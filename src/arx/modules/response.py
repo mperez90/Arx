@@ -16,6 +16,7 @@ se finge hecha.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -126,6 +127,59 @@ def expire_blocks(now=None) -> list[dict]:
     return expired
 
 
+# ── cola de acciones Tier 2 pendientes de autorización humana ─────────────────
+def _pending_path():
+    return config.state_dir() / "pending_tier2.json"
+
+
+def _load_pending() -> list[dict]:
+    try:
+        return json.loads(_pending_path().read_text())
+    except (OSError, ValueError):
+        return []
+
+
+def _save_pending(pend: list[dict]) -> None:
+    _pending_path().write_text(json.dumps(pend, indent=2, ensure_ascii=False))
+    try:
+        _pending_path().chmod(0o600)
+    except OSError:
+        pass
+
+
+def _add_pending(finding: dict, plan: dict) -> str:
+    detail = finding.get("detail", "")
+    pid = hashlib.sha1(detail.encode()).hexdigest()[:6]  # estable por amenaza → dedup natural
+    pend = _load_pending()
+    if not any(p["id"] == pid for p in pend):
+        pend.append(
+            {
+                "id": pid,
+                "sev": finding.get("sev"),
+                "detail": detail,
+                "remediation": plan["action"],
+                "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            }
+        )
+        _save_pending(pend)
+    return pid
+
+
+def list_pending() -> list[dict]:
+    return _load_pending()
+
+
+def authorize_pending(pid: str) -> dict | None:
+    """Quita el pendiente de la cola y lo registra como autorizado. Devuelve el item o None."""
+    pend = _load_pending()
+    item = next((p for p in pend if p["id"] == pid), None)
+    if item is None:
+        return None
+    _save_pending([p for p in pend if p["id"] != pid])
+    record({"kind": "tier2_authorized", "detail": item["detail"], "remediation": item["remediation"]})
+    return item
+
+
 def _execute_tier1(finding: dict) -> tuple[str, str | None]:
     """Ejecuta una remediación Tier 1 reversible SOLO en Linux+root.
 
@@ -172,8 +226,11 @@ def handle(finding: dict, enforce: bool = False, authorized: bool = False) -> di
         else:
             outcome["status"] = "propuesta auto — activa --enforce para aplicar"
     else:  # tier 2
-        outcome["status"] = (
-            "autorizada por palabra ✓" if authorized else "PENDIENTE — requiere tu palabra de autorización"
-        )
+        if authorized:
+            outcome["status"] = "autorizada por palabra ✓"
+        else:
+            pid = _add_pending(finding, plan)
+            outcome["status"] = f"PENDIENTE (id {pid}) — autoriza con: arx authorize {pid}"
+            outcome["pending_id"] = pid
     record({"kind": "incident", **outcome})
     return outcome

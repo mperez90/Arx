@@ -16,10 +16,14 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+
       - name: Smoke test — CLI runs
         run: |
           python -m zipapp src -m "arx.cli:main" -o arx.pyz
           python arx.pyz --version
+          python arx.pyz status
           python arx.pyz license status
           python arx.pyz service status
 

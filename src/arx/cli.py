@@ -57,6 +57,92 @@ def cmd_service(args: argparse.Namespace) -> int:
     return service.run(args.saction, exec_start=getattr(args, "exec_path", None))
 
 
+def cmd_status(args: argparse.Namespace) -> int:
+    import json
+    import subprocess
+
+    from arx import config
+    from arx import license as lic
+    from arx.modules import baseline, canaries, response, service
+
+    cfg = config.load_config()
+    print("\n▸ Arx — estado")
+    print(f"  configurado    {'sí' if cfg else 'no  (arx setup)'}")
+    if cfg:
+        print(f"  proveedores    {', '.join(cfg.get('providers', {})) or 'ninguno'}")
+        print(f"  palabra auth   {'configurada' if cfg.get('auth_word') else 'NO'}")
+    base = baseline.load()
+    if not base:
+        print("  baseline       no existe  (arx learn)")
+    else:
+        m = base["meta"]
+        estado = "sellada" if m.get("sealed") else "aprendiendo"
+        print(f"  baseline       {estado} ({m.get('samples', 0)} muestras)")
+    tier, why = lic.effective_tier()
+    print(f"  licencia       {tier}  ({why})")
+    if service._systemd_available():
+        r = subprocess.run(["systemctl", "is-active", "arx"], capture_output=True, text=True)
+        print(f"  servicio       {r.stdout.strip() or 'inactivo'}")
+    else:
+        print("  servicio       (systemd no disponible aquí)")
+    cs = canaries._load().get("canaries", [])
+    print(f"  canarios       {len(cs)} activos, {len(canaries.check())} disparados")
+    print(f"  bloqueos T1    {len(response._load_blocks())} activos")
+    pend = response.list_pending()
+    print(f"  Tier 2 pend.   {len(pend)}" + ("   ⚠ usa: arx authorize" if pend else ""))
+    inc = config.state_dir() / "incidents.jsonl"
+    try:
+        lines = inc.read_text().splitlines()[-5:]
+    except OSError:
+        lines = []
+    if lines:
+        print("  incidentes recientes:")
+        for line in lines:
+            try:
+                e = json.loads(line)
+                print(f"    {e.get('at', '')[:19]}  {e.get('detail') or e.get('kind')}")
+            except ValueError:
+                pass
+    print()
+    return 0
+
+
+def cmd_authorize(args: argparse.Namespace) -> int:
+    import getpass
+
+    from arx import config
+    from arx.modules import response
+
+    pend = response.list_pending()
+    if args.pending_id is None:
+        if not pend:
+            print("No hay acciones Tier 2 pendientes.")
+            return 0
+        print("Acciones Tier 2 pendientes (requieren tu palabra de autorización):")
+        for p in pend:
+            print(f"  {p['id']}  [{p['sev']}] {p['detail']}")
+            print(f"          → {p['remediation']}")
+        print("\nAutoriza una con:  arx authorize <id>")
+        return 0
+    item = next((p for p in pend if p["id"] == args.pending_id), None)
+    if item is None:
+        print(f"No hay ninguna acción pendiente con id '{args.pending_id}'.")
+        return 1
+    cfg = config.load_config()
+    if not cfg.get("auth_word"):
+        print("No hay palabra de autorización configurada. Ejecuta:  arx setup")
+        return 1
+    word = getpass.getpass("Palabra de autorización: ").strip()
+    if not config.verify_word(word, cfg.get("auth_word", {})):
+        print("Palabra incorrecta. Acción NO autorizada.")
+        return 1
+    response.authorize_pending(args.pending_id)
+    print(f"✓ Autorizada: {item['detail']}")
+    print(f"  Remediación: {item['remediation']}")
+    print("  Arx aplica lo reversible; lo irreversible confírmalo tú en el host.")
+    return 0
+
+
 def cmd_license(args: argparse.Namespace) -> int:
     import platform
     import socket
@@ -120,6 +206,9 @@ def main(argv: list[str] | None = None) -> int:
     p_guard.add_argument("--interval", type=int, default=30, help="segundos entre barridos")
     p_guard.add_argument("--chat", action="store_true", help="abrir canal de consola con Arx")
     p_guard.add_argument("--enforce", action="store_true", help="aplicar remediaciones Tier 1 (auto, reversibles)")
+    sub.add_parser("status", help="estado general de Arx (un vistazo)")
+    p_auth = sub.add_parser("authorize", help="ver/aprobar acciones Tier 2 pendientes")
+    p_auth.add_argument("pending_id", nargs="?", help="id a autorizar (sin id: lista los pendientes)")
     p_can = sub.add_parser("canaries", help="señuelos / honeytokens")
     csub = p_can.add_subparsers(dest="caction", required=True)
     p_cp = csub.add_parser("plant", help="plantar señuelos (por defecto: homes + /root)")
@@ -142,8 +231,8 @@ def main(argv: list[str] | None = None) -> int:
     lsub.add_parser("deactivate", help="liberar la activación local (al reinstalar el servidor)")
     args = p.parse_args(argv)
     handlers = {"setup": cmd_setup, "recon": cmd_recon, "learn": cmd_learn,
-                "guard": cmd_guard, "canaries": cmd_canaries, "service": cmd_service,
-                "license": cmd_license}
+                "guard": cmd_guard, "status": cmd_status, "authorize": cmd_authorize,
+                "canaries": cmd_canaries, "service": cmd_service, "license": cmd_license}
     return handlers[args.cmd](args) or 0
 
 
