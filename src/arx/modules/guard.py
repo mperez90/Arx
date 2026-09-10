@@ -15,7 +15,7 @@ import time
 
 from arx import config, engine, redact
 from arx import license as lic
-from arx.modules import baseline, canaries, response, sensors
+from arx.modules import baseline, canaries, fleet, response, sensors
 
 SYSTEM_PROMPT = (
     "Eres Arx, guardián defensivo de este servidor. Respondes breve y en español, "
@@ -132,6 +132,7 @@ def run(once: bool = False, interval: int = 30, chat: bool = False, enforce: boo
     print(f"  sensores: {', '.join(active)}  ·  enforce={'ON' if enforce else 'OFF'}  ·  "
           f"{'un barrido' if once else f'cada {interval}s'}")
     last_val = time.monotonic()
+    reported: set = set()  # dedup de eventos ya enviados a la consola en esta sesión
     while True:
         if time.monotonic() - last_val >= 86400:  # re-validar licencia cada 24 h
             lic.validate()
@@ -150,6 +151,15 @@ def run(once: bool = False, interval: int = 30, chat: bool = False, enforce: boo
             print("\n▸ Motor (LLM):\n  " + assessment.replace("\n", "\n  "))
         elif findings:
             print("\n  (motor LLM no configurado — análisis determinista únicamente)")
+        if fleet.enabled():  # flota (Business): heartbeat + hallazgos nuevos, best-effort
+            try:
+                fleet.heartbeat(fleet.status_summary())
+                new = [f for f in findings if (f.get("kind"), f.get("detail")) not in reported]
+                if new:
+                    fleet.report(new)
+                    reported.update((f.get("kind"), f.get("detail")) for f in new)
+            except Exception:
+                pass  # la consola nunca bloquea la defensa local (falla-abierto)
         if once:
             break
         time.sleep(interval)
