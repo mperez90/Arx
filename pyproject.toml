@@ -1,0 +1,20 @@
+[project]
+name = "arx"
+version = "0.0.1"
+description = "Arx — defensa activa y reactiva para servidores (Core)"
+requires-python = ">=3.11"
+license = { text = "BSL-1.1" }   # Core: Business Source License (no-reventa); ver README/LICENSE
+authors = [{ name = "Arx" }]
+# El motor de razonamiento es hermes-agent (MIT · Nous Research) — ver NOTICE.
+
+dependencies = [
+  # se fijan en F1 tras la auditoría de licencias:
+  # osquery/auditd/falco se orquestan como servicios del sistema, no como deps python.
+]
+
+[project.scripts]
+arx = "arx.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

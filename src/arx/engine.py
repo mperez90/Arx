@@ -1,0 +1,89 @@
+"""Arx · engine — motor de razonamiento LLM con fallback entre proveedores.
+
+Intenta los proveedores en el orden configurado (por defecto OpenAI → Anthropic →
+KIMI) hasta que uno responde. El cliente pone sus PROPIAS claves → coste de
+inferencia cero para Arx.
+
+Sin dependencias externas: habla el REST de cada proveedor con urllib (el Core no
+arrastra SDKs que cambian). El transporte (`post`) es inyectable para poder testear
+la lógica de fallback sin red.
+
+Este motor es la capa LENTA: razona async, fuera del hot path de detección.
+Núcleo conceptual: hermes-agent (MIT · Nous Research) — ver NOTICE.
+"""
+from __future__ import annotations
+
+import json
+import urllib.error
+import urllib.request
+
+from arx import config
+
+# Endpoints compatibles con el esquema OpenAI (chat/completions).
+OPENAI_LIKE = {
+    "openai": "https://api.openai.com/v1/chat/completions",
+    "kimi": "https://api.moonshot.ai/v1/chat/completions",
+}
+ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_VERSION = "2023-06-01"
+
+
+class ProviderError(Exception):
+    """Ningún proveedor pudo atender la petición."""
+
+
+def _http_post(url: str, headers: dict, payload: dict, timeout: int = 60) -> dict:
+    data = json.dumps(payload).encode()
+    req = urllib.request.Request(
+        url, data=data, method="POST",
+        headers={**headers, "Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as r:  # noqa: S310 (URL fija, no input externo)
+        return json.loads(r.read().decode())
+
+
+def _build(prov: str, key: str, model: str, system: str | None,
+           messages: list[dict], max_tokens: int) -> tuple[str, dict, dict]:
+    if prov == "anthropic":
+        payload = {"model": model, "max_tokens": max_tokens, "messages": messages}
+        if system:
+            payload["system"] = system
+        return ANTHROPIC_URL, {"x-api-key": key, "anthropic-version": ANTHROPIC_VERSION}, payload
+    base = OPENAI_LIKE.get(prov)
+    if not base:
+        raise ProviderError(f"proveedor desconocido: {prov}")
+    msgs = ([{"role": "system", "content": system}] if system else []) + messages
+    return base, {"Authorization": f"Bearer {key}"}, {"model": model, "messages": msgs}
+
+
+def _parse(prov: str, resp: dict) -> str:
+    if prov == "anthropic":
+        return resp["content"][0]["text"]
+    return resp["choices"][0]["message"]["content"]
+
+
+class Engine:
+    def __init__(self, cfg: dict | None = None, post=_http_post, max_tokens: int = 2048):
+        self.cfg = cfg if cfg is not None else config.load_config()
+        self._post = post
+        self.max_tokens = max_tokens
+
+    def providers_in_order(self) -> list[str]:
+        return self.cfg.get("fallback_order") or list(self.cfg.get("providers", {}))
+
+    def ask(self, messages: list[dict], system: str | None = None) -> tuple[str, str]:
+        """Devuelve (respuesta, proveedor_usado). Lanza ProviderError si todos fallan."""
+        errors: list[str] = []
+        for prov in self.providers_in_order():
+            key = config.get_api_key(prov)
+            model = self.cfg.get("providers", {}).get(prov)
+            if not key or not model:
+                errors.append(f"{prov}: sin clave o modelo")
+                continue
+            try:
+                url, headers, payload = _build(prov, key, model, system, messages, self.max_tokens)
+                return _parse(prov, self._post(url, headers, payload)), prov
+            except (urllib.error.URLError, KeyError, IndexError, ProviderError, TimeoutError, OSError) as e:
+                errors.append(f"{prov}: {e}")
+                continue
+        raise ProviderError("ningún proveedor respondió — " + "; ".join(errors))

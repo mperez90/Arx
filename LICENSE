@@ -1,0 +1,21 @@
+Business Source License 1.1  (Arx Core)
+
+Licensor:            Arx
+Licensed Work:       Arx Core (this repository's src/arx/ and docs/)
+Additional Use Grant: You may use, copy, modify, and self-host the Licensed
+                     Work to defend systems you own or operate, including in a
+                     business, without limitation.
+Change Date:         Four years from the date each version is published.
+Change License:      Apache License, Version 2.0
+
+Restriction (the only one): you may NOT provide the Licensed Work to third
+parties as a hosted or managed commercial service whose primary value is the
+Licensed Work itself (i.e. reselling Arx as a service). On the Change Date the
+Licensed Work converts to the Change License and this restriction lapses.
+
+This is a plain-language summary header. The full BSL 1.1 legal text
+(https://mariadb.com/bsl11/) governs and must be pasted in below before release.
+The Arx engine builds on hermes-agent (MIT · Nous Research) — see NOTICE; that
+component keeps its own MIT terms.
+
+[TODO release: paste full canonical BSL 1.1 text here and have counsel review.]
