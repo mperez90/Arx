@@ -20,5 +20,9 @@ secrets/
 docs/*polar*.md
 scripts/polar_*.py
 
+# Tiers cerrados — NO van en el Core (source-available)
+pro/
+backend/
+
 # OS
 .DS_Store

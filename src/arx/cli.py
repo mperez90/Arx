@@ -143,6 +143,35 @@ def cmd_authorize(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_fleet(args: argparse.Namespace) -> int:
+    from arx.modules import fleet
+
+    if args.faction == "enroll":
+        r = fleet.enroll(args.console, args.token)
+        if r.get("ok"):
+            print(f"✓ Host enrolado en la consola. agent_id: {r['agent_id']}")
+            return 0
+        print(f"No se pudo enrolar: {r.get('reason')}")
+        return 1
+    if args.faction == "sync":
+        r = fleet.sync()
+        if r.get("ok"):
+            print(f"✓ Sincronizado con la consola ({r.get('events', 0)} incidentes enviados).")
+            return 0
+        print(f"No se pudo sincronizar: {r.get('reason')}")
+        return 1
+    # status
+    st = fleet._load()
+    print("\n▸ Arx — flota")
+    print(f"  disponible     {'sí (Business)' if fleet.enabled() else 'no (requiere licencia Business)'}")
+    print(f"  enrolado       {'sí' if st.get('agent_id') else 'no'}")
+    if st.get("agent_id"):
+        print(f"  consola        {st.get('console_url')}")
+        print(f"  agent_id       {st.get('agent_id')}")
+    print()
+    return 0
+
+
 def cmd_license(args: argparse.Namespace) -> int:
     import platform
     import socket
@@ -223,6 +252,13 @@ def main(argv: list[str] | None = None) -> int:
                       help="ExecStart (por defecto: cómo se invoca arx ahora)")
     ssub.add_parser("uninstall", help="retirar el servicio")
     ssub.add_parser("status", help="estado del servicio")
+    p_fleet = sub.add_parser("fleet", help="flota / consola central (Business)")
+    fsub = p_fleet.add_subparsers(dest="faction", required=True)
+    p_fe = fsub.add_parser("enroll", help="enrolar este host en la consola central")
+    p_fe.add_argument("--console", required=True, metavar="URL", help="URL de la consola de flota")
+    p_fe.add_argument("--token", required=True, metavar="TOKEN", help="token de enrolamiento")
+    fsub.add_parser("status", help="estado de enrolamiento")
+    fsub.add_parser("sync", help="enviar heartbeat + incidentes a la consola")
     p_lic = sub.add_parser("license", help="activar / ver / liberar la licencia")
     lsub = p_lic.add_subparsers(dest="laction", required=True)
     p_la = lsub.add_parser("activate", help="activar una licencia Pro/Business en este servidor")
@@ -232,7 +268,8 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
     handlers = {"setup": cmd_setup, "recon": cmd_recon, "learn": cmd_learn,
                 "guard": cmd_guard, "status": cmd_status, "authorize": cmd_authorize,
-                "canaries": cmd_canaries, "service": cmd_service, "license": cmd_license}
+                "canaries": cmd_canaries, "service": cmd_service, "fleet": cmd_fleet,
+                "license": cmd_license}
     return handlers[args.cmd](args) or 0
 
 

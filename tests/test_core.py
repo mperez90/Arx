@@ -161,5 +161,40 @@ class EngineTests(unittest.TestCase):
         self.assertEqual((prov, ans), ("anthropic", "ok"))
 
 
+class FleetTests(unittest.TestCase):
+    BUS = "81882e82-5547-479a-a969-4ae6a514faed"
+
+    def setUp(self):
+        _isolate()
+        from arx import license as lic
+        from arx.modules import fleet
+        self.lic, self.fleet = lic, fleet
+
+    def _make_business(self):
+        self.lic.activate("K", "h", "o", "v", post=lambda u, p: {"id": "a1"})
+        fut = (datetime.now(timezone.utc) + timedelta(days=700)).isoformat()
+        self.lic.validate(post=lambda u, p: {"status": "granted", "benefit_id": self.BUS, "expires_at": fut})
+
+    def test_disabled_without_business(self):
+        self.assertFalse(self.fleet.enabled())
+        self.assertFalse(self.fleet.enroll("http://c", "tok")["ok"])
+
+    def test_enroll_and_report_redacts(self):
+        self._make_business()
+        self.assertTrue(self.fleet.enabled())
+        self.assertTrue(self.fleet.enroll("http://c", "tok",
+                        post=lambda u, h, p: {"agent_id": "ag-1", "agent_token": "t"})["ok"])
+        from arx import config
+        config.save_secrets({**config.load_secrets(), "openai": "sk-SECRET1234567890"})
+        cap = {}
+
+        def post(url, headers, payload):
+            cap.update(payload)
+            return {}
+
+        self.fleet.report([{"detail": "leak sk-SECRET1234567890"}], post=post)
+        self.assertNotIn("sk-SECRET", str(cap))
+
+
 if __name__ == "__main__":
     unittest.main()
