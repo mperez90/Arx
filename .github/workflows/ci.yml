@@ -1,0 +1,48 @@
+name: build
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Smoke test — CLI runs
+        run: |
+          python -m zipapp src -m "arx.cli:main" -o arx.pyz
+          python arx.pyz --version
+          python arx.pyz license status
+          python arx.pyz service status
+
+      - name: Build .deb
+        run: packaging/build-deb.sh
+
+      - name: Install & verify on the runner (has systemd)
+        run: |
+          sudo dpkg -i dist/arx_*.deb || sudo apt-get install -f -y
+          arx --version
+          arx service status   # must not crash
+
+      - name: Verify in a minimal container (NO systemd — regression guard)
+        run: |
+          docker run --rm -v "$PWD":/src ubuntu:24.04 bash -c '
+            apt-get update -qq && apt-get install -y -qq python3 >/dev/null
+            cd /src && (dpkg -i dist/arx_*.deb || apt-get install -f -y)
+            arx --version && arx service status'   # crashed before the systemd/root split
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: arx-packages
+          path: |
+            arx.pyz
+            dist/*.deb
