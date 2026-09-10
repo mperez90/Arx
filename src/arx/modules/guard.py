@@ -131,7 +131,14 @@ def run(once: bool = False, interval: int = 30, chat: bool = False, enforce: boo
     print(f"▸ Arx en guardia  ·  tier {tier} ({why})  ·  intel {intel}")
     print(f"  sensores: {', '.join(active)}  ·  enforce={'ON' if enforce else 'OFF'}  ·  "
           f"{'un barrido' if once else f'cada {interval}s'}")
+    last_val = time.monotonic()
     while True:
+        if time.monotonic() - last_val >= 86400:  # re-validar licencia cada 24 h
+            lic.validate()
+            last_val = time.monotonic()
+        expired = response.expire_blocks()  # auto-expira bloqueos Tier 1 vencidos
+        if expired:
+            print(f"  ⏱ {len(expired)} bloqueo(s) Tier 1 expiraron y se revirtieron.")
         print(f"\n— barrido {baseline._now()} —")
         findings, outcomes = sweep(base, enforce=enforce)
         _print_sweep(findings, outcomes)

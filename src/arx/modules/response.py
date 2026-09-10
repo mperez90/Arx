@@ -21,9 +21,11 @@ import os
 import shutil
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from arx import config
+
+DEFAULT_TTL_MIN = 60  # los bloqueos Tier 1 auto-expiran (reversibles por doctrina)
 
 # kind → (tier, acción de remediación, reversible, por qué ese nivel)
 _PLAN: dict[str, tuple[int, str, bool, str]] = {
@@ -62,6 +64,65 @@ def _is_linux_root() -> bool:
     return sys.platform.startswith("linux") and hasattr(os, "geteuid") and os.geteuid() == 0
 
 
+# ── bloqueos activos con auto-expiración (Tier 1 reversible) ──────────────────
+def _blocks_path():
+    return config.state_dir() / "active_blocks.json"
+
+
+def _load_blocks() -> list[dict]:
+    try:
+        return json.loads(_blocks_path().read_text())
+    except (OSError, ValueError):
+        return []
+
+
+def _save_blocks(blocks: list[dict]) -> None:
+    _blocks_path().write_text(json.dumps(blocks, indent=2, ensure_ascii=False))
+    try:
+        _blocks_path().chmod(0o600)
+    except OSError:
+        pass
+
+
+def _parse_dt(s: str | None):
+    try:
+        return datetime.fromisoformat(s)
+    except (ValueError, TypeError):
+        return None
+
+
+def register_block(finding: dict, revert_cmd: str, ttl_min: int = DEFAULT_TTL_MIN, now=None) -> None:
+    now = now or datetime.now(timezone.utc)
+    blocks = _load_blocks()
+    blocks.append(
+        {
+            "detail": finding.get("detail"),
+            "revert": revert_cmd,
+            "applied_at": now.isoformat(timespec="seconds"),
+            "expires_at": (now + timedelta(minutes=ttl_min)).isoformat(timespec="seconds"),
+        }
+    )
+    _save_blocks(blocks)
+
+
+def expire_blocks(now=None) -> list[dict]:
+    """Revierte los bloqueos Tier 1 vencidos. En Linux+root ejecuta el revert real."""
+    now = now or datetime.now(timezone.utc)
+    keep, expired = [], []
+    for b in _load_blocks():
+        exp = _parse_dt(b.get("expires_at"))
+        if exp and exp <= now:
+            if _is_linux_root() and b.get("revert"):
+                subprocess.run(b["revert"].split(), capture_output=True, text=True)
+            record({"kind": "block_expired", "detail": b.get("detail"), "reverted": b.get("revert")})
+            expired.append(b)
+        else:
+            keep.append(b)
+    if expired:
+        _save_blocks(keep)
+    return expired
+
+
 def _execute_tier1(finding: dict) -> tuple[str, str | None]:
     """Ejecuta una remediación Tier 1 reversible SOLO en Linux+root.
 
@@ -76,7 +137,9 @@ def _execute_tier1(finding: dict) -> tuple[str, str | None]:
         proto, port = target.get("proto", "tcp"), target["port"]
         r = subprocess.run(["ufw", "deny", f"{port}/{proto}"], capture_output=True, text=True)
         if r.returncode == 0:
-            return f"puerto {port}/{proto} bloqueado en ufw (temporal)", f"ufw delete deny {port}/{proto}"
+            revert = f"ufw delete deny {port}/{proto}"
+            register_block(finding, revert)
+            return f"puerto {port}/{proto} bloqueado en ufw (auto-expira en {DEFAULT_TTL_MIN} min)", revert
         return f"no se pudo bloquear el puerto ({r.stderr.strip()[:48]})", None
     if kind == "canary":
         return "nivel de alerta elevado y contexto capturado", None

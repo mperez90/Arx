@@ -52,6 +52,11 @@ def cmd_canaries(args: argparse.Namespace) -> int:
     return canaries.run(args.caction, locations=getattr(args, "in_dirs", None))
 
 
+def cmd_service(args: argparse.Namespace) -> int:
+    from arx.modules import service
+    return service.run(args.saction, exec_start=getattr(args, "exec_path", None))
+
+
 def cmd_license(args: argparse.Namespace) -> int:
     import platform
     import socket
@@ -122,6 +127,13 @@ def main(argv: list[str] | None = None) -> int:
                       help="dónde plantar (repetible)")
     csub.add_parser("list", help="listar señuelos activos")
     csub.add_parser("check", help="verificar integridad de los señuelos")
+    p_svc = sub.add_parser("service", help="instalar/retirar Arx como servicio systemd (24/7)")
+    ssub = p_svc.add_subparsers(dest="saction", required=True)
+    p_si = ssub.add_parser("install", help="instalar y arrancar el servicio")
+    p_si.add_argument("--exec", dest="exec_path", metavar="RUTA",
+                      help="ExecStart (por defecto: cómo se invoca arx ahora)")
+    ssub.add_parser("uninstall", help="retirar el servicio")
+    ssub.add_parser("status", help="estado del servicio")
     p_lic = sub.add_parser("license", help="activar / ver / liberar la licencia")
     lsub = p_lic.add_subparsers(dest="laction", required=True)
     p_la = lsub.add_parser("activate", help="activar una licencia Pro/Business en este servidor")
@@ -130,7 +142,8 @@ def main(argv: list[str] | None = None) -> int:
     lsub.add_parser("deactivate", help="liberar la activación local (al reinstalar el servidor)")
     args = p.parse_args(argv)
     handlers = {"setup": cmd_setup, "recon": cmd_recon, "learn": cmd_learn,
-                "guard": cmd_guard, "canaries": cmd_canaries, "license": cmd_license}
+                "guard": cmd_guard, "canaries": cmd_canaries, "service": cmd_service,
+                "license": cmd_license}
     return handlers[args.cmd](args) or 0
 
 
