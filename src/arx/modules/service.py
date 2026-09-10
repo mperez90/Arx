@@ -1,9 +1,10 @@
 """Arx · service — integración con systemd (correr `guard` 24/7).
 
-Genera el unit y, en Linux+root, lo instala y arranca (`enable --now`). Fuera de
-Linux+root NO finge: escribe el unit en el dir de estado y muestra los comandos exactos
-para instalarlo en el servidor. Arx corre como root porque contiene amenazas (firewall,
-señales, integridad de ficheros); el unit incluye endurecimiento que no rompe su función.
+Genera el unit y, si hay systemd + root, lo instala y arranca (`enable --now`). Si no
+(otro SO, sin root, o Linux sin systemd — p. ej. un contenedor), NO finge ni crashea:
+escribe el unit en el dir de estado y muestra los comandos exactos para el servidor.
+Arx corre como root porque contiene amenazas (firewall, señales, integridad de ficheros);
+el unit incluye endurecimiento que no rompe su función.
 """
 from __future__ import annotations
 
@@ -18,8 +19,17 @@ from arx import config
 UNIT_PATH = "/etc/systemd/system/arx.service"
 
 
-def _is_linux_root() -> bool:
-    return sys.platform.startswith("linux") and hasattr(os, "geteuid") and os.geteuid() == 0
+def _is_root() -> bool:
+    return hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+def _systemd_available() -> bool:
+    """Linux con systemd como init y systemctl disponible (no basta con ser root)."""
+    return (
+        sys.platform.startswith("linux")
+        and shutil.which("systemctl") is not None
+        and Path("/run/systemd/system").is_dir()
+    )
 
 
 def _default_exec() -> str:
@@ -61,19 +71,28 @@ def _prereqs_ok() -> bool:
     return bool(config.load_config()) and bool(base and base.get("meta", {}).get("sealed"))
 
 
+def _manual_instructions(dest: Path) -> None:
+    print(f"Unit systemd generado en: {dest}")
+    if not sys.platform.startswith("linux"):
+        print("Este no es un host Linux. En el servidor Ubuntu:")
+    elif not _systemd_available():
+        print("systemd no detectado aquí. En un servidor con systemd:")
+    else:
+        print("Requiere root. Instálalo con:")
+    print(f"  sudo cp {dest} {UNIT_PATH}")
+    print("  sudo systemctl daemon-reload && sudo systemctl enable --now arx")
+
+
 def install(exec_start: str | None = None) -> int:
     if not _prereqs_ok():
         print("⚠ Prerequisitos incompletos para operar 24/7:")
         print("  ejecuta  setup → recon → learn → learn --seal  antes de arrancar el servicio.")
         print("  (Sin baseline sellada, guard sale con error y systemd reintentaría en bucle.)\n")
     text = unit_text(exec_start or _default_exec())
-    if not _is_linux_root():
+    if not (_systemd_available() and _is_root()):
         dest = config.state_dir() / "arx.service"
         dest.write_text(text)
-        print(f"Unit systemd generado en: {dest}")
-        print("Requiere Linux + root para instalarlo. En el servidor:")
-        print(f"  sudo cp {dest} {UNIT_PATH}")
-        print("  sudo systemctl daemon-reload && sudo systemctl enable --now arx")
+        _manual_instructions(dest)
         return 0
     Path(UNIT_PATH).write_text(text)
     subprocess.run(["systemctl", "daemon-reload"], check=False)
@@ -86,8 +105,8 @@ def install(exec_start: str | None = None) -> int:
 
 
 def uninstall() -> int:
-    if not _is_linux_root():
-        print("Requiere Linux + root. En el servidor:")
+    if not (_systemd_available() and _is_root()):
+        print("Requiere Linux + root con systemd. En el servidor:")
         print(f"  sudo systemctl disable --now arx && sudo rm -f {UNIT_PATH} && sudo systemctl daemon-reload")
         return 0
     subprocess.run(["systemctl", "disable", "--now", "arx"], check=False)
@@ -101,8 +120,8 @@ def uninstall() -> int:
 
 
 def status() -> int:
-    if not _is_linux_root():
-        print("Estado del servicio: requiere Linux (systemctl). En el servidor:  systemctl status arx")
+    if not _systemd_available():
+        print("Estado del servicio: requiere systemd (systemctl). En el servidor:  systemctl status arx")
         return 0
     subprocess.run(["systemctl", "status", "arx", "--no-pager"], check=False)
     return 0

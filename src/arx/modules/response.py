@@ -113,7 +113,10 @@ def expire_blocks(now=None) -> list[dict]:
         exp = _parse_dt(b.get("expires_at"))
         if exp and exp <= now:
             if _is_linux_root() and b.get("revert"):
-                subprocess.run(b["revert"].split(), capture_output=True, text=True)
+                try:
+                    subprocess.run(b["revert"].split(), capture_output=True, text=True)
+                except OSError:
+                    pass  # la herramienta de revert ya no está; no romper el bucle de guardia
             record({"kind": "block_expired", "detail": b.get("detail"), "reverted": b.get("revert")})
             expired.append(b)
         else:
