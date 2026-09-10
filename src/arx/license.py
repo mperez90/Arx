@@ -29,9 +29,14 @@ POLAR = {
     "sandbox": {
         "base": "https://sandbox-api.polar.sh/v1",
         "organization_id": "3a247f62-c3ab-433e-949d-76e7234fc2e5",
+        # CUATRO benefits: cada línea tiene edición Founding (primeros 100) + estándar.
+        # Founding y estándar dan el MISMO tier; solo difieren en el término, que Arx
+        # NO deduce del tier — lo lee de expires_at en la respuesta de validación.
         "benefits": {
-            "e03995ef-5765-4fd7-abb9-2350f275aed8": "pro",
-            "81882e82-5547-479a-a969-4ae6a514faed": "business",
+            "ad29f387-ccae-44c7-aea5-af1879f512dd": "pro",       # Pro Founding (3 años)
+            "e03995ef-5765-4fd7-abb9-2350f275aed8": "pro",       # Pro (2 años)
+            "ff44b95d-e43c-41a4-a9cf-aee5a4668288": "business",  # Business Founding (2 años)
+            "81882e82-5547-479a-a969-4ae6a514faed": "business",  # Business (1 año)
         },
     },
     "production": {
