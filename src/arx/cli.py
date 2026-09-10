@@ -190,9 +190,12 @@ def cmd_license(args: argparse.Namespace) -> int:
         return 0
 
     if args.laction == "deactivate":
-        lic.deactivate()
-        print("Activación local liberada. Puedes reinstalar este servidor y reactivar con la misma llave.")
-        return 0
+        r = lic.deactivate()
+        if r.get("ok"):
+            print("✓ Activación liberada (en Polar y local). Reinstala y reactiva con la misma llave.")
+            return 0
+        print(f"⚠ {r.get('reason')}")
+        return 1
 
     # status
     st = lic.load()

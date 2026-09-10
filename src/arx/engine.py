@@ -17,7 +17,7 @@ import json
 import urllib.error
 import urllib.request
 
-from arx import config
+from arx import __version__, config
 
 # Endpoints compatibles con el esquema OpenAI (chat/completions).
 OPENAI_LIKE = {
@@ -36,7 +36,7 @@ def _http_post(url: str, headers: dict, payload: dict, timeout: int = 60) -> dic
     data = json.dumps(payload).encode()
     req = urllib.request.Request(
         url, data=data, method="POST",
-        headers={**headers, "Content-Type": "application/json"},
+        headers={**headers, "Content-Type": "application/json", "User-Agent": f"arx/{__version__}"},
     )
     with urllib.request.urlopen(req, timeout=timeout) as r:  # noqa: S310 (URL fija, no input externo)
         return json.loads(r.read().decode())

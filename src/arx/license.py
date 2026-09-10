@@ -19,7 +19,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 
-from arx import config
+from arx import __version__, config
 
 GRACE_DAYS = 14
 CONDITIONS = {"license_gen": 0}  # desacoplado de la versión de software — ver docs/respuesta-arx-polar.md §5
@@ -108,7 +108,12 @@ def _verify(cache: dict) -> bool:
 # ── HTTP (inyectable para test) ──────────────────────────────────────────────
 def _post(url: str, payload: dict, timeout: int = 15) -> dict:
     data = json.dumps(payload).encode()
-    req = urllib.request.Request(url, data=data, method="POST", headers={"Content-Type": "application/json"})
+    # User-Agent propio: sin él, Cloudflare (delante de api.polar.sh) responde 403 (error 1010)
+    # y toda activación/validación fallaría en silencio.
+    req = urllib.request.Request(
+        url, data=data, method="POST",
+        headers={"Content-Type": "application/json", "User-Agent": f"arx/{__version__}"},
+    )
     with urllib.request.urlopen(req, timeout=timeout) as r:  # noqa: S310
         return json.loads(r.read().decode())
 
@@ -116,16 +121,26 @@ def _post(url: str, payload: dict, timeout: int = 15) -> dict:
 # ── activación / validación ──────────────────────────────────────────────────
 def activate(key: str, hostname: str, os_str: str, version: str, post=_post) -> dict:
     env = _env()
-    resp = post(
-        f"{env['base']}/customer-portal/license-keys/activate",
-        {
-            "key": key,
-            "organization_id": env["organization_id"],
-            "label": hostname,
-            "conditions": CONDITIONS,
-            "meta": {"os": os_str, "arx_version": version},
-        },
-    )
+    try:
+        resp = post(
+            f"{env['base']}/customer-portal/license-keys/activate",
+            {
+                "key": key,
+                "organization_id": env["organization_id"],
+                "label": hostname,
+                "conditions": CONDITIONS,
+                "meta": {"os": os_str, "arx_version": version},
+            },
+        )
+    except urllib.error.HTTPError as e:
+        if e.code in (403, 409):
+            return {"ok": False, "reason": "esa llave ya está en uso en otro servidor — "
+                    "libérala con 'arx license deactivate' allí, o desde tu portal de Polar"}
+        if e.code == 404:
+            return {"ok": False, "reason": "llave no reconocida — revisa que la pegaste completa"}
+        return {"ok": False, "reason": f"la consola rechazó la activación (HTTP {e.code})"}
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        return {"ok": False, "reason": f"sin conexión con Polar: {e}"}
     activation_id = resp.get("id")
     if not activation_id:
         return {"ok": False, "reason": "Polar no devolvió activation_id"}
@@ -151,6 +166,16 @@ def validate(post=_post, now: datetime | None = None) -> dict:
                 "conditions": st.get("conditions", CONDITIONS),
             },
         )
+    except urllib.error.HTTPError as e:
+        # el servidor RESPONDIÓ (y dijo que no) → NO es offline. 4xx degrada; 5xx = caída.
+        if 400 <= e.code < 500:
+            cache = {"status": "denied", "http": e.code, "tier": "core",
+                     "last_validated_at": now.isoformat(timespec="seconds")}
+            cache["sig"] = _sign(cache)
+            st["cache"] = cache
+            save(st)
+            return {"ok": False, "status": "denied", "http": e.code, "tier": "core"}
+        return {"ok": False, "offline": True, "reason": f"servidor {e.code}"}
     except (urllib.error.URLError, TimeoutError, OSError) as e:
         return {"ok": False, "offline": True, "reason": f"sin conexión: {e}"}
 
@@ -191,18 +216,23 @@ def effective_tier(now: datetime | None = None) -> tuple[str, str]:
         return "core", "caché de licencia manipulada → Core"
     if cache.get("status") == "revoked":
         return "core", "licencia revocada por el servidor"
+    if cache.get("status") == "denied":
+        return "core", f"rechazada por el servidor (HTTP {cache.get('http', '?')})"
 
     now = now or datetime.now(timezone.utc)
     last = _parse_iso(cache.get("last_validated_at", ""))
     if cache.get("status") == "granted" and last:
         age_days = (now - last).total_seconds() / 86400
-        if age_days < -1:  # guardia de reloj: retrocedió más de un día
-            return "core", "reloj inconsistente (retrocedió) → Core por cautela"
         exp = _parse_iso(cache.get("expires_at", "") or "")
+        # Reloj retrocedido = "no pude preguntar", no "me dijeron que no" → no desarmar.
+        # (Un salto ADELANTE no se distingue localmente de una expiración real → degrada a
+        #  Core, nunca a "sin protección"; un host en línea se autocorrige al revalidar.)
+        if age_days < -1:
+            return cache.get("tier", "core"), "anomalía de reloj (retroceso) — mantengo el tier"
         if exp and exp < now:
             return "core", "licencia expirada por fecha"
         if age_days <= GRACE_DAYS:
-            return cache.get("tier", "core"), f"válida (validada hace {int(max(age_days,0))} d)"
+            return cache.get("tier", "core"), f"válida (validada hace {int(max(age_days, 0))} d)"
         return "core", f"gracia agotada ({int(age_days)} d sin validar) → Core"
     return "core", "sin validación exitosa previa → Core"
 
@@ -212,10 +242,26 @@ def tier_allows(feature: str, tier: str | None = None) -> bool:
     return _ORDER.get(tier, 0) >= _ORDER.get(_FEATURE_TIER.get(feature, "core"), 0)
 
 
-def deactivate() -> dict:
-    """Olvida la activación local (para reinstalar). No revoca en Polar; eso es del portal."""
+def deactivate(post=_post) -> dict:
+    """Libera la activación en Polar y luego olvida el estado local (para reinstalar).
+
+    Con Pro a 1 activación, reinstalar es un camino NORMAL: si no se libera en Polar, la
+    reactivación choca con el límite. Si la llamada falla, NO se borra el estado local: se
+    avisa y se apunta al portal, en vez de dejar la activación colgada en silencio.
+    """
     st = load()
+    if st.get("key") and st.get("activation_id"):
+        env = _env()
+        try:
+            post(
+                f"{env['base']}/customer-portal/license-keys/deactivate",
+                {"key": st["key"], "organization_id": env["organization_id"],
+                 "activation_id": st["activation_id"]},
+            )
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError) as e:
+            return {"ok": False, "released": False,
+                    "reason": f"no se pudo liberar en Polar ({e}). Libérala desde tu portal de Polar."}
     st.pop("activation_id", None)
     st.pop("cache", None)
     save(st)
-    return {"ok": True}
+    return {"ok": True, "released": True}

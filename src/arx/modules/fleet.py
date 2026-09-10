@@ -17,7 +17,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 
-from arx import config, redact
+from arx import __version__, config, redact
 from arx import license as lic
 
 
@@ -43,7 +43,8 @@ def _save(d: dict) -> None:
 def _post(url: str, headers: dict, payload: dict, timeout: int = 15) -> dict:
     data = json.dumps(payload).encode()
     req = urllib.request.Request(
-        url, data=data, method="POST", headers={**headers, "Content-Type": "application/json"}
+        url, data=data, method="POST",
+        headers={**headers, "Content-Type": "application/json", "User-Agent": f"arx/{__version__}"},
     )
     with urllib.request.urlopen(req, timeout=timeout) as r:  # noqa: S310
         return json.loads(r.read().decode())

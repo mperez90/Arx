@@ -54,6 +54,22 @@ class LicenseTests(unittest.TestCase):
         r = self.lic.validate(post=lambda u, p: {"status": "granted", "benefit_id": "xxx"})
         self.assertEqual(r["tier"], "core")
 
+    def test_http_denied_is_not_offline(self):
+        import urllib.error
+
+        def deny(u, p):
+            raise urllib.error.HTTPError(u, 404, "not found", {}, None)
+
+        r = self.lic.validate(post=deny)
+        self.assertFalse(r.get("offline"))  # "me dijeron que no" != "no pude preguntar"
+        self.assertEqual(self.lic.effective_tier()[0], "core")
+
+    def test_clock_backward_keeps_tier(self):
+        fut = (datetime.now(timezone.utc) + timedelta(days=900)).isoformat()
+        self.lic.validate(post=lambda u, p: {"status": "granted", "benefit_id": PRO, "expires_at": fut})
+        past = datetime.now(timezone.utc) - timedelta(days=5)
+        self.assertEqual(self.lic.effective_tier(now=past)[0], "pro")  # anomalía de reloj no desarma
+
 
 class BaselineTests(unittest.TestCase):
     def setUp(self):

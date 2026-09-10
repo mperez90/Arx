@@ -16,11 +16,14 @@ arx.db
 state/
 secrets/
 
-# Negocio / comercialización (Polar IDs, precios, estrategia, tooling) — NUNCA publicar
-docs/*polar*.md
-scripts/polar_*.py
+# docs/: solo los de PRODUCTO van en el Core. Coordinación/negocio (Polar, hallazgos,
+# respuestas entre sesiones) queda FUERA — allowlist explícita.
+docs/*
+!docs/arquitectura.md
+!docs/tiers.md
 
-# Tiers cerrados — NO van en el Core (source-available)
+# Tooling de negocio y tiers cerrados — NUNCA en el Core (source-available)
+scripts/polar_*.py
 pro/
 backend/
 
