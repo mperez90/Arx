@@ -1,0 +1,33 @@
+name: arx
+base: core24
+version: "0.0.1"
+summary: Autonomous defensive security agent for servers
+description: |
+  Arx learns your server's normal and answers threats in real time — reversible
+  by doctrine, human-gated for the irreversible. Console-first, no external deps.
+
+  NOTE ON CONFINEMENT: Arx defends the WHOLE host, so it needs broad visibility
+  (processes, network, files, users). That's a poor fit for strict snap
+  confinement, which would sandbox Arx away from the very host it protects. This
+  snap therefore uses `classic` confinement (full host access) — which requires
+  manual Snap Store review and is disabled on some distros. On a server, the
+  .deb (packaging/build-deb.sh) is the primary, friction-free channel; the snap
+  is a convenience for distros that prefer it.
+
+grade: stable
+confinement: classic
+
+apps:
+  arx:
+    command: bin/arx
+
+parts:
+  arx:
+    plugin: nil
+    source: .
+    build-packages: [python3]
+    override-build: |
+      python3 -m zipapp src -m "arx.cli:main" -o "$CRAFT_PART_INSTALL/arx.pyz"
+      mkdir -p "$CRAFT_PART_INSTALL/bin"
+      printf '#!/bin/sh\nexec /usr/bin/env python3 "$SNAP/arx.pyz" "$@"\n' > "$CRAFT_PART_INSTALL/bin/arx"
+      chmod 0755 "$CRAFT_PART_INSTALL/bin/arx"
