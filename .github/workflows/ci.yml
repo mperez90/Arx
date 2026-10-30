@@ -7,7 +7,24 @@ on:
   pull_request:
 
 jobs:
-  build-test:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # 3.10 = Ubuntu 22.04 LTS (mínimo soportado) · 3.12 = 24.04 · 3.13 = actual
+        python-version: ["3.10", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Lint (errores reales, no estilo)
+        run: pipx run ruff check src tests --select F,E9
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+
+  build-package:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -15,9 +32,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
-      - name: Unit tests
-        run: python -m unittest discover -s tests -v
 
       - name: Smoke test — CLI runs
         run: |
@@ -32,21 +46,53 @@ jobs:
 
       - name: Install & verify on the runner (has systemd)
         run: |
-          sudo dpkg -i dist/arx_*.deb || sudo apt-get install -f -y
+          sudo dpkg -i dist/arx_all.deb || sudo apt-get install -f -y
           arx --version
           arx service status   # must not crash
 
-      - name: Verify in a minimal container (NO systemd — regression guard)
+      - name: Verify on Ubuntu 22.04 (python 3.10) and 24.04, without systemd
         run: |
-          docker run --rm -v "$PWD":/src ubuntu:24.04 bash -c '
-            apt-get update -qq && apt-get install -y -qq python3 >/dev/null
-            cd /src && (dpkg -i dist/arx_*.deb || apt-get install -f -y)
-            arx --version && arx service status'   # crashed before the systemd/root split
+          for img in ubuntu:22.04 ubuntu:24.04; do
+            docker run --rm -v "$PWD":/src "$img" bash -c '
+              apt-get update -qq && apt-get install -y -qq python3 >/dev/null
+              cd /src && (dpkg -i dist/arx_all.deb || apt-get install -f -y)
+              arx --version && arx service status && arx status'
+          done
+
+      - name: Checksums
+        run: |
+          cp arx.pyz dist/arx.pyz
+          cd dist && sha256sum arx_all.deb arx.pyz > SHA256SUMS && cat SHA256SUMS
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: arx-packages
           path: |
-            arx.pyz
-            dist/*.deb
+            dist/arx_all.deb
+            dist/arx.pyz
+            dist/SHA256SUMS
+
+  release:
+    # Solo al empujar un tag vX.Y.Z: publica lo que install.sh descarga y verifica.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build-package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: arx-packages
+          path: dist
+      - name: Tag must match __version__
+        run: |
+          v="$(python3 -c "import sys; sys.path.insert(0,'src'); import arx; print(arx.__version__)")"
+          test "v$v" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME != versión v$v"; exit 1; }
+      - name: GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/arx_all.deb dist/arx.pyz dist/SHA256SUMS \
+            --title "Arx $GITHUB_REF_NAME" --generate-notes

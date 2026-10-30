@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 from arx import __version__, config
 
 GRACE_DAYS = 14
+DENY_CODES = {400, 401, 404, 410, 422}  # respuestas que significan "esta licencia no vale"
 CONDITIONS = {"license_gen": 0}  # desacoplado de la versión de software — ver docs/respuesta-arx-polar.md §5
 
 # IDs por entorno. Producción se fija antes del release (los IDs difieren de sandbox).
@@ -70,18 +71,11 @@ def _path():
 
 
 def load() -> dict:
-    try:
-        return json.loads(_path().read_text())
-    except (OSError, ValueError):
-        return {}
+    return config.read_json(_path())
 
 
 def save(d: dict) -> None:
-    _path().write_text(json.dumps(d, indent=2, ensure_ascii=False))
-    try:
-        _path().chmod(0o600)
-    except OSError:
-        pass
+    config.write_json(_path(), d)
 
 
 # ── firma de la caché (HMAC local) ───────────────────────────────────────────
@@ -167,8 +161,9 @@ def validate(post=_post, now: datetime | None = None) -> dict:
             },
         )
     except urllib.error.HTTPError as e:
-        # el servidor RESPONDIÓ (y dijo que no) → NO es offline. 4xx degrada; 5xx = caída.
-        if 400 <= e.code < 500:
+        # Solo un "no" DEFINITIVO del servidor degrada al instante. 403 (WAF/Cloudflare),
+        # 408, 429 (rate-limit) y 5xx son "no pude preguntar" → gracia, como sin red.
+        if e.code in DENY_CODES:
             cache = {"status": "denied", "http": e.code, "tier": "core",
                      "last_validated_at": now.isoformat(timespec="seconds")}
             cache["sig"] = _sign(cache)

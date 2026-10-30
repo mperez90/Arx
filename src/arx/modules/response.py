@@ -9,16 +9,25 @@ se propone una remediación con su nivel:
 
 "Voluntad de acero" = Tier 0/1 sin fatiga; lo irreversible es del humano.
 
-Nota de honestidad: la EJECUCIÓN real de acciones de sistema (bloqueo de puerto,
-SIGSTOP, revertir fichero) requiere Linux + root en el host destino. Aquí se decide
-y se registra el plan; la ejecución se realiza en el host (marcada como tal), nunca
-se finge hecha.
+Salvaguardas contra el auto-daño (una defensa que tumba su propio servidor es peor que
+ninguna):
+  · Memoria por hallazgo (huella estable): lo ya visto no se re-ejecuta ni se re-registra
+    cada barrido; solo cuenta lo NUEVO o lo que cambia de estado.
+  · Intocables: el puerto SSH, PID 1, el propio Arx y lo que el operador marcó como
+    fuera-de-límites nunca reciben una acción automática — solo se observan.
+  · Un bloqueo que expira y cuyo hallazgo REAPARECE no se re-bloquea en bucle: escala a
+    Tier 2 (lo decide el humano).
+  · Freno de seguridad: más de MAX_TIER1_PER_HOUR acciones automáticas en una hora →
+    Arx deja de actuar y solo observa (algo raro pasa, o es él quien se equivoca).
+
+Nota de honestidad: la EJECUCIÓN real de acciones de sistema requiere Linux + root en el
+host destino. Fuera de eso se decide y se registra el plan, nunca se finge hecho.
 """
 from __future__ import annotations
 
 import hashlib
-import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -27,6 +36,7 @@ from datetime import datetime, timedelta, timezone
 from arx import config
 
 DEFAULT_TTL_MIN = 60  # los bloqueos Tier 1 auto-expiran (reversibles por doctrina)
+MAX_TIER1_PER_HOUR = 5
 
 # kind → (tier, acción de remediación, reversible, por qué ese nivel)
 _PLAN: dict[str, tuple[int, str, bool, str]] = {
@@ -34,6 +44,8 @@ _PLAN: dict[str, tuple[int, str, bool, str]] = {
                   "alterar credenciales/ficheros del sistema es sensible → requiere tu palabra"),
     "listen_ports": (1, "bloquear el puerto en firewall (temporal, auto-expira)", True,
                      "bloquear un puerto es reversible y contiene exposición nueva"),
+    "executables": (1, "suspender el proceso (SIGSTOP) para análisis", True,
+                    "suspender es reversible (SIGCONT); no destruye evidencia"),
     "processes": (1, "suspender el proceso (SIGSTOP) para análisis", True,
                   "suspender es reversible (SIGCONT); no destruye evidencia"),
     "login_users": (2, "terminar la sesión y rotar credenciales", False,
@@ -43,6 +55,10 @@ _PLAN: dict[str, tuple[int, str, bool, str]] = {
     "gauge": (0, "registrar y vigilar la tendencia", True, "señal débil; observar primero"),
 }
 
+# Procesos que jamás se suspenden automáticamente (dejarían el host inaccesible o a Arx ciego).
+_PROTECTED_EXES = {"sshd", "systemd", "init", "dbus-daemon", "journald", "systemd-journald",
+                   "auditd", "falco", "osqueryd", "python3", "arx"}
+
 
 def classify(finding: dict) -> dict:
     tier, action, reversible, why = _PLAN.get(
@@ -51,38 +67,18 @@ def classify(finding: dict) -> dict:
     return {"tier": tier, "action": action, "reversible": reversible, "why": why}
 
 
-def _incidents_path():
-    return config.state_dir() / "incidents.jsonl"
+def fingerprint(finding: dict) -> str:
+    """Huella estable de un hallazgo: misma amenaza → misma huella entre barridos."""
+    basis = finding.get("fp_key") or f"{finding.get('kind', '')}|{finding.get('detail', '')}"
+    return hashlib.sha1(basis.encode()).hexdigest()[:10]
 
 
-def record(entry: dict) -> None:
-    entry = {"at": datetime.now(timezone.utc).isoformat(timespec="seconds"), **entry}
-    with open(_incidents_path(), "a", encoding="utf-8") as f:
-        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
-def _is_linux_root() -> bool:
-    return sys.platform.startswith("linux") and hasattr(os, "geteuid") and os.geteuid() == 0
-
-
-# ── bloqueos activos con auto-expiración (Tier 1 reversible) ──────────────────
-def _blocks_path():
-    return config.state_dir() / "active_blocks.json"
-
-
-def _load_blocks() -> list[dict]:
-    try:
-        return json.loads(_blocks_path().read_text())
-    except (OSError, ValueError):
-        return []
-
-
-def _save_blocks(blocks: list[dict]) -> None:
-    _blocks_path().write_text(json.dumps(blocks, indent=2, ensure_ascii=False))
-    try:
-        _blocks_path().chmod(0o600)
-    except OSError:
-        pass
+def _iso(dt: datetime) -> str:
+    return dt.isoformat(timespec="seconds")
 
 
 def _parse_dt(s: str | None):
@@ -92,39 +88,176 @@ def _parse_dt(s: str | None):
         return None
 
 
-def register_block(finding: dict, revert_cmd: str, ttl_min: int = DEFAULT_TTL_MIN, now=None) -> None:
-    now = now or datetime.now(timezone.utc)
+def _incidents_path():
+    return config.state_dir() / "incidents.jsonl"
+
+
+def record(entry: dict) -> None:
+    import json
+
+    entry = {"at": _iso(_now()), **entry}
+    fd = os.open(_incidents_path(), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    with os.fdopen(fd, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def _is_linux_root() -> bool:
+    return sys.platform.startswith("linux") and hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+# ── memoria de hallazgos (dedup + escalada) ──────────────────────────────────
+def _findings_path():
+    return config.state_dir() / "findings.json"
+
+
+def load_findings() -> dict:
+    return config.read_json(_findings_path())
+
+
+def _save_findings(st: dict) -> None:
+    config.write_json(_findings_path(), st)
+
+
+# ── intocables ───────────────────────────────────────────────────────────────
+def ssh_ports() -> set[int]:
+    from arx.modules import recon
+
+    ports = {int(p) for p in ((recon.collect_ssh() or {}).get("ports") or []) if str(p).isdigit()}
+    return ports or {22}
+
+
+def _out_of_bounds(cfg: dict) -> list[str]:
+    raw = cfg.get("out_of_bounds") or ""
+    if raw.strip() in ("", "(ninguno)"):
+        return []
+    return [t.strip() for t in re.split(r"[,\s]+", raw) if t.strip()]
+
+
+def protected_reason(finding: dict, cfg: dict | None = None) -> str | None:
+    """Por qué este objetivo NO admite acción automática (None = sí la admite)."""
+    cfg = cfg if cfg is not None else config.load_config()
+    kind, target = finding.get("kind"), finding.get("target") or {}
+    oob = _out_of_bounds(cfg)
+    if kind == "listen_ports" and target.get("port"):
+        port = int(target["port"])
+        if port in ssh_ports():
+            return "puerto SSH: bloquearlo te dejaría fuera del servidor"
+        if str(port) in oob:
+            return "puerto marcado fuera-de-límites"
+    if kind in ("executables", "processes"):
+        name = str(target.get("exe") or target.get("process") or "")
+        base = name.rsplit("/", 1)[-1]
+        if base in _PROTECTED_EXES or name == sys.executable:
+            return f"proceso crítico ({base})"
+        if any(t and t in name for t in oob):
+            return "proceso marcado fuera-de-límites"
+    path = str(target.get("path") or target.get("file") or "")
+    if path and any(path.startswith(t) for t in oob if t.startswith("/")):
+        return "ruta marcada fuera-de-límites"
+    return None
+
+
+# ── bloqueos activos con auto-expiración (Tier 1 reversible) ──────────────────
+def _blocks_path():
+    return config.state_dir() / "active_blocks.json"
+
+
+def _load_blocks() -> list[dict]:
+    return config.read_json(_blocks_path(), [])
+
+
+def _save_blocks(blocks: list[dict]) -> None:
+    config.write_json(_blocks_path(), blocks)
+
+
+def register_block(finding: dict, revert: dict, ttl_min: int = DEFAULT_TTL_MIN, now=None) -> None:
+    now = now or _now()
     blocks = _load_blocks()
     blocks.append(
         {
+            "fp": fingerprint(finding),
             "detail": finding.get("detail"),
-            "revert": revert_cmd,
-            "applied_at": now.isoformat(timespec="seconds"),
-            "expires_at": (now + timedelta(minutes=ttl_min)).isoformat(timespec="seconds"),
+            "revert": revert,
+            "applied_at": _iso(now),
+            "expires_at": _iso(now + timedelta(minutes=ttl_min)),
         }
     )
     _save_blocks(blocks)
 
 
+_LEGACY_REVERT = re.compile(r"^ufw delete deny (\d{1,5})/(tcp|udp)$")
+
+
+def _revert_argv(revert) -> list[str] | None:
+    """Comando de reversión validado. Solo formas conocidas: nunca se ejecuta texto libre."""
+    if isinstance(revert, dict) and revert.get("tool") == "ufw":
+        port, proto = revert.get("port"), revert.get("proto")
+        if isinstance(port, int) and 0 < port < 65536 and proto in ("tcp", "udp"):
+            return ["ufw", "delete", "deny", f"{port}/{proto}"]
+        return None
+    if isinstance(revert, str):  # formato antiguo (texto): solo si encaja exactamente
+        m = _LEGACY_REVERT.match(revert)
+        if m:
+            return ["ufw", "delete", "deny", f"{m.group(1)}/{m.group(2)}"]
+    return None
+
+
 def expire_blocks(now=None) -> list[dict]:
     """Revierte los bloqueos Tier 1 vencidos. En Linux+root ejecuta el revert real."""
-    now = now or datetime.now(timezone.utc)
-    keep, expired = [], []
+    now = now or _now()
+    with config.locked():
+        keep, expired = [], []
+        for b in _load_blocks():
+            exp = _parse_dt(b.get("expires_at"))
+            if exp and exp <= now:
+                argv = _revert_argv(b.get("revert"))
+                if _is_linux_root() and argv:
+                    try:
+                        subprocess.run(argv, capture_output=True, text=True, timeout=15)
+                    except (OSError, subprocess.TimeoutExpired):
+                        pass  # la herramienta ya no está; no romper el bucle de guardia
+                record({"kind": "block_expired", "detail": b.get("detail"), "reverted": argv})
+                expired.append(b)
+            else:
+                keep.append(b)
+        if expired:
+            _save_blocks(keep)
+            st = load_findings()
+            for b in expired:  # si reaparece, ya no se re-bloquea: escala al humano
+                if b.get("fp") in st:
+                    st[b["fp"]]["blocked_before"] = True
+            _save_findings(st)
+    return expired
+
+
+def _active_block(fp: str, now=None) -> dict | None:
+    now = now or _now()
     for b in _load_blocks():
         exp = _parse_dt(b.get("expires_at"))
-        if exp and exp <= now:
-            if _is_linux_root() and b.get("revert"):
-                try:
-                    subprocess.run(b["revert"].split(), capture_output=True, text=True)
-                except OSError:
-                    pass  # la herramienta de revert ya no está; no romper el bucle de guardia
-            record({"kind": "block_expired", "detail": b.get("detail"), "reverted": b.get("revert")})
-            expired.append(b)
-        else:
-            keep.append(b)
-    if expired:
-        _save_blocks(keep)
-    return expired
+        if b.get("fp") == fp and exp and exp > now:
+            return b
+    return None
+
+
+# ── freno de seguridad ───────────────────────────────────────────────────────
+def _actions_path():
+    return config.state_dir() / "tier1_actions.json"
+
+
+def recent_actions(now=None) -> list[str]:
+    now = now or _now()
+    cutoff = now - timedelta(hours=1)
+    return [t for t in config.read_json(_actions_path(), [])
+            if (_parse_dt(t) or cutoff) > cutoff]
+
+
+def breaker_tripped(now=None) -> bool:
+    return len(recent_actions(now)) >= MAX_TIER1_PER_HOUR
+
+
+def _note_action(now=None) -> None:
+    now = now or _now()
+    config.write_json(_actions_path(), recent_actions(now) + [_iso(now)])
 
 
 # ── cola de acciones Tier 2 pendientes de autorización humana ─────────────────
@@ -133,32 +266,24 @@ def _pending_path():
 
 
 def _load_pending() -> list[dict]:
-    try:
-        return json.loads(_pending_path().read_text())
-    except (OSError, ValueError):
-        return []
+    return config.read_json(_pending_path(), [])
 
 
 def _save_pending(pend: list[dict]) -> None:
-    _pending_path().write_text(json.dumps(pend, indent=2, ensure_ascii=False))
-    try:
-        _pending_path().chmod(0o600)
-    except OSError:
-        pass
+    config.write_json(_pending_path(), pend)
 
 
 def _add_pending(finding: dict, plan: dict) -> str:
-    detail = finding.get("detail", "")
-    pid = hashlib.sha1(detail.encode()).hexdigest()[:6]  # estable por amenaza → dedup natural
+    pid = fingerprint(finding)[:6]  # estable por amenaza → dedup natural
     pend = _load_pending()
     if not any(p["id"] == pid for p in pend):
         pend.append(
             {
                 "id": pid,
                 "sev": finding.get("sev"),
-                "detail": detail,
+                "detail": finding.get("detail", ""),
                 "remediation": plan["action"],
-                "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "at": _iso(_now()),
             }
         )
         _save_pending(pend)
@@ -171,30 +296,58 @@ def list_pending() -> list[dict]:
 
 def authorize_pending(pid: str) -> dict | None:
     """Quita el pendiente de la cola y lo registra como autorizado. Devuelve el item o None."""
-    pend = _load_pending()
-    item = next((p for p in pend if p["id"] == pid), None)
-    if item is None:
-        return None
-    _save_pending([p for p in pend if p["id"] != pid])
+    with config.locked():
+        pend = _load_pending()
+        item = next((p for p in pend if p["id"] == pid), None)
+        if item is None:
+            return None
+        _save_pending([p for p in pend if p["id"] != pid])
     record({"kind": "tier2_authorized", "detail": item["detail"], "remediation": item["remediation"]})
     return item
 
 
-def _execute_tier1(finding: dict) -> tuple[str, str | None]:
+def forget(fp: str) -> dict | None:
+    """Olvida un hallazgo aceptado (y su pendiente Tier 2). Devuelve la entrada o None."""
+    with config.locked():
+        st = load_findings()
+        entry = st.pop(fp, None)
+        if entry is None:
+            return None
+        _save_findings(st)
+        _save_pending([p for p in _load_pending() if p["id"] != fp[:6]])
+    return entry
+
+
+# ── ejecución Tier 1 ─────────────────────────────────────────────────────────
+def _ufw_active() -> bool:
+    try:
+        r = subprocess.run(["ufw", "status"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    first = (r.stdout.splitlines() or [""])[0].lower()
+    return r.returncode == 0 and "inactive" not in first and "inactivo" not in first
+
+
+def _execute_tier1(finding: dict) -> tuple[str, dict | None]:
     """Ejecuta una remediación Tier 1 reversible SOLO en Linux+root.
 
-    Devuelve (status, comando_para_revertir). Fuera de Linux+root NO finge: informa que
-    queda listo para ejecutar en el destino. Nunca hace nada irreversible.
+    Devuelve (status, revert). Fuera de Linux+root NO finge: informa que queda listo para
+    ejecutar en el destino. Nunca hace nada irreversible.
     """
     if not _is_linux_root():
         return "listo para ejecutar en destino (requiere Linux + root)", None
     kind = finding.get("kind")
     target = finding.get("target") or {}
-    if kind == "listen_ports" and target.get("port") and shutil.which("ufw"):
-        proto, port = target.get("proto", "tcp"), target["port"]
-        r = subprocess.run(["ufw", "deny", f"{port}/{proto}"], capture_output=True, text=True)
+    if kind == "listen_ports" and target.get("port"):
+        if not shutil.which("ufw"):
+            return "sin ufw: no hay ejecutor seguro de bloqueo en este host", None
+        if not _ufw_active():
+            # `ufw deny` "funciona" con ufw apagado pero no filtra nada → no fingir contención
+            return "ufw está INACTIVO: un bloqueo no tendría efecto (actívalo o decide tú)", None
+        proto, port = target.get("proto", "tcp"), int(target["port"])
+        r = subprocess.run(["ufw", "deny", f"{port}/{proto}"], capture_output=True, text=True, timeout=15)
         if r.returncode == 0:
-            revert = f"ufw delete deny {port}/{proto}"
+            revert = {"tool": "ufw", "port": port, "proto": proto}
             register_block(finding, revert)
             return f"puerto {port}/{proto} bloqueado en ufw (auto-expira en {DEFAULT_TTL_MIN} min)", revert
         return f"no se pudo bloquear el puerto ({r.stderr.strip()[:48]})", None
@@ -204,33 +357,70 @@ def _execute_tier1(finding: dict) -> tuple[str, str | None]:
     return "propuesta (sin ejecutor automático seguro para este tipo)", None
 
 
-def handle(finding: dict, enforce: bool = False, authorized: bool = False) -> dict:
-    """Decide y registra la respuesta a un hallazgo. Devuelve el desenlace."""
+def handle(finding: dict, enforce: bool = False, authorized: bool = False,
+           cfg: dict | None = None, now=None) -> dict:
+    """Decide y registra la respuesta a un hallazgo. Devuelve el desenlace.
+
+    `outcome["new"]` es True solo la primera vez que se ve esta amenaza: es la señal que
+    usan las alertas y el motor LLM para no repetirse cada barrido.
+    """
+    now = now or _now()
     plan = classify(finding)
     tier = plan["tier"]
+    fp = fingerprint(finding)
     outcome = {
+        "fp": fp,
         "sev": finding.get("sev"),
         "detail": finding.get("detail"),
         "tier": tier,
         "remediation": plan["action"],
         "reversible": plan["reversible"],
     }
-    if tier == 0:
-        outcome["status"] = "observado y registrado"
-    elif tier == 1:
-        if enforce:
+    with config.locked():
+        st = load_findings()
+        entry = st.get(fp)
+        outcome["new"] = entry is None
+        entry = entry or {"first_seen": _iso(now), "seen": 0, "kind": finding.get("kind"),
+                          "detail": finding.get("detail"), "set": finding.get("set"),
+                          "item": finding.get("item")}
+        entry["seen"] += 1
+        entry["last_seen"] = _iso(now)
+
+        reason = protected_reason(finding, cfg) if tier == 1 else None
+        if tier == 0:
+            status = "observado y registrado"
+        elif tier == 1 and reason:
+            outcome["tier"] = 0
+            status = f"protegido ({reason}) — solo se observa"
+        elif tier == 1 and entry.get("blocked_before"):
+            outcome["tier"] = 2
+            pid = _add_pending(finding, {"action": f"{plan['action']} — REAPARECIÓ tras expirar el bloqueo"})
+            outcome["pending_id"] = pid
+            status = f"reapareció tras expirar el bloqueo → decide tú: arx authorize {pid}  ·  o acepta: arx accept {fp}"
+        elif tier == 1 and not enforce:
+            status = "propuesta auto — activa --enforce para aplicar"
+        elif tier == 1 and (blk := _active_block(fp, now)):
+            status = f"ya contenido (bloqueo activo hasta {blk['expires_at'][11:16]} UTC)"
+        elif tier == 1 and breaker_tripped(now):
+            status = (f"FRENO DE SEGURIDAD: ya hubo {MAX_TIER1_PER_HOUR} acciones automáticas en la "
+                      "última hora → solo observo")
+        elif tier == 1:
             status, revert = _execute_tier1(finding)
-            outcome["status"] = status
             if revert:
                 outcome["revert"] = revert
-        else:
-            outcome["status"] = "propuesta auto — activa --enforce para aplicar"
-    else:  # tier 2
-        if authorized:
-            outcome["status"] = "autorizada por palabra ✓"
-        else:
+                _note_action(now)
+        elif authorized:
+            status = "autorizada por palabra ✓"
+        else:  # tier 2
             pid = _add_pending(finding, plan)
-            outcome["status"] = f"PENDIENTE (id {pid}) — autoriza con: arx authorize {pid}"
             outcome["pending_id"] = pid
-    record({"kind": "incident", **outcome})
+            status = f"PENDIENTE (id {pid}) — autoriza con: arx authorize {pid}"
+        outcome["status"] = status
+
+        changed = entry.get("status") != status
+        entry["status"] = status
+        st[fp] = entry
+        _save_findings(st)
+    if outcome["new"] or changed:  # registrar solo lo nuevo o lo que cambia, no cada barrido
+        record({"kind": "incident", **outcome})
     return outcome

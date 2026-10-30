@@ -6,16 +6,25 @@ Toma instantáneas del comportamiento del host y las funde en una línea base:
   · MEDIDORES (carga, memoria, disco, conexiones): min/max/media → rango normal.
 
 Conservador: aprender > bloquear durante la ventana. Integridad de arranque: se
-fija la huella de ficheros críticos (authorized_keys, sudoers, passwd, set SUID)
-en el primer muestreo y se avisa si cambian mientras se aprende — para no aprender
-a un intruso como "normal". `compare()` es la función que usa `guard` para detectar
-desvíos contra esta base.
+fija la huella de ficheros críticos (authorized_keys, sudoers, passwd, cron, units de
+systemd, ld.so.preload, set SUID) en el primer muestreo y se avisa si cambian mientras
+se aprende — para no aprender a un intruso como "normal". `compare()` es la función que
+usa `guard` para detectar desvíos contra esta base.
+
+Identidades estables (para no inundar de falsos positivos):
+  · ejecutables por RUTA real (/proc/<pid>/exe), no por el nombre corto de 15 caracteres
+    que cualquier malware puede imitar ("sshd", "kworker");
+  · puertos como "proto puerto exposición" ("tcp 22 all"): 0.0.0.0:22 y [::]:22 son lo
+    mismo; los UDP del rango efímero (DHCP, NTP, mDNS) no se aprenden ni se vigilan.
 """
 from __future__ import annotations
 
+import glob
 import hashlib
+import os
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 from arx import config
 from arx.modules import recon
@@ -25,8 +34,16 @@ KIND_SEV = {
     "listen_ports": "high",
     "login_users": "high",
     "services": "med",
+    "executables": "med",
     "processes": "med",
 }
+# Ejecutar desde estas rutas es típico de malware descargado → severidad alta.
+_SUSPECT_DIRS = ("/tmp/", "/dev/shm/", "/var/tmp/", "/run/user/")
+# Binarios del sistema (gestionados por paquetes): que un admin ejecute uno nuevo es lo normal.
+# Se registran con severidad baja; lo que corre desde /opt, /home, /srv… queda en media.
+_SYSTEM_DIRS = ("/usr/bin/", "/usr/sbin/", "/bin/", "/sbin/", "/usr/lib/", "/usr/libexec/",
+                "/lib/", "/usr/local/bin/", "/snap/")
+FORMAT = 2  # v2: executables + puertos normalizados
 
 
 def _now() -> str:
@@ -38,12 +55,55 @@ def _baseline_path():
 
 
 # ── instantánea de comportamiento ────────────────────────────────────────────
-def _processes() -> list[str]:
-    for args in (["ps", "-eo", "comm="], ["ps", "-axo", "comm="], ["ps", "axo", "comm="]):
-        out = recon._run(args)
-        if out:
-            return sorted({l.strip().rsplit("/", 1)[-1] for l in out.splitlines() if l.strip()})
-    return []
+def _executables() -> list[str]:
+    """Rutas de los binarios en ejecución. Linux: /proc/<pid>/exe (no falsificable por
+    nombre). Sin /proc (macOS/dev): `ps -axo comm=`, que allí ya da la ruta."""
+    proc = Path("/proc")
+    if proc.is_dir():
+        exes = set()
+        for d in proc.iterdir():
+            if not d.name.isdigit():
+                continue
+            try:
+                exe = os.readlink(d / "exe")
+            except OSError:
+                continue  # hilo del kernel, proceso ya terminado o sin permiso
+            exes.add(exe.removesuffix(" (deleted)"))
+        if exes:
+            return sorted(exes)
+    out = recon._run(["ps", "-axo", "comm="]) or recon._run(["ps", "-eo", "comm="])
+    return sorted({l.strip() for l in (out or "").splitlines() if l.strip()})
+
+
+def _ephemeral_range() -> tuple[int, int]:
+    raw = recon._read("/proc/sys/net/ipv4/ip_local_port_range")
+    try:
+        lo, hi = (int(x) for x in raw.split())
+        return lo, hi
+    except (AttributeError, ValueError):
+        return 32768, 60999
+
+
+def port_item(proto: str, local: str, exposed: str) -> str | None:
+    """'tcp' '[::]:22' 'all' → 'tcp 22 all'. None si no aplica (UDP efímero, sin puerto)."""
+    try:
+        port = int(local.rsplit(":", 1)[1])
+    except (IndexError, ValueError):
+        return None
+    proto = proto.lower()
+    if proto.startswith("udp"):
+        lo, hi = _ephemeral_range()
+        if lo <= port <= hi:
+            return None
+        proto = "udp"
+    else:
+        proto = "tcp"
+    return f"{proto} {port} {exposed}"
+
+
+def _listen_ports() -> list[str]:
+    items = {port_item(p["proto"], p["local"], p["exposed"]) for p in recon.collect_ports()}
+    return sorted(i for i in items if i)
 
 
 def _login_users() -> list[str]:
@@ -93,12 +153,11 @@ def _gauges() -> dict:
 
 
 def snapshot() -> dict:
-    ports = [f"{p['proto']} {p['local']}" for p in recon.collect_ports()]
     return {
         "at": _now(),
         "sets": {
-            "processes": _processes(),
-            "listen_ports": sorted(ports),
+            "executables": _executables(),
+            "listen_ports": _listen_ports(),
             "services": recon.collect_services() or [],
             "login_users": _login_users(),
         },
@@ -107,27 +166,54 @@ def snapshot() -> dict:
 
 
 # ── integridad de arranque ───────────────────────────────────────────────────
-def integrity_fingerprint() -> dict:
+def _h(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()[:16]
+
+
+def _hash_files(paths: list[str]) -> str | None:
+    """Huella conjunta de varios ficheros (ruta + contenido). None si no hay ninguno legible."""
+    parts = [f"{p}\0{d}" for p in sorted(paths) if (d := recon._read(p)) is not None]
+    return _h("\0\0".join(parts)) if parts else None
+
+
+def suid_fingerprint() -> str | None:
+    """Recorre el disco (find -perm -4000): CARO. `guard` lo hace cada hora, no cada barrido."""
+    suid = recon.collect_users().get("suid_binaries")
+    return _h("\n".join(sorted(suid))) if suid is not None else None
+
+
+def integrity_fingerprint(include_suid: bool = True) -> dict:
     fp: dict = {}
     for name, path in [
         ("authorized_keys_root", "/root/.ssh/authorized_keys"),
         ("sudoers", "/etc/sudoers"),
         ("passwd", "/etc/passwd"),
+        ("ld_preload", "/etc/ld.so.preload"),
     ]:
         data = recon._read(path)
         if data is not None:
-            fp[name] = hashlib.sha256(data.encode()).hexdigest()[:16]
-    users = recon.collect_users()
-    if users.get("suid_binaries") is not None:
-        joined = "\n".join(sorted(users["suid_binaries"]))
-        fp["suid_set"] = hashlib.sha256(joined.encode()).hexdigest()[:16]
+            fp[name] = _h(data)
+    groups = {
+        "authorized_keys_users": glob.glob("/home/*/.ssh/authorized_keys"),
+        "sudoers_d": glob.glob("/etc/sudoers.d/*"),
+        "cron": ["/etc/crontab", *glob.glob("/etc/cron.d/*"), *glob.glob("/var/spool/cron/crontabs/*")],
+        "systemd_units": glob.glob("/etc/systemd/system/*.service") + glob.glob("/etc/systemd/system/*.timer"),
+    }
+    for name, paths in groups.items():
+        v = _hash_files(paths)
+        if v:
+            fp[name] = v
+    if include_suid:
+        v = suid_fingerprint()
+        if v:
+            fp["suid_set"] = v
     return fp
 
 
 # ── modelo de la base ────────────────────────────────────────────────────────
 def new_baseline() -> dict:
     return {
-        "meta": {"created": _now(), "updated": _now(), "samples": 0, "sealed": False},
+        "meta": {"created": _now(), "updated": _now(), "samples": 0, "sealed": False, "format": FORMAT},
         "integrity": {},
         "integrity_alerts": [],
         "sets": {},
@@ -159,13 +245,14 @@ def fold(baseline: dict, snap: dict, check_integrity: bool = True) -> dict:
 
 def _target_for(key: str, item: str) -> dict:
     """Objetivo estructurado del hallazgo, para que la respuesta pueda actuar sobre él."""
-    if key == "listen_ports":  # "tcp 0.0.0.0:4444"
+    if key == "listen_ports":  # "tcp 4444 all"
         try:
-            proto, local = item.split(" ", 1)
-            host, port = local.rsplit(":", 1)
-            return {"proto": proto, "addr": host, "port": int(port)}
+            proto, port, exposed = item.split(" ")
+            return {"proto": proto, "port": int(port), "exposed": exposed}
         except (ValueError, TypeError):
             return {}
+    if key == "executables":
+        return {"exe": item}
     if key == "processes":
         return {"process": item}
     if key == "login_users":
@@ -178,16 +265,26 @@ def compare(baseline: dict, snap: dict) -> list[dict]:
     anomalies: list[dict] = []
     sets = baseline.get("sets", {})
     for key, observed in snap["sets"].items():
-        known = set(sets.get(key, {}))
+        if key not in sets:
+            continue  # la base no aprendió este conjunto (base antigua): no inundar de "nuevos"
+        known = set(sets[key])
         for item in observed:
             if item not in known:
+                sev = KIND_SEV.get(key, "med")
+                why = f"no aparece en la línea base de {key} ({len(known)} conocidos)"
+                if key == "executables" and item.startswith(_SUSPECT_DIRS):
+                    sev, why = "high", why + "; además corre desde un directorio temporal"
+                elif key == "executables" and item.startswith(_SYSTEM_DIRS):
+                    sev = "low"
                 anomalies.append(
                     {
-                        "sev": KIND_SEV.get(key, "med"),
+                        "sev": sev,
                         "kind": key,
                         "detail": f"nuevo en {key}: {item}",
-                        "why": f"no aparece en la línea base de {key} ({len(known)} conocidos)",
+                        "why": why,
                         "target": _target_for(key, item),
+                        "set": key,
+                        "item": item,
                     }
                 )
     gauges = baseline.get("gauges", {})
@@ -202,25 +299,55 @@ def compare(baseline: dict, snap: dict) -> list[dict]:
                         "kind": "gauge",
                         "detail": f"{key}={val:.1f} sobre el rango aprendido [{g['min']:.1f}, {g['max']:.1f}]",
                         "why": "valor fuera del comportamiento normal aprendido",
+                        "fp_key": f"gauge|{key}",  # el valor cambia cada barrido; la amenaza no
                     }
                 )
     return anomalies
 
 
 # ── persistencia ─────────────────────────────────────────────────────────────
-def load() -> dict | None:
-    import json
+def _migrate(b: dict) -> dict:
+    """Base v1 → v2: puertos 'tcp 0.0.0.0:22' → 'tcp 22 all'. Los ejecutables no se
+    pueden deducir de los nombres cortos de v1: hay que re-aprender (guard lo avisa)."""
+    if b.get("meta", {}).get("format", 1) >= FORMAT:
+        return b
+    old = b.get("sets", {}).get("listen_ports")
+    if old is not None:
+        new: dict = {}
+        for item, n in old.items():
+            try:
+                proto, local = item.split(" ", 1)
+            except ValueError:
+                continue
+            norm = port_item(proto, local, recon._classify_exposure(local))
+            if norm:
+                new[norm] = new.get(norm, 0) + n
+        b["sets"]["listen_ports"] = new
+    b["sets"].pop("processes", None)
+    b["meta"]["format"] = FORMAT
+    b["meta"]["migrated_from_v1"] = True
+    return b
 
-    try:
-        return json.loads(_baseline_path().read_text())
-    except (OSError, ValueError):
-        return None
+
+def load() -> dict | None:
+    b = config.read_json(_baseline_path(), None)
+    return _migrate(b) if isinstance(b, dict) and "meta" in b else None
 
 
 def save(baseline: dict) -> None:
-    import json
+    config.write_json(_baseline_path(), baseline)
 
-    _baseline_path().write_text(json.dumps(baseline, indent=2, ensure_ascii=False))
+
+def accept(key: str, item: str) -> bool:
+    """Incorpora a la base un cambio legítimo (p. ej. instalaste nginx → 'tcp 80 all')."""
+    with config.locked("baseline"):
+        b = load()
+        if not b or key not in b.get("sets", {}):
+            return False
+        b["sets"][key][item] = b["sets"][key].get(item, 0) + 1
+        b["meta"]["updated"] = _now()
+        save(b)
+    return True
 
 
 # ── informe / estado ─────────────────────────────────────────────────────────

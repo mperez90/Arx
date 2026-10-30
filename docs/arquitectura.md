@@ -6,9 +6,13 @@
 path: estado del sistema, syscalls/ficheros, comportamiento en kernel (eBPF), integridad.
 Produce eventos normalizados.
 
-**Capa lenta (razonamiento).** Un core de razonamiento open-source (MIT) trabaja **async,
-fuera del hot path**: correlaciona eventos, decide, redacta el porqué en lenguaje natural,
-propone respuesta. Nunca bloquea la detección.
+**Capa lenta (razonamiento).** El motor de Arx (cliente LLM propio, con las claves del
+cliente) trabaja **fuera del hot path** y **solo cuando la capa rápida encuentra algo
+nuevo**: recibe el expediente completo (hallazgos, respuesta aplicada, contexto del host,
+historial reciente), correlaciona, redacta el porqué en lenguaje natural y propone el
+siguiente paso. Agrupa lo nuevo en ventanas y respeta un presupuesto diario: un servidor
+tranquilo no gasta tokens. La telemetría se le entrega marcada como dato no confiable
+(defensa ante inyección de prompt). Nunca bloquea la detección.
 
 Regla: si la capa rápida puede decidir sola y es reversible, actúa ya; el razonamiento
 explica y refina después. Nunca es requisito para contener.
@@ -30,7 +34,7 @@ No solo red: **software** (procesos, binarios, servicios, cron, paquetes), **har
 privilegios, horarios). Aprender > bloquear durante la ventana. Integridad de arranque
 para no aprender a un intruso como "normal". Deriva controlada.
 
-## 4. Ejecución de herramientas aislada (defensivo)
+## 4. Ejecución de herramientas aislada (defensivo) — *planificado*
 
 Las herramientas del propio agente (recon, verificación de exposición) **no** corren con
 capacidades amplias en el proceso principal: se ejecutan en **contenedores hermanos

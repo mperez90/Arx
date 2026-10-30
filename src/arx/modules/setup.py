@@ -4,8 +4,9 @@ Configura, en orden:
   1) proveedores LLM y orden de fallback (OpenAI → Anthropic → KIMI),
   2) palabra de autorización (se guarda solo su hash),
   3) alcance y fuera-de-límites,
-  4) ventana de baseline,
-  5) licencia (core/pro/business).
+  4) ventana de baseline y presupuesto del motor LLM,
+  5) licencia (core/pro/business),
+  6) alertas salientes (Telegram / webhook).
 
 Escribe config.json + secrets.json (0600) en el dir de Arx. `arx setup --show`
 muestra la configuración actual con los secretos redactados.
@@ -19,7 +20,7 @@ from arx import config
 # (proveedor, modelo por defecto). El orden es también el orden de fallback base.
 PROVIDERS = [
     ("openai", "gpt-5.4-mini"),
-    ("anthropic", "claude-sonnet-5"),
+    ("anthropic", "claude-sonnet-5-5"),
     ("kimi", "kimi-k3"),
 ]
 
@@ -47,6 +48,11 @@ def show() -> int:
     print(f"  alcance        {cfg.get('scope', '(todo el host)')}")
     print(f"  fuera-límites  {cfg.get('out_of_bounds', '(ninguno)')}")
     print(f"  baseline       {cfg.get('baseline_days', '?')} días")
+    print(f"  LLM            solo ante hallazgos nuevos · máx {cfg.get('llm_daily_budget', 48)}/día")
+    n = cfg.get("notify") or {}
+    tg = "sí" if n.get("telegram_chat_id") and config.load_secrets().get("telegram_bot_token") else "no"
+    print(f"  alertas        telegram {tg} · webhook {'sí' if n.get('webhook_url') else 'no'} "
+          f"· desde sev {n.get('min_sev', 'high')}")
     print(f"  licencia       {cfg.get('license_tier', 'core')}\n")
     return 0
 
@@ -85,10 +91,13 @@ def run(show_only: bool = False) -> int:
 
     print("\n3) Alcance")
     scope = _ask("   Qué defiende Arx", "todo el host")
-    oob = _ask("   Fuera de límites (rutas/servicios que NO debe tocar)", "(ninguno)")
+    oob = _ask("   Fuera de límites — puertos, rutas o procesos que NUNCA debe tocar, "
+               "separados por coma (el puerto SSH ya está protegido)", cfg.get("out_of_bounds", "(ninguno)"))
 
-    print("\n4) Aprendizaje")
+    print("\n4) Aprendizaje y motor")
     days = _ask("   Días de ventana de baseline", "7")
+    budget = _ask("   Máximo de consultas al LLM por día (solo se usa ante hallazgos nuevos)",
+                  str(cfg.get("llm_daily_budget", 48)))
 
     print("\n5) Licencia")
     tier = _ask("   Tier (core/pro/business)", "core").lower()
@@ -116,6 +125,17 @@ def run(show_only: bool = False) -> int:
                 print(f"   ⚠ Sin conexión para activar ({e}). "
                       "Guardada; reintenta:  arx license activate <LLAVE>")
 
+    print("\n6) Alertas  (Enter = omitir)")
+    notify_cfg = dict(cfg.get("notify") or {})
+    tg_token = _ask_secret("   Token del bot de Telegram (vacío = mantener/omitir)")
+    if tg_token:
+        store["telegram_bot_token"] = tg_token
+    if tg_token or store.get("telegram_bot_token"):
+        notify_cfg["telegram_chat_id"] = _ask("   chat_id de Telegram al que avisar",
+                                              notify_cfg.get("telegram_chat_id"))
+    notify_cfg["webhook_url"] = _ask("   URL de webhook (Slack/Discord/n8n…)", notify_cfg.get("webhook_url"))
+    notify_cfg["min_sev"] = _ask("   Avisar desde severidad (crit/high/med)", notify_cfg.get("min_sev", "high"))
+
     cfg.update(
         {
             "providers": providers,
@@ -124,6 +144,8 @@ def run(show_only: bool = False) -> int:
             "scope": scope,
             "out_of_bounds": oob,
             "baseline_days": int(days) if days.isdigit() else 7,
+            "llm_daily_budget": int(budget) if budget.isdigit() else 48,
+            "notify": {k: v for k, v in notify_cfg.items() if v},
             "license_tier": tier if tier in ("core", "pro", "business") else "core",
         }
     )
@@ -133,6 +155,5 @@ def run(show_only: bool = False) -> int:
     print("\n✓ Configuración guardada:")
     print(f"    {config.config_path()}  (0600)")
     print(f"    {config.secrets_path()}  (0600)")
-    print("    En producción Arx los deja inmutables (chattr +i) tras el setup.")
     print("\nSiguiente paso:  arx recon\n")
     return 0

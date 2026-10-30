@@ -4,7 +4,7 @@
 *normal* looks like, and answers threats in real time — relentless on what can be undone,
 and never touching the irreversible without you.
 
-> **Status:** v0.01 · Core lifecycle complete, working end-to-end. Not yet released.
+> **Status:** v0.0.1 · Core lifecycle complete, working end-to-end. Not yet released.
 > © ASL — Advanced Systems Laboratories.
 
 ---
@@ -74,8 +74,8 @@ ranks what matters — is where the real work lives, and it stays in the code.
 | **Pro** | managed threat intelligence, advanced detections, authorized self-testing |
 | **Business** | fleet operation, central console, correlation, compliance, MDR |
 
-The reasoning core is open-source (MIT) — see [`NOTICE`](NOTICE). Core is licensed under the
-Business Source License; see [`LICENSE`](LICENSE).
+Core is licensed under the Business Source License; see [`LICENSE`](LICENSE) and
+[`NOTICE`](NOTICE).
 
 ---
 

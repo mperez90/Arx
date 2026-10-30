@@ -1,20 +1,11 @@
-Arx incorpora y se construye sobre software de terceros:
+Arx — avisos de terceros
 
-────────────────────────────────────────────────────────────
-hermes-agent  (el "núcleo" / motor de razonamiento de Arx)
-Copyright (c) 2025 Nous Research
-Licencia: MIT
+Arx Core es código propio y no incorpora ni redistribuye código fuente de terceros.
+Solo usa la biblioteca estándar de Python.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, subject to the inclusion of the above copyright
-notice and this permission notice in all copies or substantial portions.
+Herramientas del sistema que Arx puede invocar si están instaladas en el host (se
+ejecutan como programas externos, no se distribuyen con Arx y conservan sus propias
+licencias): osquery, auditd/ausearch, Falco, ufw, systemd, iproute2 (ss/ip), procps.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.
-────────────────────────────────────────────────────────────
-
-Pendiente antes del release: auditoría de licencias de todas las dependencias
-transitivas (verificar que ninguna sea GPL/AGPL que imponga obligaciones sobre
-los tiers cerrados Pro/Business).
+Si en el futuro Arx incorpora o redistribuye código de terceros, su aviso de copyright
+y licencia se añadirán aquí.

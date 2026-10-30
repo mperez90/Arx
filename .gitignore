@@ -29,3 +29,6 @@ backend/
 
 # OS
 .DS_Store
+
+# Plan de desarrollo interno — fuera del Core source-available
+DevelopDocs/

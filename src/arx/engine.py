@@ -8,8 +8,8 @@ Sin dependencias externas: habla el REST de cada proveedor con urllib (el Core n
 arrastra SDKs que cambian). El transporte (`post`) es inyectable para poder testear
 la lógica de fallback sin red.
 
-Este motor es la capa LENTA: razona async, fuera del hot path de detección.
-Núcleo conceptual: hermes-agent (MIT · Nous Research) — ver NOTICE.
+Este motor es la capa LENTA: razona fuera del hot path de detección, y `guard` solo lo
+despierta cuando la capa determinista encuentra algo NUEVO.
 """
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ class ProviderError(Exception):
     """Ningún proveedor pudo atender la petición."""
 
 
-def _http_post(url: str, headers: dict, payload: dict, timeout: int = 60) -> dict:
+def _http_post(url: str, headers: dict, payload: dict, timeout: int = 180) -> dict:
     data = json.dumps(payload).encode()
     req = urllib.request.Request(
         url, data=data, method="POST",
@@ -53,17 +53,28 @@ def _build(prov: str, key: str, model: str, system: str | None,
     if not base:
         raise ProviderError(f"proveedor desconocido: {prov}")
     msgs = ([{"role": "system", "content": system}] if system else []) + messages
-    return base, {"Authorization": f"Bearer {key}"}, {"model": model, "messages": msgs}
+    payload = {"model": model, "messages": msgs}
+    # Los modelos de razonamiento gastan tokens pensando: un tope bajo devuelve respuesta vacía.
+    # OpenAI (serie gpt-5) usa max_completion_tokens; Kimi (compatible OpenAI) usa max_tokens.
+    payload["max_completion_tokens" if prov == "openai" else "max_tokens"] = max_tokens
+    return base, {"Authorization": f"Bearer {key}"}, payload
 
 
 def _parse(prov: str, resp: dict) -> str:
     if prov == "anthropic":
-        return resp["content"][0]["text"]
-    return resp["choices"][0]["message"]["content"]
+        if resp.get("stop_reason") == "refusal":
+            raise ProviderError("el modelo declinó la petición")
+        # Los modelos actuales pueden abrir con un bloque `thinking`: tomar el primer `text`.
+        text = next((b.get("text") for b in resp["content"] if b.get("type") == "text"), None)
+    else:
+        text = resp["choices"][0]["message"]["content"]
+    if not text:
+        raise ProviderError("respuesta vacía")
+    return text
 
 
 class Engine:
-    def __init__(self, cfg: dict | None = None, post=_http_post, max_tokens: int = 2048):
+    def __init__(self, cfg: dict | None = None, post=_http_post, max_tokens: int = 16000):
         self.cfg = cfg if cfg is not None else config.load_config()
         self._post = post
         self.max_tokens = max_tokens

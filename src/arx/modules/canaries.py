@@ -1,17 +1,23 @@
 """Arx · canaries — señuelos / honeytokens.
 
 Planta ficheros-cebo con nombres que un atacante querría abrir (`.aws_credentials`,
-`id_rsa_backup`, …). Contenido inerte pero verosímil, con un marcador único. Nadie
-legítimo los toca → cualquier modificación/borrado es señal fuerte de intruso.
+`id_rsa_backup`, …). Contenido inerte pero VEROSÍMIL y sin ninguna marca que delate que
+es un señuelo; cada uno lleva un token único (registrado en el estado de Arx) para poder
+rastrear una fuga si alguien lo usa fuera. Nadie legítimo los toca → cualquier acceso es
+señal fuerte de intruso.
 
-MVP: verificación por sondeo (sha256 + inode), portable a cualquier SO. En Linux el
-objetivo de producción es inotify en tiempo real (lo consume `guard`); el sondeo es el
-respaldo. `check()` devuelve hallazgos en el mismo formato que el resto de detección.
+Detección, de mejor a peor:
+  · auditd (regla -p rwa, clave arx_canary): lectura/escritura con el PROCESO que la hizo
+    — lo emite `sensors.read_auditd_events`.
+  · Sondeo por `stat` (portable, sin abrir el fichero para no contaminar la señal):
+    borrado, recreado (inode), modificado (tamaño/mtime) y LEÍDO (atime avanza; con
+    `relatime`, la primera lectura tras plantarlo siempre actualiza atime).
 """
 from __future__ import annotations
 
+import base64
 import hashlib
-import json
+import os
 import secrets
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,8 +25,7 @@ from pathlib import Path
 from arx import config
 from arx.modules import recon
 
-DECOY_NAMES = [".aws_credentials", "id_rsa_backup", "wallet.dat", "db_dump.sql", ".env.prod"]
-MARKER = "ARX-CANARY-DO-NOT-EDIT"
+DECOY_NAMES = [".aws_credentials", "id_rsa_backup", "db_dump.sql", ".env.prod", "wallet.dat"]
 
 
 def _now() -> str:
@@ -32,33 +37,44 @@ def _path():
 
 
 def _load() -> dict:
-    try:
-        return json.loads(_path().read_text())
-    except (OSError, ValueError):
-        return {}
+    return config.read_json(_path())
 
 
 def _save(d: dict) -> None:
-    _path().write_text(json.dumps(d, indent=2, ensure_ascii=False))
-    try:
-        _path().chmod(0o600)
-    except OSError:
-        pass
+    config.write_json(_path(), d)
 
 
-def _decoy_content(token: str) -> str:
-    return (
-        f"# {MARKER} {token}\n"
-        "# honeytoken de Arx — cualquier acceso o edición queda registrado\n"
-        f"aws_access_key_id=AKIA{token[:16].upper()}\n"
-        f"aws_secret_access_key={token}\n"
-    )
+def _decoy_content(name: str, token: str) -> str:
+    """Contenido creíble según el tipo de cebo. El token es único por señuelo."""
+    if name == ".aws_credentials":
+        return ("[default]\n"
+                f"aws_access_key_id = AKIA{token[:16].upper()}\n"
+                f"aws_secret_access_key = {base64.b64encode(bytes.fromhex(token)).decode()[:40]}\n"
+                "region = us-east-1\n")
+    if name == "id_rsa_backup":
+        body = base64.b64encode(bytes.fromhex(token) * 18).decode()
+        lines = "\n".join(body[i:i + 70] for i in range(0, len(body), 70))
+        return f"-----BEGIN OPENSSH PRIVATE KEY-----\n{lines}\n-----END OPENSSH PRIVATE KEY-----\n"
+    if name == "db_dump.sql":
+        return ("-- MySQL dump 10.13\n"
+                "CREATE TABLE `users` (`id` int, `email` varchar(255), `password_hash` varchar(255));\n"
+                f"INSERT INTO `users` VALUES (1,'admin@internal','$2y$10${token[:53]}');\n")
+    if name == ".env.prod":
+        return (f"DATABASE_URL=postgres://app:{token[:24]}@db.internal:5432/app\n"
+                f"SECRET_KEY={token}\nSTRIPE_SECRET=sk_live_{token[:24]}\n")
+    return f"wallet_seed={token}\n"
 
 
 def default_locations() -> list[str]:
     locs = [u["home"] for u in recon.collect_users().get("human_users", [])]
     locs.append("/root")
     return [l for l in locs if l and Path(l).is_dir()]
+
+
+def _stat_record(p: Path) -> dict:
+    st = p.stat()
+    return {"inode": st.st_ino, "size": st.st_size, "mtime_ns": st.st_mtime_ns,
+            "atime_ns": st.st_atime_ns}
 
 
 def plant(locations: list[str]) -> list[dict]:
@@ -69,57 +85,75 @@ def plant(locations: list[str]) -> list[dict]:
         d = Path(loc)
         if not d.is_dir():
             continue
-        p = d / DECOY_NAMES[(len(planted) + i) % len(DECOY_NAMES)]
+        name = DECOY_NAMES[(len(planted) + i) % len(DECOY_NAMES)]
+        p = d / name
         if str(p) in known or p.exists():
             continue
         token = secrets.token_hex(20)
+        content = _decoy_content(name, token)
         try:
-            p.write_text(_decoy_content(token))
-            p.chmod(0o600)
-            stt = p.stat()
+            fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w") as f:
+                f.write(content)
+            rec = _stat_record(p)
         except OSError:
             continue
-        planted.append(
-            {
-                "path": str(p),
-                "sha256": hashlib.sha256(p.read_bytes()).hexdigest(),
-                "inode": stt.st_ino,
-                "planted_at": _now(),
-            }
-        )
+        planted.append({"path": str(p), "token": token,
+                        "sha256": hashlib.sha256(content.encode()).hexdigest(),
+                        "planted_at": _now(), **rec})
         known.add(str(p))
     st["canaries"] = planted
     _save(st)
+    from arx.modules import sensors
+
+    sensors.ensure_audit_rules([c["path"] for c in planted])
     return planted
+
+
+def _finding(sev: str, detail: str, why: str, path: str) -> dict:
+    return {"sev": sev, "kind": "canary", "detail": detail, "why": why, "target": {"path": path}}
 
 
 def check() -> list[dict]:
     findings: list[dict] = []
-    for c in _load().get("canaries", []):
+    st = _load()
+    dirty = False
+    for c in st.get("canaries", []):
         p = Path(c["path"])
-        if not p.exists():
-            findings.append(
-                {"sev": "high", "kind": "canary", "detail": f"señuelo DESAPARECIDO: {c['path']}",
-                 "why": "un honeytoken borrado indica manipulación o barrido de un intruso",
-                 "target": {"path": c["path"]}}
-            )
-            continue
         try:
-            cur = hashlib.sha256(p.read_bytes()).hexdigest()
+            cur = _stat_record(p)
+        except FileNotFoundError:
+            findings.append(_finding("high", f"señuelo DESAPARECIDO: {c['path']}",
+                                     "un honeytoken borrado indica manipulación o barrido de un intruso",
+                                     c["path"]))
+            continue
         except OSError:
             continue
-        if cur != c["sha256"]:
-            findings.append(
-                {"sev": "high", "kind": "canary", "detail": f"señuelo MODIFICADO: {c['path']}",
-                 "why": "nadie legítimo edita un honeytoken → acceso de atacante",
-                 "target": {"path": c["path"]}}
-            )
-        elif p.stat().st_ino != c["inode"]:
-            findings.append(
-                {"sev": "med", "kind": "canary", "detail": f"señuelo RECREADO: {c['path']}",
-                 "why": "el fichero-cebo fue reemplazado (inode distinto)",
-                 "target": {"path": c["path"]}}
-            )
+        if "size" not in c:  # señuelo plantado por una versión antigua: solo hash de contenido
+            try:
+                if hashlib.sha256(p.read_bytes()).hexdigest() != c["sha256"]:
+                    findings.append(_finding("high", f"señuelo MODIFICADO: {c['path']}",
+                                             "nadie legítimo edita un honeytoken → acceso de atacante",
+                                             c["path"]))
+            except OSError:
+                pass
+            continue
+        if cur["inode"] != c["inode"]:
+            findings.append(_finding("med", f"señuelo RECREADO: {c['path']}",
+                                     "el fichero-cebo fue reemplazado (inode distinto)", c["path"]))
+        elif cur["size"] != c["size"] or cur["mtime_ns"] != c["mtime_ns"]:
+            findings.append(_finding("high", f"señuelo MODIFICADO: {c['path']}",
+                                     "nadie legítimo edita un honeytoken → acceso de atacante", c["path"]))
+        elif cur["atime_ns"] > c["atime_ns"]:
+            when = datetime.fromtimestamp(cur["atime_ns"] / 1e9, timezone.utc).strftime("%Y-%m-%d %H:%M")
+            findings.append(_finding("high", f"señuelo LEÍDO: {c['path']} ({when} UTC)",
+                                     "alguien abrió un honeytoken (posible búsqueda de credenciales). "
+                                     "Ojo: un backup que lea el disco entero también lo dispara.",
+                                     c["path"]))
+            c["atime_ns"] = cur["atime_ns"]  # la próxima lectura será un hallazgo distinto
+            dirty = True
+    if dirty:
+        _save(st)
     return findings
 
 
@@ -138,7 +172,7 @@ def run(action: str, locations: list[str] | None = None) -> int:
         cs = _load().get("canaries", [])
         print(f"▸ {len(cs)} señuelo(s):")
         for c in cs:
-            print(f"   {c['path']}  (sha {c['sha256'][:8]}…)")
+            print(f"   {c['path']}  (plantado {c.get('planted_at', '?')[:10]})")
         return 0
     if action == "check":
         f = check()

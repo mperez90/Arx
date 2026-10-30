@@ -41,7 +41,7 @@ Version: $VERSION
 Section: admin
 Priority: optional
 Architecture: all
-Depends: python3 (>= 3.11)
+Depends: python3 (>= 3.10)
 Maintainer: $MAINTAINER
 Installed-Size: $INSTALLED_KB
 Description: Arx - autonomous defensive security agent
@@ -59,7 +59,8 @@ Arx instalado. Para ponerlo en guardia:
   sudo arx recon            # mapear el servidor
   sudo arx learn            # aprender lo normal (repetir unos días)
   sudo arx learn --seal     # cerrar la línea base
-  sudo arx service install  # defensa 24/7 (systemd)
+  sudo arx service install  # defensa 24/7 en modo observar (systemd)
+  sudo arx notify test      # comprobar que te llegan las alertas
 
 MSG
 exit 0
@@ -90,4 +91,6 @@ if ! command -v dpkg-deb >/dev/null 2>&1; then
   exit 1
 fi
 dpkg-deb --root-owner-group --build "$PKG" "$DEB"
-echo "OK: $DEB"
+# Copia con nombre estable: es la que descarga install.sh desde .../releases/latest/download/
+cp "$DEB" "$ROOT/dist/arx_all.deb"
+echo "OK: $DEB (+ dist/arx_all.deb)"

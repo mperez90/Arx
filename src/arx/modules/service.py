@@ -4,7 +4,8 @@ Genera el unit y, si hay systemd + root, lo instala y arranca (`enable --now`). 
 (otro SO, sin root, o Linux sin systemd — p. ej. un contenedor), NO finge ni crashea:
 escribe el unit en el dir de estado y muestra los comandos exactos para el servidor.
 Arx corre como root porque contiene amenazas (firewall, señales, integridad de ficheros);
-el unit incluye endurecimiento que no rompe su función.
+el unit incluye endurecimiento que no rompe su función. Por defecto el servicio arranca en
+modo OBSERVAR; las acciones Tier 1 automáticas exigen `--enforce` explícito.
 """
 from __future__ import annotations
 
@@ -40,7 +41,7 @@ def _default_exec() -> str:
     return shutil.which("arx") or f"{sys.executable} -m arx.cli"
 
 
-def unit_text(exec_start: str) -> str:
+def unit_text(exec_start: str, enforce: bool = False) -> str:
     return f"""[Unit]
 Description=Arx - autonomous defensive agent
 After=network-online.target
@@ -48,7 +49,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart={exec_start} guard --enforce
+ExecStart={exec_start} guard{' --enforce' if enforce else ''}
 Restart=always
 RestartSec=10
 # Corre como root: contiene amenazas (firewall, señales, ficheros del sistema).
@@ -83,12 +84,16 @@ def _manual_instructions(dest: Path) -> None:
     print("  sudo systemctl daemon-reload && sudo systemctl enable --now arx")
 
 
-def install(exec_start: str | None = None) -> int:
+def install(exec_start: str | None = None, enforce: bool = False) -> int:
     if not _prereqs_ok():
         print("⚠ Prerequisitos incompletos para operar 24/7:")
         print("  ejecuta  setup → recon → learn → learn --seal  antes de arrancar el servicio.")
         print("  (Sin baseline sellada, guard sale con error y systemd reintentaría en bucle.)\n")
-    text = unit_text(exec_start or _default_exec())
+    text = unit_text(exec_start or _default_exec(), enforce)
+    if not enforce:
+        print("ℹ Modo OBSERVAR: Arx detecta, registra y alerta, pero no aplica acciones Tier 1.\n"
+              "  Revisa unos días sus hallazgos (arx status) y, si son fiables, reinstala con:\n"
+              "  arx service install --enforce\n")
     if not (_systemd_available() and _is_root()):
         dest = config.state_dir() / "arx.service"
         dest.write_text(text)
@@ -127,9 +132,9 @@ def status() -> int:
     return 0
 
 
-def run(action: str, exec_start: str | None = None) -> int:
+def run(action: str, exec_start: str | None = None, enforce: bool = False) -> int:
     if action == "install":
-        return install(exec_start)
+        return install(exec_start, enforce)
     if action == "uninstall":
         return uninstall()
     return status()

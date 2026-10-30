@@ -26,18 +26,11 @@ def _path():
 
 
 def _load() -> dict:
-    try:
-        return json.loads(_path().read_text())
-    except (OSError, ValueError):
-        return {}
+    return config.read_json(_path())
 
 
 def _save(d: dict) -> None:
-    _path().write_text(json.dumps(d, indent=2, ensure_ascii=False))
-    try:
-        _path().chmod(0o600)
-    except OSError:
-        pass
+    config.write_json(_path(), d)
 
 
 def _post(url: str, headers: dict, payload: dict, timeout: int = 15) -> dict:
@@ -106,12 +99,23 @@ def heartbeat(status: dict, post=_post) -> dict:
     return {"ok": True}
 
 
+def _scrub_deep(v):
+    """Redacta TODOS los campos de texto (detail, why, target, status…), no solo `detail`."""
+    if isinstance(v, str):
+        return redact.scrub(v)
+    if isinstance(v, dict):
+        return {k: _scrub_deep(x) for k, x in v.items()}
+    if isinstance(v, list):
+        return [_scrub_deep(x) for x in v]
+    return v
+
+
 def report(incidents: list[dict], post=_post) -> dict:
     st = _load()
     if not (enabled() and st.get("agent_id")):
         return {"ok": False, "reason": "no enrolado o sin Business"}
     # redactar SIEMPRE antes de que nada salga del host
-    safe = [{**i, "detail": redact.scrub(str(i.get("detail", "")))} for i in incidents]
+    safe = [_scrub_deep(i) for i in incidents]
     try:
         post(f"{st['console_url']}/v1/agents/{st['agent_id']}/events", _auth(st), {"events": safe})
     except (urllib.error.URLError, TimeoutError, OSError) as e:

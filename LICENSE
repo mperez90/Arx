@@ -15,7 +15,5 @@ Licensed Work converts to the Change License and this restriction lapses.
 
 This is a plain-language summary header. The full BSL 1.1 legal text
 (https://mariadb.com/bsl11/) governs and must be pasted in below before release.
-The Arx engine builds on hermes-agent (MIT · Nous Research) — see NOTICE; that
-component keeps its own MIT terms.
 
 [TODO release: paste full canonical BSL 1.1 text here and have counsel review.]

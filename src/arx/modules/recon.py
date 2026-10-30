@@ -11,7 +11,6 @@ Así el mismo módulo corre parcial en el equipo de desarrollo y completo en des
 from __future__ import annotations
 
 import glob
-import json
 import os
 import platform
 import shutil
@@ -457,7 +456,7 @@ def save_report(inv: dict, findings: list[dict], plan: list[tuple[str, str]], pa
 
     report = {**inv, "surface": findings, "defense_plan": [{"area": a, "action": c} for a, c in plan]}
     dest = Path(path) if path else config.state_dir() / f"recon-{inv['os'].get('hostname', 'host')}.json"
-    dest.write_text(json.dumps(report, indent=2, ensure_ascii=False))
+    config.write_json(dest, report)
     return dest
 
 

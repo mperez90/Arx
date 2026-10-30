@@ -1,37 +1,52 @@
 """Arx · config — configuración y secretos del host.
 
-Producción: /etc/arx (root, 0700) con config.json y secrets.json a 0600,
-inmutables (chattr +i) tras el setup. Desarrollo/sin permiso: ~/.arx.
+Producción: /etc/arx (root, 0700) con config.json y secrets.json a 0600.
+Desarrollo/sin permiso: ~/.arx.
 
 Reglas de seguridad:
   · La palabra de autorización NUNCA se guarda en claro — solo salt + hash scrypt.
   · Las claves de API se leen primero de entorno (ARX_<PROV>_API_KEY) y, si no,
     de secrets.json — así se puede operar sin escribir la clave a disco.
+  · Toda escritura de estado es ATÓMICA (temporal + rename) y nace con 0600: un corte
+    a mitad no deja JSON corrupto, y un secreto nunca existe ni un instante legible.
+  · `locked()` serializa a los escritores concurrentes (servicio `guard` + CLI).
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
 import secrets
 from pathlib import Path
 
+try:
+    import fcntl
+except ImportError:  # no-POSIX: sin bloqueo entre procesos (Arx apunta a Linux/macOS)
+    fcntl = None
+
+
+def _first_writable(candidates: list[Path], private: bool) -> Path:
+    for p in candidates:
+        try:
+            p.mkdir(parents=True, exist_ok=True)
+            if private:
+                try:
+                    p.chmod(0o700)
+                except OSError:
+                    pass
+            return p
+        except OSError:
+            continue
+    # Nunca caer al directorio actual: ahí acabarían secretos en sitios imprevisibles.
+    raise SystemExit("Arx no encuentra un directorio escribible para su estado "
+                     f"({', '.join(map(str, candidates))}). Usa ARX_CONFIG_DIR / ARX_STATE_DIR.")
+
 
 def config_dir() -> Path:
     """Preferencia: $ARX_CONFIG_DIR → /etc/arx (root) → ~/.arx (dev/sin permiso)."""
     env = os.environ.get("ARX_CONFIG_DIR")
-    candidates = [Path(env)] if env else [Path("/etc/arx"), Path.home() / ".arx"]
-    for p in candidates:
-        try:
-            p.mkdir(parents=True, exist_ok=True)
-            try:
-                p.chmod(0o700)
-            except OSError:
-                pass
-            return p
-        except OSError:
-            continue
-    return Path.cwd()
+    return _first_writable([Path(env)] if env else [Path("/etc/arx"), Path.home() / ".arx"], True)
 
 
 def config_path() -> Path:
@@ -48,45 +63,65 @@ def state_dir() -> Path:
     Producción: /var/lib/arx (root). Desarrollo/sin permiso: ~/.arx/state.
     """
     env = os.environ.get("ARX_STATE_DIR")
-    candidates = [Path(env)] if env else [Path("/var/lib/arx"), Path.home() / ".arx" / "state"]
-    for p in candidates:
-        try:
-            p.mkdir(parents=True, exist_ok=True)
-            return p
-        except OSError:
-            continue
-    return Path.cwd()
+    return _first_writable(
+        [Path(env)] if env else [Path("/var/lib/arx"), Path.home() / ".arx" / "state"], True)
 
 
-def _load(path: Path) -> dict:
+# ── E/S de estado: atómica, privada y con bloqueo ────────────────────────────
+def read_json(path: Path, default=None):
+    """Lee JSON; ante fichero ausente o corrupto devuelve `default` (copia nueva)."""
     try:
-        return json.loads(path.read_text())
+        return json.loads(Path(path).read_text())
     except (OSError, ValueError):
-        return {}
+        return {} if default is None else default
 
 
-def _save_private(path: Path, data: dict) -> None:
-    path.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+def write_json(path: Path, data) -> None:
+    """Escritura atómica: temporal 0600 en el mismo dir → fsync → rename."""
+    path = Path(path)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
-        path.chmod(0o600)
-    except OSError:
-        pass
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+@contextlib.contextmanager
+def locked(name: str = "state"):
+    """Bloqueo exclusivo entre procesos sobre un fichero de estado (`flock`)."""
+    if fcntl is None:
+        yield
+        return
+    fd = os.open(state_dir() / f".{name}.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
 
 
 def load_config() -> dict:
-    return _load(config_path())
+    return read_json(config_path())
 
 
 def save_config(d: dict) -> None:
-    _save_private(config_path(), d)
+    write_json(config_path(), d)
 
 
 def load_secrets() -> dict:
-    return _load(secrets_path())
+    return read_json(secrets_path())
 
 
 def save_secrets(d: dict) -> None:
-    _save_private(secrets_path(), d)
+    write_json(secrets_path(), d)
 
 
 # ── palabra de autorización (solo hash) ──────────────────────────────────────

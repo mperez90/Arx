@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Arx — punto de entrada de consola (v0.01, sin UI).
+"""Arx — punto de entrada de consola (sin UI).
 
 Ciclo de arranque:  install → setup → recon → learn → guard
 
@@ -14,10 +14,10 @@ Ciclo de arranque:  install → setup → recon → learn → guard
                  y con chequeo de integridad de arranque (no aprender a un atacante
                  como normal).
     arx guard    Operativo 24/7: sensores + canarios + respuesta por niveles
-                 (Tier 0/1 auto reversible · Tier 2 humano). Detección = firmas
-                 (ATT&CK/CVE) + anomalía sobre la base. Chat por consola.
-
-Motor de razonamiento: núcleo hermes-agent (MIT · Nous Research) — ver NOTICE.
+                 (Tier 0/1 auto reversible · Tier 2 humano). Detección = anomalía
+                 sobre la base + integridad + señuelos + sensores. El motor LLM solo
+                 se consulta ante hallazgos nuevos. Chat por consola.
+    arx accept   Incorporar a la base un cambio legítimo que Arx marcó como anómalo.
 """
 from __future__ import annotations
 
@@ -44,7 +44,8 @@ def cmd_learn(args: argparse.Namespace) -> int:
 
 def cmd_guard(args: argparse.Namespace) -> int:
     from arx.modules import guard
-    return guard.run(once=args.once, interval=args.interval, chat=args.chat, enforce=args.enforce)
+    return guard.run(once=args.once, interval=args.interval, chat=args.chat, enforce=args.enforce,
+                     verbose=args.verbose)
 
 
 def cmd_canaries(args: argparse.Namespace) -> int:
@@ -54,7 +55,48 @@ def cmd_canaries(args: argparse.Namespace) -> int:
 
 def cmd_service(args: argparse.Namespace) -> int:
     from arx.modules import service
-    return service.run(args.saction, exec_start=getattr(args, "exec_path", None))
+    return service.run(args.saction, exec_start=getattr(args, "exec_path", None),
+                       enforce=getattr(args, "enforce", False))
+
+
+def cmd_accept(args: argparse.Namespace) -> int:
+    from arx.modules import baseline, response
+
+    st = response.load_findings()
+    if args.fp is None:
+        open_ = [(fp, e) for fp, e in st.items() if e.get("set")]
+        if not open_:
+            print("No hay hallazgos de línea base pendientes de aceptar.")
+            return 0
+        print("Hallazgos que puedes aceptar como normales (se añaden a la línea base):")
+        for fp, e in sorted(open_, key=lambda x: x[1].get("last_seen", ""), reverse=True)[:30]:
+            print(f"  {fp}  {e.get('detail')}   (visto {e.get('seen')}×, últ. {e.get('last_seen', '')[:16]})")
+        print("\nAcepta uno con:  arx accept <id>")
+        return 0
+    e = st.get(args.fp)
+    if not e or not e.get("set"):
+        print(f"No hay un hallazgo aceptable con id '{args.fp}'. Lista:  arx accept")
+        return 1
+    if not baseline.accept(e["set"], e["item"]):
+        print("No se pudo actualizar la línea base (¿existe y contiene ese conjunto?).")
+        return 1
+    response.forget(args.fp)
+    response.record({"kind": "accepted", "detail": e.get("detail")})
+    print(f"✓ Aceptado como normal: {e['item']}  (reinicia el servicio para que guard lo recargue)")
+    return 0
+
+
+def cmd_notify(args: argparse.Namespace) -> int:
+    from arx import notify
+
+    chans = notify.channels()
+    if not chans:
+        print("No hay canales de alerta configurados. Ejecuta:  arx setup  (paso 6)")
+        return 1
+    res = notify.send("Prueba de alertas: si lees esto, Arx puede avisarte. ✓")
+    for ch, r in res.items():
+        print(f"  {ch:<9} {r}")
+    return 0 if all(r == "ok" for r in res.values()) else 1
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -87,7 +129,11 @@ def cmd_status(args: argparse.Namespace) -> int:
         print("  servicio       (systemd no disponible aquí)")
     cs = canaries._load().get("canaries", [])
     print(f"  canarios       {len(cs)} activos, {len(canaries.check())} disparados")
-    print(f"  bloqueos T1    {len(response._load_blocks())} activos")
+    print(f"  bloqueos T1    {len(response._load_blocks())} activos"
+          + ("   ⚠ FRENO DE SEGURIDAD activo" if response.breaker_tripped() else ""))
+    from arx import notify
+    print(f"  alertas        {', '.join(notify.channels(cfg)) or 'ninguna  (arx setup)'}")
+    print(f"  hallazgos      {len(response.load_findings())} conocidos  ·  aceptar cambios legítimos: arx accept")
     pend = response.list_pending()
     print(f"  Tier 2 pend.   {len(pend)}" + ("   ⚠ usa: arx authorize" if pend else ""))
     inc = config.state_dir() / "incidents.jsonl"
@@ -238,6 +284,7 @@ def main(argv: list[str] | None = None) -> int:
     p_guard.add_argument("--interval", type=int, default=30, help="segundos entre barridos")
     p_guard.add_argument("--chat", action="store_true", help="abrir canal de consola con Arx")
     p_guard.add_argument("--enforce", action="store_true", help="aplicar remediaciones Tier 1 (auto, reversibles)")
+    p_guard.add_argument("--verbose", action="store_true", help="mostrar todos los hallazgos en cada barrido")
     sub.add_parser("status", help="estado general de Arx (un vistazo)")
     p_auth = sub.add_parser("authorize", help="ver/aprobar acciones Tier 2 pendientes")
     p_auth.add_argument("pending_id", nargs="?", help="id a autorizar (sin id: lista los pendientes)")
@@ -253,8 +300,15 @@ def main(argv: list[str] | None = None) -> int:
     p_si = ssub.add_parser("install", help="instalar y arrancar el servicio")
     p_si.add_argument("--exec", dest="exec_path", metavar="RUTA",
                       help="ExecStart (por defecto: cómo se invoca arx ahora)")
+    p_si.add_argument("--enforce", action="store_true",
+                      help="aplicar acciones Tier 1 automáticas (por defecto: solo observar)")
     ssub.add_parser("uninstall", help="retirar el servicio")
     ssub.add_parser("status", help="estado del servicio")
+    p_acc = sub.add_parser("accept", help="aceptar como normal un cambio legítimo (lo añade a la base)")
+    p_acc.add_argument("fp", nargs="?", help="id del hallazgo (sin id: lista los aceptables)")
+    p_not = sub.add_parser("notify", help="alertas salientes (Telegram / webhook)")
+    nsub = p_not.add_subparsers(dest="naction", required=True)
+    nsub.add_parser("test", help="enviar un mensaje de prueba por los canales configurados")
     p_fleet = sub.add_parser("fleet", help="flota / consola central (Business)")
     fsub = p_fleet.add_subparsers(dest="faction", required=True)
     p_fe = fsub.add_parser("enroll", help="enrolar este host en la consola central")
@@ -272,7 +326,7 @@ def main(argv: list[str] | None = None) -> int:
     handlers = {"setup": cmd_setup, "recon": cmd_recon, "learn": cmd_learn,
                 "guard": cmd_guard, "status": cmd_status, "authorize": cmd_authorize,
                 "canaries": cmd_canaries, "service": cmd_service, "fleet": cmd_fleet,
-                "license": cmd_license}
+                "license": cmd_license, "accept": cmd_accept, "notify": cmd_notify}
     return handlers[args.cmd](args) or 0
 
 
