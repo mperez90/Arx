@@ -341,6 +341,8 @@ class ResponseSafetyTests(unittest.TestCase):
 
     def test_inactive_ufw_is_not_faked(self):
         self._patch(self.r, "_ufw_active", lambda: False)
+        self._patch(self.r.shutil, "which",  # host sin nft: solo ufw inactivo
+                    lambda c: "/usr/sbin/ufw" if c == "ufw" else None)
         o = self.r.handle(self._port(4444), enforce=True, cfg={})
         self.assertEqual(self.calls, [])
         self.assertIn("INACTIVO", o["status"])
@@ -607,6 +609,112 @@ class SuspendActuatorTests(unittest.TestCase):
         self.assertIsNone(self.r._apply_revert({"tool": "sigstop", "exe": "/x", "pids": [1]}))
         self.assertIsNone(self.r._apply_revert({"tool": "sigstop", "exe": "/x", "pids": "9"}))
         self.assertEqual(self.kills, [])
+
+
+class NftActuatorTests(unittest.TestCase):
+    """F5 — nftables como ejecutor nativo cuando no hay ufw activo (timeout nativo)."""
+
+    def setUp(self):
+        _isolate()
+        from arx.modules import response
+        self.r = response
+        self.calls = []
+
+        class R:
+            returncode, stderr, stdout = 0, "", ""
+
+        def fake_run(argv, **kw):
+            self.calls.append(argv)
+            return R()
+        for target, value in [("_is_linux_root", lambda: True),
+                              ("_ufw_active", lambda: False),
+                              ("ssh_ports", lambda: {22})]:
+            p = mock.patch.object(response, target, value)
+            p.start()
+            self.addCleanup(p.stop)
+        self._patch(response.shutil, "which",  # host sin ufw, con nft
+                    lambda c: "/usr/sbin/nft" if c == "nft" else None)
+        self._patch(response.subprocess, "run", fake_run)
+
+    def _patch(self, obj, name, value):
+        p = mock.patch.object(obj, name, value)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _flat(self):
+        return [" ".join(c) for c in self.calls]
+
+    def _port(self, port):
+        return {"kind": "listen_ports", "sev": "high", "detail": f"nuevo puerto {port}",
+                "target": {"proto": "tcp", "port": port, "exposed": "all"},
+                "set": "listen_ports", "item": f"tcp {port} all"}
+
+    def test_blocks_via_nft_when_no_ufw(self):
+        o = self.r.handle(self._port(4444), enforce=True, cfg={})
+        flat = self._flat()
+        self.assertTrue(any("nft add table inet arx" in c for c in flat))
+        self.assertTrue(any("add element inet arx block_tcp { 4444 timeout 60m }" in c
+                            for c in flat))
+        self.assertIn("nftables", o["status"])
+        self.assertEqual(self.r._load_blocks()[0]["revert"],
+                         {"tool": "nft", "port": 4444, "proto": "tcp"})
+
+    def test_expiry_deletes_nft_element(self):
+        self.r.handle(self._port(4444), enforce=True, cfg={})
+        self.calls.clear()
+        later = datetime.now(timezone.utc) + timedelta(minutes=61)
+        self.r.expire_blocks(now=later)
+        self.assertEqual(self._flat(),
+                         ["nft delete element inet arx block_tcp { 4444 }"])
+
+    def test_no_executor_is_honest(self):
+        self._patch(self.r.shutil, "which", lambda c: None)
+        o = self.r.handle(self._port(4444), enforce=True, cfg={})
+        self.assertIn("no hay ejecutor", o["status"])
+        self.assertEqual(self.r._load_blocks(), [])
+
+    def test_revert_shape_nft_validated(self):
+        self.assertEqual(self.r._revert_argv({"tool": "nft", "port": 53, "proto": "udp"}),
+                         ["nft", "delete", "element", "inet", "arx", "block_udp", "{ 53 }"])
+        self.assertIsNone(self.r._revert_argv({"tool": "nft", "port": 70000, "proto": "tcp"}))
+
+
+class ProcfsPortsTests(unittest.TestCase):
+    """Sin iproute2 (`ss`) el sensor de puertos NO puede morir: fallback a /proc/net/*."""
+
+    def test_parses_tcp_listen_and_udp(self):
+        from arx.modules import recon
+        tcp = """  sl  local_address rem_address   st
+   0: 00000000:15B3 00000000:0000 0A
+   1: 0100007F:0016 0100007F:9C40 01
+"""
+        udp = """  sl  local_address rem_address   st
+   0: 00000000:14E9 00000000:0000 07
+"""
+        ports = recon._parse_procfs_net(tcp, "tcp", "0A") + \
+            recon._parse_procfs_net(udp, "udp", "07")
+        items = {(p["proto"], p["local"], p["exposed"]) for p in ports}
+        self.assertIn(("tcp", "*:5555", "all"), items)        # 0x15B3 LISTEN
+        self.assertIn(("udp", "*:5353", "all"), items)         # 0x14E9
+        self.assertNotIn(("tcp", "127.0.0.1:22", "local"), items)  # 01 = ESTABLISHED, fuera
+
+    def test_collect_falls_back_when_no_ss(self):
+        from arx.modules import recon
+        with mock.patch.object(recon, "_run", lambda *a, **k: ""), \
+             mock.patch.object(recon, "_collect_ports_procfs",
+                               return_value=[{"proto": "tcp", "local": "*:4444",
+                                              "exposed": "all", "process": ""}]) as fb:
+            ports = recon.collect_ports()
+        self.assertTrue(fb.called)
+        self.assertEqual(ports[0]["local"], "*:4444")
+
+    def test_procfs_host_classification(self):
+        from arx.modules import recon
+        self.assertEqual(recon._procfs_host("00000000"), "*")
+        self.assertEqual(recon._procfs_host("0" * 32), "*")
+        self.assertEqual(recon._procfs_host("0100007F"), "127.0.0.1")
+        self.assertEqual(recon._procfs_host("0" * 24 + "01000000"), "127.0.0.1")
+        self.assertEqual(recon._procfs_host("0A000001"), "0A000001")  # iface: hex crudo
 
 
 if __name__ == "__main__":

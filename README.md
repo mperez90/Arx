@@ -77,7 +77,8 @@ ranks what matters — is where the real work lives, and it stays in the code.
 | **Business** | fleet operation, central console, correlation, compliance, MDR | after Pro |
 
 Core is licensed under the Business Source License; see [`LICENSE`](LICENSE) and
-[`NOTICE`](NOTICE).
+[`NOTICE`](NOTICE). Core is free forever — if it defended your machine, you can fuel the
+roadmap via the **Sponsor** button (pay what you want, one-time or monthly).
 
 ---
 

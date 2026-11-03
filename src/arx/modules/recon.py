@@ -140,12 +140,61 @@ def _classify_exposure(local: str) -> str:
     return "iface"
 
 
+def _procfs_host(addr: str) -> str:
+    """Hex de /proc/net/* → host clasificable por _classify_exposure."""
+    if addr in ("00000000", "0" * 32):
+        return "*"
+    if addr == "0100007F":  # 127.0.0.1 (v4, little-endian)
+        return "127.0.0.1"
+    if len(addr) == 32 and addr.endswith("01000000") and set(addr[:24]) == {"0"}:
+        return "127.0.0.1"  # ::1 (v6 en palabras little-endian)
+    return addr  # interfaz concreta: el hex crudo basta para clasificar
+
+
+def _parse_procfs_net(text: str, proto: str, listen_state: str) -> list[dict]:
+    """Parsea el contenido de un /proc/net/{tcp,tcp6,udp,udp} ya leído."""
+    ports: list[dict] = []
+    for line in text.splitlines()[1:]:
+        f = line.split()
+        if len(f) < 4 or f[3] != listen_state:
+            continue
+        addr, _, phex = f[1].rpartition(":")
+        try:
+            port = int(phex, 16)
+        except ValueError:
+            continue
+        if not port:
+            continue
+        local = f"{_procfs_host(addr)}:{port}"
+        ports.append({"proto": proto, "local": local,
+                      "exposed": _classify_exposure(local), "process": ""})
+    return ports
+
+
+def _collect_ports_procfs() -> list[dict]:
+    """Fallback sin iproute2: lee /proc/net/{tcp,tcp6,udp,udp6} directamente.
+
+    Un agente de seguridad no puede perder un sensor entero porque falte `ss`.
+    """
+    ports: list[dict] = []
+    for path, proto, state in (("/proc/net/tcp", "tcp", "0A"),      # 0A = LISTEN
+                               ("/proc/net/tcp6", "tcp", "0A"),
+                               ("/proc/net/udp", "udp", "07"),       # 07 = no conectado
+                               ("/proc/net/udp6", "udp", "07")):
+        try:
+            text = Path(path).read_text()
+        except OSError:
+            continue
+        ports += _parse_procfs_net(text, proto, state)
+    return ports
+
+
 def collect_ports() -> list[dict]:
     """Sockets en escucha (TCP/UDP) con proceso dueño y grado de exposición."""
     out = _run(["ss", "-tulpnH"]) or _run(["ss", "-tulpn"])
-    ports: list[dict] = []
     if not out:
-        return ports
+        return _collect_ports_procfs()  # sin ss no significa sin sensor
+    ports: list[dict] = []
     for line in out.splitlines():
         f = line.split()
         if len(f) < 5 or f[0] in ("Netid", "State"):

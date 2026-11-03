@@ -196,6 +196,12 @@ def _revert_argv(revert) -> list[str] | None:
         if isinstance(port, int) and 0 < port < 65536 and proto in ("tcp", "udp"):
             return ["ufw", "delete", "deny", f"{port}/{proto}"]
         return None
+    if isinstance(revert, dict) and revert.get("tool") == "nft":
+        port, proto = revert.get("port"), revert.get("proto")
+        if isinstance(port, int) and 0 < port < 65536 and proto in ("tcp", "udp"):
+            return ["nft", "delete", "element", "inet", "arx", f"block_{proto}",
+                    f"{{ {port} }}"]
+        return None
     if isinstance(revert, str):  # formato antiguo (texto): solo si encaja exactamente
         m = _LEGACY_REVERT.match(revert)
         if m:
@@ -373,6 +379,42 @@ def _ufw_active() -> bool:
     return r.returncode == 0 and "inactive" not in first and "inactivo" not in first
 
 
+def _nft_available() -> bool:
+    return shutil.which("nft") is not None
+
+
+def _nft_setup() -> bool:
+    """Tabla/set/cadena de Arx en nftables, idempotente (ignora 'ya existe')."""
+    try:
+        ruleset = subprocess.run(["nft", "list", "ruleset"], capture_output=True,
+                                 text=True, timeout=15).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    cmds = []
+    if "table inet arx" not in ruleset:
+        cmds.append(["nft", "add", "table", "inet", "arx"])
+    if "block_tcp" not in ruleset:
+        cmds += [["nft", "add", "set", "inet", "arx", "block_tcp",
+                  "{", "type", "inet_service;", "flags", "timeout;", "}"],
+                 ["nft", "add", "set", "inet", "arx", "block_udp",
+                  "{", "type", "inet_service;", "flags", "timeout;", "}"]]
+    if "chain input" not in ruleset.split("table inet arx")[-1]:
+        cmds.append(["nft", "add", "chain", "inet", "arx", "input",
+                     "{", "type", "filter", "hook", "input", "priority", "0;",
+                     "policy", "accept;", "}"])
+    if "tcp dport @block_tcp" not in ruleset:
+        cmds += [["nft", "add", "rule", "inet", "arx", "input", "tcp", "dport",
+                  "@block_tcp", "drop"],
+                 ["nft", "add", "rule", "inet", "arx", "input", "udp", "dport",
+                  "@block_udp", "drop"]]
+    for argv in cmds:
+        try:
+            subprocess.run(argv, capture_output=True, text=True, timeout=15)
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+    return True
+
+
 def _execute_tier1(finding: dict) -> tuple[str, dict | None]:
     """Ejecuta una remediación Tier 1 reversible SOLO en Linux+root.
 
@@ -384,18 +426,33 @@ def _execute_tier1(finding: dict) -> tuple[str, dict | None]:
     kind = finding.get("kind")
     target = finding.get("target") or {}
     if kind == "listen_ports" and target.get("port"):
-        if not shutil.which("ufw"):
-            return "sin ufw: no hay ejecutor seguro de bloqueo en este host", None
-        if not _ufw_active():
+        proto, port = target.get("proto", "tcp"), int(target["port"])
+        if shutil.which("ufw") and _ufw_active():
+            r = subprocess.run(["ufw", "deny", f"{port}/{proto}"],
+                               capture_output=True, text=True, timeout=15)
+            if r.returncode == 0:
+                revert = {"tool": "ufw", "port": port, "proto": proto}
+                register_block(finding, revert)
+                return (f"puerto {port}/{proto} bloqueado en ufw "
+                        f"(auto-expira en {DEFAULT_TTL_MIN} min)"), revert
+            return f"no se pudo bloquear el puerto ({r.stderr.strip()[:48]})", None
+        if _nft_available():
+            # hosts sin ufw: nftables con timeout NATIVO (el set expira solo aunque Arx caiga)
+            if not _nft_setup():
+                return "nftables presente pero no se pudo preparar la tabla arx", None
+            r = subprocess.run(["nft", "add", "element", "inet", "arx", f"block_{proto}",
+                                f"{{ {port} timeout {DEFAULT_TTL_MIN}m }}"],
+                               capture_output=True, text=True, timeout=15)
+            if r.returncode == 0:
+                revert = {"tool": "nft", "port": port, "proto": proto}
+                register_block(finding, revert)
+                return (f"puerto {port}/{proto} bloqueado en nftables "
+                        f"(timeout nativo {DEFAULT_TTL_MIN} min + reversión de Arx)"), revert
+            return f"nft falló al bloquear ({r.stderr.strip()[:48]})", None
+        if shutil.which("ufw"):
             # `ufw deny` "funciona" con ufw apagado pero no filtra nada → no fingir contención
             return "ufw está INACTIVO: un bloqueo no tendría efecto (actívalo o decide tú)", None
-        proto, port = target.get("proto", "tcp"), int(target["port"])
-        r = subprocess.run(["ufw", "deny", f"{port}/{proto}"], capture_output=True, text=True, timeout=15)
-        if r.returncode == 0:
-            revert = {"tool": "ufw", "port": port, "proto": proto}
-            register_block(finding, revert)
-            return f"puerto {port}/{proto} bloqueado en ufw (auto-expira en {DEFAULT_TTL_MIN} min)", revert
-        return f"no se pudo bloquear el puerto ({r.stderr.strip()[:48]})", None
+        return "sin ufw ni nftables: no hay ejecutor seguro de bloqueo en este host", None
     if kind in ("executables", "processes"):
         exe = str(target.get("exe") or target.get("process") or "")
         if not exe.startswith("/"):
