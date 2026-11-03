@@ -182,27 +182,40 @@ def suid_fingerprint() -> str | None:
     return _h("\n".join(sorted(suid))) if suid is not None else None
 
 
-def integrity_fingerprint(include_suid: bool = True) -> dict:
-    fp: dict = {}
-    for name, path in [
-        ("authorized_keys_root", "/root/.ssh/authorized_keys"),
-        ("sudoers", "/etc/sudoers"),
-        ("passwd", "/etc/passwd"),
-        ("ld_preload", "/etc/ld.so.preload"),
-    ]:
-        data = recon._read(path)
-        if data is not None:
-            fp[name] = _h(data)
+def integrity_paths() -> dict[str, list[str]]:
+    """Clave de integridad → ficheros cubiertos que EXISTEN (respaldo y restauración)."""
     groups = {
+        "authorized_keys_root": ["/root/.ssh/authorized_keys"],
+        "sudoers": ["/etc/sudoers"],
+        "passwd": ["/etc/passwd"],
+        "ld_preload": ["/etc/ld.so.preload"],
         "authorized_keys_users": glob.glob("/home/*/.ssh/authorized_keys"),
         "sudoers_d": glob.glob("/etc/sudoers.d/*"),
-        "cron": ["/etc/crontab", *glob.glob("/etc/cron.d/*"), *glob.glob("/var/spool/cron/crontabs/*")],
-        "systemd_units": glob.glob("/etc/systemd/system/*.service") + glob.glob("/etc/systemd/system/*.timer"),
+        "cron": ["/etc/crontab", *glob.glob("/etc/cron.d/*"),
+                 *glob.glob("/var/spool/cron/crontabs/*")],
+        "systemd_units": glob.glob("/etc/systemd/system/*.service")
+                         + glob.glob("/etc/systemd/system/*.timer"),
     }
-    for name, paths in groups.items():
-        v = _hash_files(paths)
-        if v:
-            fp[name] = v
+    out: dict[str, list[str]] = {}
+    for key, paths in groups.items():
+        existing = [p for p in paths if os.path.isfile(p)]
+        if existing:
+            out[key] = existing
+    return out
+
+
+def integrity_fingerprint(include_suid: bool = True) -> dict:
+    fp: dict = {}
+    singles = {"authorized_keys_root", "sudoers", "passwd", "ld_preload"}
+    for key, paths in integrity_paths().items():
+        if key in singles:
+            data = recon._read(paths[0])
+            if data is not None:
+                fp[key] = _h(data)
+        else:
+            v = _hash_files(paths)
+            if v:
+                fp[key] = v
     if include_suid:
         v = suid_fingerprint()
         if v:
@@ -389,7 +402,11 @@ def run(samples: int = 1, interval: int = 0, seal: bool = False, status: bool = 
             return 1
         baseline["meta"]["sealed"] = True
         save(baseline)
+        # Respaldo de los ficheros críticos al sellar: sin copia buena no hay restauración.
+        from arx.modules import response
+        n = response.backup_critical(integrity_paths())
         print(f"✓ Línea base SELLADA con {baseline['meta']['samples']} muestras. Lista para `arx guard`.")
+        print(f"✓ Respaldo de {n} fichero(s) crítico(s) en el vault (habilita restauración Tier 2).")
         return 0
 
     for i in range(max(1, samples)):

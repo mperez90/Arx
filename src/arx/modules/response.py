@@ -311,6 +311,133 @@ def _note_action(now=None) -> None:
     config.write_json(_actions_path(), recent_actions(now) + [_iso(now)])
 
 
+# ── vault: respaldo de ficheros críticos y cuarentena ─────────────────────────
+def _vault_dir():
+    d = config.state_dir() / "vault"
+    d.mkdir(parents=True, exist_ok=True)
+    os.chmod(d, 0o700)
+    return d
+
+
+def _vault_manifest_path():
+    return _vault_dir() / "manifest.json"
+
+
+def backup_critical(paths: dict[str, list[str]]) -> int:
+    """Copia los ficheros cubiertos por integridad al vault (0600, solo root).
+
+    Sin copia buena conocida no hay restauración posible: se hace al sellar la base.
+    Devuelve cuántos ficheros quedaron respaldados (nuevos o cambiados).
+    """
+    manifest = config.read_json(_vault_manifest_path(), {})
+    n = 0
+    for key, files in paths.items():
+        for path in files:
+            try:
+                data = open(path, "rb").read()
+                st = os.stat(path)
+            except OSError:
+                continue
+            h = hashlib.sha256(data).hexdigest()
+            entry = manifest.get(path)
+            if entry and entry.get("sha256") == h:
+                continue
+            q = _vault_dir() / f"{hashlib.sha1(path.encode()).hexdigest()[:12]}.bak"
+            fd = os.open(q, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+            manifest[path] = {"key": key, "sha256": h, "mode": st.st_mode & 0o777,
+                              "backed_at": _iso(_now())}
+            n += 1
+    config.write_json(_vault_manifest_path(), manifest)
+    return n
+
+
+def quarantine_file(path: str) -> str | None:
+    """Mueve un fichero al vault en cuarentena (evidencia preservada). Devuelve su ruta."""
+    try:
+        data = open(path, "rb").read()
+        st = os.stat(path)
+    except OSError:
+        return None
+    q = _vault_dir() / f"q-{_now().strftime('%Y%m%d%H%M%S')}-{os.path.basename(path)}"
+    fd = os.open(q, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+    manifest = config.read_json(_vault_manifest_path(), {})
+    manifest[str(q)] = {"quarantined_from": path, "sha256": hashlib.sha256(data).hexdigest(),
+                        "mode": st.st_mode & 0o777, "at": _iso(_now())}
+    config.write_json(_vault_manifest_path(), manifest)
+    try:
+        os.unlink(path)  # el fichero hostil sale de su sitio
+    except OSError:
+        pass
+    return str(q)
+
+
+def _restore_from_vault(key: str, current_files: list[str] | None = None) -> str:
+    """Restaura el estado sellado de una clave de integridad desde el vault.
+
+    Dos casos, ambos con evidencia preservada:
+      · fichero CON copia buena alterado o ausente → cuarentena de la versión hostil
+        (si existe) + restauración del respaldo con su modo original;
+      · fichero SIN copia buena presente ahora bajo la clave → no existía al sellar:
+        es un intruso (persistencia plantada) → cuarentena directa, no hay nada que
+        restaurar.
+
+    Lo intacto no se toca: restaurar ficheros que no cambiaron sería ruido forense.
+    `current_files` se puede inyectar en pruebas; por defecto se deriva de la clave.
+    """
+    if current_files is None:
+        from arx.modules import baseline  # perezoso: baseline importa response (gancho de sellado)
+        current_files = baseline.integrity_paths().get(key, [])
+    manifest = config.read_json(_vault_manifest_path(), {})
+    known = {p: m for p, m in manifest.items()
+             if m.get("key") == key and not p.startswith(str(_vault_dir()))}
+    restored, quarantined = [], []
+    for path, meta in known.items():
+        bak = _vault_dir() / f"{hashlib.sha1(path.encode()).hexdigest()[:12]}.bak"
+        try:
+            good = open(bak, "rb").read()
+        except OSError:
+            continue
+        try:
+            now = open(path, "rb").read()
+        except OSError:
+            now = None  # el fichero crítico fue BORRADO: también se restaura
+        if now == good:
+            continue  # intacto: no tocar
+        if now is not None:
+            q = quarantine_file(path)  # la versión hostil no se pierde: es evidencia
+            if q:
+                quarantined.append(q)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(good)
+        os.chmod(path, int(meta.get("mode", 0o600)))
+        restored.append(path)
+    for path in sorted(set(current_files) - set(known)):
+        q = quarantine_file(path)  # intruso: sin copia buena porque no existía al sellar
+        if q:
+            quarantined.append(q)
+    if not restored and not quarantined:
+        if not known:
+            return f"sin respaldo en el vault para '{key}' — restauración manual necesaria"
+        return f"'{key}' ya coincide con el sellado — nada que restaurar"
+    return (f"restaurado {len(restored)} fichero(s) de '{key}' desde el vault; "
+            f"versiones hostiles en cuarentena: {len(quarantined)}")
+
+
+def _execute_tier2(finding: dict) -> str:
+    """Ejecuta una remediación Tier 2 ya autorizada por el humano. Nunca antes."""
+    kind, target = finding.get("kind"), finding.get("target") or {}
+    if not _is_linux_root():
+        return "listo para ejecutar en destino (requiere Linux + root)"
+    if kind == "integrity" and target.get("file"):
+        return _restore_from_vault(str(target["file"]))
+    return "plan registrado — aún sin ejecutor Tier 2 para este tipo"
+
+
 # ── cola de acciones Tier 2 pendientes de autorización humana ─────────────────
 def _pending_path():
     return config.state_dir() / "pending_tier2.json"
@@ -332,7 +459,9 @@ def _add_pending(finding: dict, plan: dict) -> str:
             {
                 "id": pid,
                 "sev": finding.get("sev"),
+                "kind": finding.get("kind"),
                 "detail": finding.get("detail", ""),
+                "target": finding.get("target"),  # el ejecutor Tier 2 lo necesita
                 "remediation": plan["action"],
                 "at": _iso(_now()),
             }
@@ -346,7 +475,11 @@ def list_pending() -> list[dict]:
 
 
 def authorize_pending(pid: str) -> dict | None:
-    """Quita el pendiente de la cola y lo registra como autorizado. Devuelve el item o None."""
+    """Quita el pendiente de la cola, lo registra como autorizado y lo EJECUTA.
+
+    La autorización la verifica el llamador (CLI pide la palabra; Telegram pedirá TOTP).
+    La ejecución es siempre reversible o restauradora, y queda auditada.
+    """
     with config.locked():
         pend = _load_pending()
         item = next((p for p in pend if p["id"] == pid), None)
@@ -354,6 +487,10 @@ def authorize_pending(pid: str) -> dict | None:
             return None
         _save_pending([p for p in pend if p["id"] != pid])
     record({"kind": "tier2_authorized", "detail": item["detail"], "remediation": item["remediation"]})
+    finding = {"kind": item.get("kind"), "target": item.get("target"),
+               "detail": item.get("detail"), "sev": item.get("sev")}
+    item["executed"] = _execute_tier2(finding)
+    record({"kind": "tier2_executed", "detail": item["detail"], "result": item["executed"]})
     return item
 
 

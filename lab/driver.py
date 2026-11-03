@@ -101,12 +101,30 @@ def main():
              for i in incidents())
     report(7, ok, "integridad SUID disparó crit")
 
-    print("\n── nivel 8: persistencia en cron.d ──")
+    print("\n── nivel 8: persistencia en cron.d → autorización → restauración ──")
     sh("echo '* * * * * root /bin/true' > /etc/cron.d/arxevil")
     sweep()
     pend = config.read_json(config.state_dir() / "pending_tier2.json", [])
-    ok = bool(pend) and any("cron" in i.get("detail", "").lower() for i in incidents())
-    report(8, ok, f"drift crit + {len(pend)} pendiente(s) Tier 2 para el humano")
+    # el barrido puede haber encolado otros pendientes antes (p. ej. suid_set del L7):
+    # el humano autoriza el de cron, no el primero de la fila
+    item_id = next((p["id"] for p in pend
+                    if p.get("kind") == "integrity"
+                    and (p.get("target") or {}).get("file") == "cron"), None)
+    restored, quarantined = False, False
+    if item_id:
+        from arx.modules import response
+        # el humano autoriza (en la CLI real pide la palabra; aquí es el lab)
+        item = response.authorize_pending(item_id)
+        restored = bool(item and "restaurado" in (item.get("executed") or ""))
+        import pathlib
+        quarantined = any(p.name.startswith("q-") for p in
+                          pathlib.Path(config.state_dir() / "vault").glob("q-*"))
+        gone = not os.path.exists("/etc/cron.d/arxevil")
+        report(8, restored and quarantined and gone,
+               f"restaurado={restored} · hostil en cuarentena={quarantined} · "
+               f"fichero hostil fuera de /etc/cron.d={gone}")
+    else:
+        report(8, False, "no se creó el pendiente Tier 2 de cron")
 
     print("\n── nivel 9: lectura del señuelo ──")
     if canary_path and os.path.exists(canary_path):

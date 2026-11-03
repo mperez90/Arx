@@ -717,5 +717,98 @@ class ProcfsPortsTests(unittest.TestCase):
         self.assertEqual(recon._procfs_host("0A000001"), "0A000001")  # iface: hex crudo
 
 
+class Tier2ExecutorTests(unittest.TestCase):
+    """F5 — lo autorizado se EJECUTA: restauración desde el vault + cuarentena de evidencia."""
+
+    def setUp(self):
+        _isolate()
+        from arx.modules import response
+        self.r = response
+        p = mock.patch.object(response, "_is_linux_root", lambda: True)
+        p.start()
+        self.addCleanup(p.stop)
+        self.tmp = tempfile.mkdtemp()
+
+    def _critical_file(self, content="* * * * * root /bin/legit\n"):
+        path = os.path.join(self.tmp, "crontab")
+        with open(path, "w") as f:
+            f.write(content)
+        return path
+
+    def test_authorize_integrity_restores_and_quarantines(self):
+        good = self._critical_file()
+        self.r.backup_critical({"cron": [good]})
+        with open(good, "w") as f:  # el atacante lo altera
+            f.write("* * * * * root /tmp/evil\n")
+        finding = {"kind": "integrity", "sev": "crit",
+                   "detail": "cambió cron desde el sellado", "target": {"file": "cron"}}
+        from arx.modules import baseline
+        p = mock.patch.object(baseline, "integrity_paths", lambda: {"cron": [good]})
+        p.start()  # el barrido real del host queda fuera del test
+        self.addCleanup(p.stop)
+        o = self.r.handle(finding, enforce=True, cfg={})
+        item = self.r.authorize_pending(o["pending_id"])
+        self.assertIn("restaurado", item["executed"])
+        self.assertEqual(open(good).read(), "* * * * * root /bin/legit\n")
+        manifest = self.r.config.read_json(self.r._vault_manifest_path(), {})
+        quars = [m for m in manifest.values() if m.get("quarantined_from") == good]
+        self.assertEqual(len(quars), 1)  # la versión hostil se preserva como evidencia
+
+    def test_restore_without_backup_is_honest(self):
+        finding = {"kind": "integrity", "sev": "crit", "detail": "x",
+                   "target": {"file": "sudoers"}}
+        item = self.r.authorize_pending(self.r._add_pending(finding, {"action": "a"}))
+        self.assertIn("sin respaldo", item["executed"])
+
+    def test_unknown_kind_registers_plan(self):
+        finding = {"kind": "login_users", "sev": "high", "detail": "x",
+                   "target": {"user": "bob"}}
+        item = self.r.authorize_pending(self.r._add_pending(finding, {"action": "a"}))
+        self.assertIn("sin ejecutor", item["executed"])
+
+    def test_pending_stores_kind_and_target(self):
+        f = {"kind": "integrity", "sev": "crit", "detail": "d", "target": {"file": "cron"}}
+        self.r._add_pending(f, {"action": "x"})
+        self.assertEqual(self.r.list_pending()[0]["target"], {"file": "cron"})
+
+    def test_backup_is_idempotent(self):
+        good = self._critical_file("a")
+        self.assertEqual(self.r.backup_critical({"cron": [good]}), 1)
+        self.assertEqual(self.r.backup_critical({"cron": [good]}), 0)
+
+    def test_intruder_without_backup_is_quarantined(self):
+        """B6 (lab L8): un fichero NUEVO bajo una clave sellada no tiene copia buena:
+        no hay nada que restaurar, pero sí que cuarentenar como evidencia."""
+        good = self._critical_file()
+        self.r.backup_critical({"cron": [good]})
+        intruder = os.path.join(self.tmp, "arxevil")
+        with open(intruder, "w") as f:
+            f.write("* * * * * root /tmp/evil\n")
+        out = self.r._restore_from_vault("cron", current_files=[good, intruder])
+        self.assertIn("cuarentena", out)
+        self.assertFalse(os.path.exists(intruder))  # fuera de su sitio
+        manifest = self.r.config.read_json(self.r._vault_manifest_path(), {})
+        self.assertTrue(any(m.get("quarantined_from") == intruder for m in manifest.values()))
+        self.assertEqual(open(good).read(), "* * * * * root /bin/legit\n")  # intacto
+
+    def test_intact_files_are_not_touched(self):
+        """Restaurar lo que no cambió sería ruido forense: 0 cuarentenas espurias."""
+        good = self._critical_file()
+        self.r.backup_critical({"cron": [good]})
+        out = self.r._restore_from_vault("cron", current_files=[good])
+        self.assertIn("nada que restaurar", out)
+        manifest = self.r.config.read_json(self.r._vault_manifest_path(), {})
+        self.assertFalse(any(m.get("quarantined_from") for m in manifest.values()))
+
+    def test_deleted_critical_file_is_restored(self):
+        """Si el atacante BORRA el fichero crítico, el vault lo repone (now=None)."""
+        good = self._critical_file()
+        self.r.backup_critical({"cron": [good]})
+        os.unlink(good)
+        out = self.r._restore_from_vault("cron", current_files=[])
+        self.assertIn("restaurado", out)
+        self.assertEqual(open(good).read(), "* * * * * root /bin/legit\n")
+
+
 if __name__ == "__main__":
     unittest.main()

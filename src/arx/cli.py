@@ -182,10 +182,10 @@ def cmd_authorize(args: argparse.Namespace) -> int:
     if not config.verify_word(word, cfg.get("auth_word", {})):
         print("Palabra incorrecta. Acción NO autorizada.")
         return 1
-    response.authorize_pending(args.pending_id)
+    item = response.authorize_pending(args.pending_id)
     print(f"✓ Autorizada: {item['detail']}")
     print(f"  Remediación: {item['remediation']}")
-    print("  Arx aplica lo reversible; lo irreversible confírmalo tú en el host.")
+    print(f"  Ejecutado:   {item.get('executed', '—')}")
     return 0
 
 
