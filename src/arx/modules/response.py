@@ -29,6 +29,7 @@ import hashlib
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
@@ -202,6 +203,55 @@ def _revert_argv(revert) -> list[str] | None:
     return None
 
 
+def _pids_for_exe(exe: str) -> list[int]:
+    """PIDs cuyo ejecutable REAL (readlink de /proc/<pid>/exe) es `exe`.
+
+    Jamás se empareja por nombre de proceso: dos binarios distintos pueden llamarse
+    igual y el nombre lo pone el propio programa.
+    """
+    out = []
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return out
+    for name in entries:
+        if not name.isdigit():
+            continue
+        try:
+            if os.readlink(f"/proc/{name}/exe") == exe:
+                out.append(int(name))
+        except OSError:
+            continue  # murió entre listado y lectura, o sin permiso
+    return out
+
+
+def _apply_revert(revert) -> str | None:
+    """Ejecuta una reversión y la describe. Solo formas conocidas: nunca texto libre."""
+    argv = _revert_argv(revert)
+    if argv:
+        try:
+            subprocess.run(argv, capture_output=True, text=True, timeout=15)
+        except (OSError, subprocess.TimeoutExpired):
+            pass  # la herramienta ya no está; no romper el bucle de guardia
+        return " ".join(argv)
+    if isinstance(revert, dict) and revert.get("tool") == "sigstop":
+        pids, exe = revert.get("pids"), revert.get("exe")
+        if not (isinstance(exe, str) and exe.startswith("/") and isinstance(pids, list)
+                and all(isinstance(p, int) and p > 1 for p in pids)):
+            return None
+        done = 0
+        for pid in pids:
+            try:
+                # anti reutilización de PID: solo SIGCONT si sigue siendo el mismo binario
+                if os.readlink(f"/proc/{pid}/exe") == exe:
+                    os.kill(pid, signal.SIGCONT)
+                    done += 1
+            except OSError:
+                continue
+        return f"SIGCONT a {done} proceso(s) de {exe}"
+    return None
+
+
 def expire_blocks(now=None) -> list[dict]:
     """Revierte los bloqueos Tier 1 vencidos. En Linux+root ejecuta el revert real."""
     now = now or _now()
@@ -210,13 +260,8 @@ def expire_blocks(now=None) -> list[dict]:
         for b in _load_blocks():
             exp = _parse_dt(b.get("expires_at"))
             if exp and exp <= now:
-                argv = _revert_argv(b.get("revert"))
-                if _is_linux_root() and argv:
-                    try:
-                        subprocess.run(argv, capture_output=True, text=True, timeout=15)
-                    except (OSError, subprocess.TimeoutExpired):
-                        pass  # la herramienta ya no está; no romper el bucle de guardia
-                record({"kind": "block_expired", "detail": b.get("detail"), "reverted": argv})
+                done = _apply_revert(b.get("revert")) if _is_linux_root() else None
+                record({"kind": "block_expired", "detail": b.get("detail"), "reverted": done})
                 expired.append(b)
             else:
                 keep.append(b)
@@ -351,9 +396,32 @@ def _execute_tier1(finding: dict) -> tuple[str, dict | None]:
             register_block(finding, revert)
             return f"puerto {port}/{proto} bloqueado en ufw (auto-expira en {DEFAULT_TTL_MIN} min)", revert
         return f"no se pudo bloquear el puerto ({r.stderr.strip()[:48]})", None
+    if kind in ("executables", "processes"):
+        exe = str(target.get("exe") or target.get("process") or "")
+        if not exe.startswith("/"):
+            # suspender por NOMBRE es inseguro (match erróneo) → se propone, no se auto-ejecuta
+            return "sin ruta de ejecutable resuelta: no se suspende por nombre", None
+        base = exe.rsplit("/", 1)[-1]
+        if base in _PROTECTED_EXES:
+            return f"proceso crítico ({base}): jamás se suspende", None
+        pids = [p for p in _pids_for_exe(exe) if p > 1 and p != os.getpid()]
+        if not pids:
+            return "el proceso ya no está vivo: nada que suspender", None
+        stopped = 0
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGSTOP)
+                stopped += 1
+            except OSError:
+                continue
+        if not stopped:
+            return "no se pudo suspender (carrera o permisos)", None
+        revert = {"tool": "sigstop", "exe": exe, "pids": pids}
+        register_block(finding, revert)
+        return (f"proceso suspendido ({stopped} pid) — SIGCONT automático al expirar "
+                f"({DEFAULT_TTL_MIN} min)"), revert
     if kind == "canary":
         return "nivel de alerta elevado y contexto capturado", None
-    # p. ej. suspender un proceso por NOMBRE es inseguro (match erróneo) → se propone, no se auto-ejecuta
     return "propuesta (sin ejecutor automático seguro para este tipo)", None
 
 

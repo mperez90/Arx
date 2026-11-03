@@ -527,5 +527,87 @@ class VersionTests(unittest.TestCase):
                          "pyproject debe leer la versión de arx/__init__.py (dynamic)")
 
 
+class SuspendActuatorTests(unittest.TestCase):
+    """F5 — suspensión real de procesos (SIGSTOP) con reversión automática (SIGCONT)."""
+
+    def setUp(self):
+        _isolate()
+        from arx.modules import response
+        self.r = response
+        self.kills = []
+        for target, value in [("_is_linux_root", lambda: True), ("ssh_ports", lambda: {22})]:
+            p = mock.patch.object(response, target, value)
+            p.start()
+            self.addCleanup(p.stop)
+        pk = mock.patch.object(response.os, "kill",
+                               lambda pid, sig: self.kills.append((pid, sig)))
+        pk.start()
+        self.addCleanup(pk.stop)
+
+    def _exe(self, exe):
+        return {"kind": "executables", "sev": "high",
+                "detail": f"ejecutable nuevo: {exe}", "target": {"exe": exe},
+                "set": "executables", "item": exe}
+
+    def _live(self, pids):
+        p = mock.patch.object(self.r, "_pids_for_exe", lambda exe: list(pids))
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_refuses_bare_name(self):
+        o = self.r.handle(self._exe("minerd"), enforce=True, cfg={})  # sin ruta → inseguro
+        self.assertEqual(self.kills, [])
+        self.assertIn("no se suspende por nombre", o["status"])
+
+    def test_refuses_protected_exe(self):
+        o = self.r.handle(self._exe("/usr/sbin/sshd"), enforce=True, cfg={})
+        self.assertEqual(self.kills, [])
+        self.assertEqual(o["tier"], 0)  # intocable: baja a observar antes de ejecutar
+
+    def test_dead_process_registers_nothing(self):
+        self._live(())
+        o = self.r.handle(self._exe("/tmp/miner"), enforce=True, cfg={})
+        self.assertEqual(self.kills, [])
+        self.assertIn("ya no está vivo", o["status"])
+        self.assertEqual(self.r._load_blocks(), [])
+
+    def test_suspend_registers_sigstop_revert(self):
+        import signal
+        self._live((4242, 4343))
+        o = self.r.handle(self._exe("/tmp/miner"), enforce=True, cfg={})
+        self.assertEqual(self.kills, [(4242, signal.SIGSTOP), (4343, signal.SIGSTOP)])
+        self.assertIn("SIGCONT", o["status"])
+        revert = self.r._load_blocks()[0]["revert"]
+        self.assertEqual(revert, {"tool": "sigstop", "exe": "/tmp/miner", "pids": [4242, 4343]})
+
+    def test_expiry_sigcont_only_if_same_exe(self):
+        import signal
+        self._live((4242,))
+        self.r.handle(self._exe("/tmp/miner"), enforce=True, cfg={})
+        self.kills.clear()
+        # el PID fue reutilizado por OTRO binario → no se toca
+        pr = mock.patch.object(self.r.os, "readlink", lambda p: "/usr/bin/otro")
+        pr.start()
+        later = datetime.now(timezone.utc) + timedelta(minutes=61)
+        self.r.expire_blocks(now=later)
+        pr.stop()
+        self.assertEqual(self.kills, [])
+        # mismo binario → SIGCONT real
+        self._live((5555,))
+        self.r.handle(self._exe("/tmp/miner2"), enforce=True, cfg={})
+        self.kills.clear()
+        pr2 = mock.patch.object(self.r.os, "readlink", lambda p: "/tmp/miner2")
+        pr2.start()
+        self.addCleanup(pr2.stop)
+        self.r.expire_blocks(now=later + timedelta(minutes=1))
+        self.assertEqual(self.kills, [(5555, signal.SIGCONT)])
+
+    def test_malformed_sigstop_revert_rejected(self):
+        self.assertIsNone(self.r._apply_revert({"tool": "sigstop", "exe": "relativo", "pids": [5]}))
+        self.assertIsNone(self.r._apply_revert({"tool": "sigstop", "exe": "/x", "pids": [1]}))
+        self.assertIsNone(self.r._apply_revert({"tool": "sigstop", "exe": "/x", "pids": "9"}))
+        self.assertEqual(self.kills, [])
+
+
 if __name__ == "__main__":
     unittest.main()
