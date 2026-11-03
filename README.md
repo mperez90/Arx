@@ -4,7 +4,9 @@
 *normal* looks like, and answers threats in real time — relentless on what can be undone,
 and never touching the irreversible without you.
 
-> **Status:** v0.0.1 · Core lifecycle complete, working end-to-end. Not yet released.
+> **Status:** v0.0.1 · **Arx Core is free and available now.** The paid tiers open after
+> Core completes its public testing phase — **Pro first, Business last**. Founding pricing
+> (half price, first 500 purchases of each plan) is reserved for that opening.
 > © ASL — Advanced Systems Laboratories.
 
 ---
@@ -68,11 +70,11 @@ ranks what matters — is where the real work lives, and it stays in the code.
 
 ## Editions
 
-| Edition | For |
-|---------|-----|
-| **Core** | source-available, auditable, complete on the essentials of defense |
-| **Pro** | managed threat intelligence, advanced detections, authorized self-testing |
-| **Business** | fleet operation, central console, correlation, compliance, MDR |
+| Edition | For | Availability |
+|---------|-----|--------------|
+| **Core** | source-available, auditable, complete on the essentials of defense | **Free — available now** |
+| **Pro** | managed threat intelligence, advanced detections, authorized self-testing | after Core's public testing phase |
+| **Business** | fleet operation, central console, correlation, compliance, MDR | after Pro |
 
 Core is licensed under the Business Source License; see [`LICENSE`](LICENSE) and
 [`NOTICE`](NOTICE).

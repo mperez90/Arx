@@ -42,8 +42,14 @@ POLAR = {
     },
     "production": {
         "base": "https://api.polar.sh/v1",
-        "organization_id": "",  # TODO release: fijar org_id de producción
-        "benefits": {},          # TODO release: fijar benefit_id → tier de producción
+        "organization_id": "658f3fab-d2e5-4415-9e5a-e6eb41856c8b",  # Advanced Systems Laboratories
+        # Suscripciones (D7): UN benefit por tier, compartido por founding/estándar y
+        # mensual/anual. La suscripción gobierna la vigencia: al cancelar, Polar revoca
+        # el benefit y la validación degrada a Core (falla-abierto con gracia).
+        "benefits": {
+            "f3b4fe6c-34fa-4edb-91f8-d610aff86158": "pro",       # Arx Pro — suscripción (1 dispositivo)
+            "6349dc31-3239-434a-a58d-1fbe377f4b79": "business",  # Arx Business — suscripción (flota)
+        },
     },
 }
 
