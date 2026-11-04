@@ -65,6 +65,9 @@ step "tarpit (Core): con política 'tarpit' se ESTRANGULA la IP en vez de bloque
 docker exec "$ATT" nmap -sS -p 9000-9020 --max-retries 1 victim >/dev/null 2>&1 || true
 docker exec "$VIC" python3 /src/lab/driver.py net-tarpit "$ATTACKER_IP" || FAILED=1
 
+step "F6 sandbox estático (Core): ¿este fichero es malicioso? — sin ejecutar nada"
+docker exec "$VIC" python3 /src/lab/driver.py sandbox || FAILED=1
+
 echo
 if [ "$FAILED" = 0 ]; then
   echo "══ MINI-LAB COMPLETO: todos los niveles ejecutables superados ══"

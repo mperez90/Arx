@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 
 from arx import config, engine, notify, redact
 from arx import license as lic
-from arx.modules import baseline, canaries, fleet, response, sensors
+from arx.modules import baseline, canaries, fleet, response, sandbox, sensors
 
 SYSTEM_PROMPT = (
     "Eres Arx, guardián defensivo de este servidor. Respondes breve y en español, "
@@ -82,6 +82,9 @@ def sweep(base: dict, enforce: bool = False, include_suid: bool = True,
         + canaries.check()
         + sensors.collect_events()
     )
+    # "estático siempre": un ejecutable nuevo en disco se analiza (no se ejecuta) y el
+    # hallazgo lleva su veredicto. Un malicioso sube a severidad alta; lo limpio no hace ruido.
+    findings = [sandbox.enrich_finding(f) for f in findings]
     findings.sort(key=lambda f: _SEV_RANK.get(f["sev"], 9))
     outcomes = [response.handle(f, enforce=enforce, cfg=cfg) for f in findings]
     return findings, outcomes

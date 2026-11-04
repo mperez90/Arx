@@ -53,6 +53,11 @@ def cmd_canaries(args: argparse.Namespace) -> int:
     return canaries.run(args.caction, locations=getattr(args, "in_dirs", None))
 
 
+def cmd_scan(args: argparse.Namespace) -> int:
+    from arx.modules import sandbox  # análisis estático: nunca ejecuta el fichero
+    return sandbox.run(args.path)
+
+
 def cmd_service(args: argparse.Namespace) -> int:
     from arx.modules import service
     return service.run(args.saction, exec_start=getattr(args, "exec_path", None),
@@ -285,6 +290,8 @@ def main(argv: list[str] | None = None) -> int:
     p_guard.add_argument("--chat", action="store_true", help="abrir canal de consola con Arx")
     p_guard.add_argument("--enforce", action="store_true", help="aplicar remediaciones Tier 1 (auto, reversibles)")
     p_guard.add_argument("--verbose", action="store_true", help="mostrar todos los hallazgos en cada barrido")
+    p_scan = sub.add_parser("scan", help="análisis estático de un fichero (¿es malicioso?)")
+    p_scan.add_argument("path", help="ruta del fichero a analizar (no se ejecuta)")
     sub.add_parser("status", help="estado general de Arx (un vistazo)")
     p_auth = sub.add_parser("authorize", help="ver/aprobar acciones Tier 2 pendientes")
     p_auth.add_argument("pending_id", nargs="?", help="id a autorizar (sin id: lista los pendientes)")
@@ -333,8 +340,9 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
     handlers = {"setup": cmd_setup, "recon": cmd_recon, "learn": cmd_learn,
                 "guard": cmd_guard, "status": cmd_status, "authorize": cmd_authorize,
-                "canaries": cmd_canaries, "service": cmd_service, "fleet": cmd_fleet,
-                "license": cmd_license, "accept": cmd_accept, "notify": cmd_notify}
+                "canaries": cmd_canaries, "scan": cmd_scan, "service": cmd_service,
+                "fleet": cmd_fleet, "license": cmd_license, "accept": cmd_accept,
+                "notify": cmd_notify}
     if args.cmd not in handlers:
         # Puerta 5 de D2: el arsenal vive en un paquete privado fuera del repo Core.
         # Este gancho solo lo DESCUBRE si está instalado; no contiene nada suyo.
