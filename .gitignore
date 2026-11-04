@@ -26,6 +26,7 @@ docs/*
 scripts/polar_*.py
 pro/
 backend/
+arsenal/
 
 # OS
 .DS_Store

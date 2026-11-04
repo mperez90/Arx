@@ -322,11 +322,30 @@ def main(argv: list[str] | None = None) -> int:
     p_la.add_argument("key", help="la llave que compraste (Polar)")
     lsub.add_parser("status", help="ver estado y tier efectivo")
     lsub.add_parser("deactivate", help="liberar la activación local (al reinstalar el servidor)")
+    # Puerta 5 de D2: el arsenal vive en un paquete privado fuera del repo Core.
+    # Este gancho solo lo DESCUBRE si está instalado; no contiene nada suyo.
+    try:
+        from arx_arsenal import cli as _arsenal_cli
+    except ImportError:
+        _arsenal_cli = None
+    if _arsenal_cli is not None:
+        _arsenal_cli.register(sub)
     args = p.parse_args(argv)
     handlers = {"setup": cmd_setup, "recon": cmd_recon, "learn": cmd_learn,
                 "guard": cmd_guard, "status": cmd_status, "authorize": cmd_authorize,
                 "canaries": cmd_canaries, "service": cmd_service, "fleet": cmd_fleet,
                 "license": cmd_license, "accept": cmd_accept, "notify": cmd_notify}
+    if args.cmd not in handlers:
+        # Puerta 5 de D2: el arsenal vive en un paquete privado fuera del repo Core.
+        # Este gancho solo lo DESCUBRE si está instalado; no contiene nada suyo.
+        try:
+            from arx_arsenal import cli as _arsenal_cli
+        except ImportError:
+            _arsenal_cli = None
+        if _arsenal_cli is not None and _arsenal_cli.handles(args.cmd):
+            return _arsenal_cli.run(args) or 0
+        p.print_help()
+        return 1
     return handlers[args.cmd](args) or 0
 
 

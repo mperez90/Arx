@@ -63,6 +63,7 @@ _FEATURE_TIER = {
     "console": "business",
     "cross_host": "business",
     "compliance": "business",
+    "arsenal": "business",
 }
 _ORDER = {"core": 0, "pro": 1, "business": 2}
 
