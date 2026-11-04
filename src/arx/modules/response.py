@@ -26,6 +26,7 @@ host destino. Fuera de eso se decide y se registra el plan, nunca se finge hecho
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import os
 import re
 import shutil
@@ -35,6 +36,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 
 from arx import config
+from arx.modules import recon
 
 DEFAULT_TTL_MIN = 60  # los bloqueos Tier 1 auto-expiran (reversibles por doctrina)
 MAX_TIER1_PER_HOUR = 5
@@ -53,6 +55,12 @@ _PLAN: dict[str, tuple[int, str, bool, str]] = {
                     "podría ser un admin legítimo → requiere tu palabra"),
     "canary": (1, "elevar el nivel de alerta y capturar el contexto del acceso al señuelo", True,
                "un señuelo tocado es señal fuerte de intruso; elevar y capturar es reversible"),
+    "port_scan": (1, "bloquear la IP de origen en el firewall (temporal, auto-expira)", True,
+                  "cortar el reconocimiento es reversible y no toca nada local"),
+    "auth_bruteforce": (1, "bloquear la IP de origen en el firewall (temporal, auto-expira)", True,
+                        "corta la fuerza bruta sin tocar la cuenta atacada (eso es Tier 2)"),
+    "log_tamper": (0, "registrar y alertar — alguien está borrando huellas", True,
+                   "borrar logs es señal de intruso DENTRO: observar y escalar, no actuar a ciegas"),
     "gauge": (0, "registrar y vigilar la tendencia", True, "señal débil; observar primero"),
 }
 
@@ -134,6 +142,32 @@ def _out_of_bounds(cfg: dict) -> list[str]:
     return [t.strip() for t in re.split(r"[,\s]+", raw) if t.strip()]
 
 
+def _never_block_ips() -> set[str]:
+    """IPs que JAMÁS reciben un bloqueo automático.
+
+    · Las propias del host (bloquear tu interfaz es un auto-daño absurdo).
+    · Las del OPERADOR: una sesión SSH ESTABLECIDA y PERSISTENTE (vista en ≥2
+      decisiones). Un atacante a mitad de fuerza bruta también tiene sockets
+      ESTABLISHED efímeros hacia sshd: proteger "cualquiera conectado al 22" sería
+      un interruptor de evasión — el atacante solo tendría que mantener una conexión
+      abierta para volverse intocable.
+    """
+    out = set(recon.local_ips())
+    ssh = ssh_ports()
+    current = {c["remote_ip"] for c in recon.collect_connections()
+               if c.get("state") == "ESTABLISHED" and c.get("local_port") in ssh}
+    path = config.state_dir() / "ssh-peers.json"
+    peers = config.read_json(path, {})
+    now = _now().timestamp()
+    peers = {ip: p for ip, p in peers.items() if now - p.get("last", 0) < 900}
+    for ip in current:
+        p = peers.setdefault(ip, {"seen": 0, "last": now})
+        p["seen"] += 1
+        p["last"] = now
+    config.write_json(path, peers)
+    return out | {ip for ip, p in peers.items() if ip in current and p["seen"] >= 2}
+
+
 def protected_reason(finding: dict, cfg: dict | None = None) -> str | None:
     """Por qué este objetivo NO admite acción automática (None = sí la admite)."""
     cfg = cfg if cfg is not None else config.load_config()
@@ -145,6 +179,12 @@ def protected_reason(finding: dict, cfg: dict | None = None) -> str | None:
             return "puerto SSH: bloquearlo te dejaría fuera del servidor"
         if str(port) in oob:
             return "puerto marcado fuera-de-límites"
+    if kind in ("port_scan", "auth_bruteforce") and target.get("ip"):
+        ip = str(target["ip"])
+        if ip in _never_block_ips():
+            return "IP intocable (propia del host o con sesión de operador activa)"
+        if ip in oob:
+            return "IP marcada fuera-de-límites"
     if kind in ("executables", "processes"):
         name = str(target.get("exe") or target.get("process") or "")
         base = name.rsplit("/", 1)[-1]
@@ -202,6 +242,19 @@ def _revert_argv(revert) -> list[str] | None:
             return ["nft", "delete", "element", "inet", "arx", f"block_{proto}",
                     f"{{ {port} }}"]
         return None
+    if isinstance(revert, dict) and revert.get("tool") == "nft_ip":
+        try:
+            fam = ipaddress.ip_address(str(revert.get("ip", ""))).version
+        except ValueError:
+            return None
+        return ["nft", "delete", "element", "inet", "arx", f"block_ipv{fam}",
+                f"{{ {revert['ip']} }}"]
+    if isinstance(revert, dict) and revert.get("tool") == "ufw_ip":
+        try:
+            ipaddress.ip_address(str(revert.get("ip", "")))
+        except ValueError:
+            return None
+        return ["ufw", "delete", "deny", "from", str(revert["ip"])]
     if isinstance(revert, str):  # formato antiguo (texto): solo si encaja exactamente
         m = _LEGACY_REVERT.match(revert)
         if m:
@@ -520,6 +573,15 @@ def _nft_available() -> bool:
     return shutil.which("nft") is not None
 
 
+def ensure_nft_tracking() -> bool:
+    """Instala la tabla/sets/reglas de Arx — incluida la PISTA de escaneo — aunque aún
+    no haya nada que bloquear. La pista debe existir ANTES del primer escaneo, no en
+    la primera respuesta. Idempotente; sin nft o sin root: False silencioso."""
+    if not (_is_linux_root() and _nft_available()):
+        return False
+    return _nft_setup()
+
+
 def _nft_setup() -> bool:
     """Tabla/set/cadena de Arx en nftables, idempotente (ignora 'ya existe')."""
     try:
@@ -535,6 +597,21 @@ def _nft_setup() -> bool:
                   "{", "type", "inet_service;", "flags", "timeout;", "}"],
                  ["nft", "add", "set", "inet", "arx", "block_udp",
                   "{", "type", "inet_service;", "flags", "timeout;", "}"]]
+    if "block_ipv4" not in ruleset:
+        cmds += [["nft", "add", "set", "inet", "arx", "block_ipv4",
+                  "{", "type", "ipv4_addr;", "flags", "timeout;", "}"],
+                 ["nft", "add", "set", "inet", "arx", "block_ipv6",
+                  "{", "type", "ipv6_addr;", "flags", "timeout;", "}"]]
+    # Parejas (origen, puerto) de cada SYN entrante: la PISTA de escaneo la guarda el
+    # kernel (incluso contra puertos cerrados, donde no nace socket). La lee
+    # sensors.detect_port_scan.
+    if "scan4" not in ruleset:
+        cmds += [["nft", "add", "set", "inet", "arx", "scan4",
+                  "{", "type", "ipv4_addr", ".", "inet_service;", "flags", "timeout;",
+                  "timeout", "10m;", "}"],
+                 ["nft", "add", "set", "inet", "arx", "scan6",
+                  "{", "type", "ipv6_addr", ".", "inet_service;", "flags", "timeout;",
+                  "timeout", "10m;", "}"]]
     if "chain input" not in ruleset.split("table inet arx")[-1]:
         cmds.append(["nft", "add", "chain", "inet", "arx", "input",
                      "{", "type", "filter", "hook", "input", "priority", "0;",
@@ -544,6 +621,18 @@ def _nft_setup() -> bool:
                   "@block_tcp", "drop"],
                  ["nft", "add", "rule", "inet", "arx", "input", "udp", "dport",
                   "@block_udp", "drop"]]
+    if "ip saddr @block_ipv4" not in ruleset:
+        cmds += [["nft", "add", "rule", "inet", "arx", "input", "ip", "saddr",
+                  "@block_ipv4", "drop"],
+                 ["nft", "add", "rule", "inet", "arx", "input", "ip6", "saddr",
+                  "@block_ipv6", "drop"]]
+    if "@scan4" not in ruleset.split("chain input")[-1]:
+        cmds += [["nft", "add", "rule", "inet", "arx", "input", "tcp", "flags", "&",
+                  "(", "syn", "|", "ack", ")", "==", "syn", "add", "@scan4",
+                  "{", "ip", "saddr", ".", "tcp", "dport", "}"],
+                 ["nft", "add", "rule", "inet", "arx", "input", "tcp", "flags", "&",
+                  "(", "syn", "|", "ack", ")", "==", "syn", "add", "@scan6",
+                  "{", "ip6", "saddr", ".", "tcp", "dport", "}"]]
     for argv in cmds:
         try:
             subprocess.run(argv, capture_output=True, text=True, timeout=15)
@@ -616,6 +705,36 @@ def _execute_tier1(finding: dict) -> tuple[str, dict | None]:
                 f"({DEFAULT_TTL_MIN} min)"), revert
     if kind == "canary":
         return "nivel de alerta elevado y contexto capturado", None
+    if kind in ("port_scan", "auth_bruteforce") and target.get("ip"):
+        ip = str(target["ip"])
+        try:
+            fam = ipaddress.ip_address(ip).version
+        except ValueError:
+            return f"IP inválida ({ip}): no se bloquea", None
+        if shutil.which("ufw") and _ufw_active():
+            r = subprocess.run(["ufw", "deny", "from", ip],
+                               capture_output=True, text=True, timeout=15)
+            if r.returncode == 0:
+                revert = {"tool": "ufw_ip", "ip": ip}
+                register_block(finding, revert)
+                return (f"IP {ip} bloqueada en ufw "
+                        f"(auto-expira en {DEFAULT_TTL_MIN} min)"), revert
+            return f"no se pudo bloquear la IP ({r.stderr.strip()[:48]})", None
+        if _nft_available():
+            if not _nft_setup():
+                return "nftables presente pero no se pudo preparar la tabla arx", None
+            r = subprocess.run(["nft", "add", "element", "inet", "arx", f"block_ipv{fam}",
+                                f"{{ {ip} timeout {DEFAULT_TTL_MIN}m }}"],
+                               capture_output=True, text=True, timeout=15)
+            if r.returncode == 0:
+                revert = {"tool": "nft_ip", "ip": ip}
+                register_block(finding, revert)
+                return (f"IP {ip} bloqueada en nftables "
+                        f"(timeout nativo {DEFAULT_TTL_MIN} min + reversión de Arx)"), revert
+            return f"nft falló al bloquear la IP ({r.stderr.strip()[:48]})", None
+        if shutil.which("ufw"):
+            return "ufw está INACTIVO: un bloqueo no tendría efecto (actívalo o decide tú)", None
+        return "sin ufw ni nftables: no hay ejecutor seguro de bloqueo en este host", None
     return "propuesta (sin ejecutor automático seguro para este tipo)", None
 
 

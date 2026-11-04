@@ -74,6 +74,7 @@ def _integrity_drift(base: dict, include_suid: bool) -> list[dict]:
 
 def sweep(base: dict, enforce: bool = False, include_suid: bool = True,
           cfg: dict | None = None) -> tuple[list[dict], list[dict]]:
+    response.ensure_nft_tracking()  # la pista de escaneo debe existir ANTES del ataque
     snap = baseline.snapshot()
     findings = (
         baseline.compare(base, snap)

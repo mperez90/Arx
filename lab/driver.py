@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 """Driver del mini-lab Arx — corre DENTRO del contenedor víctima.
 
-Prepara Arx (learn + seal + canario) y ejecuta los niveles que hoy deben pasar en
-un contenedor único (3, 4, 5, 7, 8, 9). Imprime un scoreboard PASS/GAP por nivel y
-sale != 0 si alguno de los que deberían pasar falla. Los niveles 1, 2 y 6 necesitan
-atacante separado o sensores aún inexistentes — ver lab/README.md (GAPs honestos).
+Modos (los orquesta lab/docker-lab.sh con un contenedor atacante separado):
+  prep              learn ×2 + seal + canario + listeners señuelo 9001-9012
+  net-scan <ip>     L1: verifica detección del escaneo y bloqueo nft de la IP
+  release           libera los bloqueos Tier 1 (entre fases de red)
+  net-brute <ip>    L2: verifica detección de fuerza bruta y bloqueo nft
+  levels            L4, L5, L7, L8, L9 en la víctima + scoreboard
+  all               prep + levels (modo clásico de contenedor único)
+
+Cada modo imprime [PASS]/[FAIL] por nivel y sale != 0 si falla.
 """
 import json
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -55,16 +61,63 @@ def sweep():
     return arx("guard", "--once", "--enforce")
 
 
-def main():
+def _nft_set(name):
+    return sh(["nft", "list", "set", "inet", "arx", name]).stdout
+
+
+def prep():
     config.write_json(config.config_dir() / "config.json",
                       {"llm_daily_budget": 0, "lab": True})
-
-    print("── preparación: learn ×2 + seal + canario ──")
+    print("── preparación: verificar listeners 9001-9012 + learn ×2 + seal + canario ──")
+    # Los listeners se siembran en el entrypoint del contenedor (docker exec mata el
+    # árbol de procesos al salir — B7). Aquí se VERIFICA, con honestidad si faltan.
+    import socket
+    dead = [p for p in range(9001, 9013)
+            if socket.socket(socket.AF_INET, socket.SOCK_STREAM).connect_ex(("127.0.0.1", p)) != 0]
+    if dead:
+        print(f"listeners señuelo caídos: {dead} — deben nacer en el entrypoint")
+        return 1
     arx("learn")
     arx("learn")
     out = arx("learn", "--seal")
     assert "sellad" in out.lower() or "seal" in out.lower(), f"seal falló: {out}"
     print(arx("canaries", "plant").strip()[:120])
+    return 0
+
+
+def net_scan(ip):
+    sweep()
+    found = any("escaneo desde" in i.get("detail", "") and ip in i.get("detail", "")
+                for i in incidents())
+    blocked = ip in _nft_set("block_ipv4")
+    ok = found and blocked
+    print(f"[{'PASS' if ok else 'FAIL'}] nivel 1: escaneo detectado={found} · "
+          f"IP en block_ipv4={blocked}")
+    return 0 if ok else 1
+
+
+def release():
+    """Libera los bloqueos Tier 1 activos (como si hubieran expirado) entre fases."""
+    from datetime import datetime, timedelta, timezone
+    from arx.modules import response
+    later = datetime.now(timezone.utc) + timedelta(minutes=61)
+    n = len(response.expire_blocks(now=later))
+    print(f"── bloqueos Tier 1 liberados entre fases: {n} ──")
+    return 0
+
+
+def net_brute(ip):
+    sweep()
+    found = any("fallos de autenticación desde" in i.get("detail", "")
+                and ip in i.get("detail", "") for i in incidents())
+    blocked = ip in _nft_set("block_ipv4")
+    ok = found and blocked
+    print(f"[{'PASS' if ok else 'FAIL'}] nivel 2: fuerza bruta detectada={found} · "
+          f"IP en block_ipv4={blocked}")
+    return 0 if ok else 1
+
+
+def levels():
     canary_path = None
     from arx.modules import canaries
     planted = canaries._load().get("canaries", [])
@@ -138,9 +191,24 @@ def main():
         report(9, False, "no se pudo plantar el canario en el lab")
 
     print(f"\n══ SCOREBOARD: {sum(score)}/{len(score)} niveles superados ══")
-    print("(niveles 1, 2 y 6: GAP documentado en lab/README.md — necesitan sensor de red/"
-          "auth.log/conexiones, ya en roadmap)")
+    print("(nivel 6 — anomalía de conexión saliente: GAP documentado en lab/README.md)")
     return 0 if all(score) else 1
+
+
+def main():
+    mode = sys.argv[1] if len(sys.argv) > 1 else "all"
+    if mode == "prep":
+        return prep()
+    if mode == "net-scan":
+        return net_scan(sys.argv[2])
+    if mode == "release":
+        return release()
+    if mode == "net-brute":
+        return net_brute(sys.argv[2])
+    if mode == "levels":
+        return levels()
+    prep()
+    return levels()
 
 
 if __name__ == "__main__":

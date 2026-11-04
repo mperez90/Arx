@@ -679,9 +679,313 @@ class NftActuatorTests(unittest.TestCase):
         self.assertIsNone(self.r._revert_argv({"tool": "nft", "port": 70000, "proto": "tcp"}))
 
 
+class ProcfsConnsTests(unittest.TestCase):
+    """Conexiones desde /proc/net/*: decodificación little-endian y estados."""
+
+    def test_parses_established_and_timewait_skips_listen(self):
+        from arx.modules import recon
+        tcp = """  sl  local_address rem_address   st
+   0: 00000000:15B3 00000000:0000 0A
+   1: 00000000:2329 0A01A8C0:C000 01
+   2: 00000000:2330 0A01A8C0:C001 06
+"""
+        conns = recon._parse_procfs_conns(tcp, "tcp")
+        self.assertEqual(len(conns), 2)  # el LISTEN (0A) no es conexión
+        self.assertEqual(conns[0]["remote_ip"], "192.168.1.10")  # 0A01A8C0 little-endian
+        self.assertEqual(conns[0]["local_port"], 9001)
+        self.assertEqual(conns[0]["state"], "ESTABLISHED")
+        self.assertEqual(conns[1]["state"], "TIME_WAIT")  # rastro post-cierre: clave L1
+
+    def test_procfs_ip_v4_and_v6(self):
+        from arx.modules import recon
+        self.assertEqual(recon._procfs_ip("0100007F"), "127.0.0.1")
+        self.assertEqual(recon._procfs_ip("00000000000000000000000001000000"), "::1")
+
+    def test_local_ips_from_fib_trie(self):
+        from arx.modules import recon
+        trie = """Main table:
+\t        |-- 10.0.0.9
+\t           /32 host LOCAL
+\t        |-- 172.17.0.0
+\t           /16 link UNICAST
+"""
+        fake = mock.Mock()
+        fake.read_text.return_value = trie
+        with mock.patch.object(recon, "Path", lambda *a: fake):
+            ips = recon.local_ips()
+        self.assertIn("10.0.0.9", ips)      # /32 host LOCAL
+        self.assertIn("127.0.0.1", ips)     # loopback siempre
+        self.assertNotIn("172.17.0.0", ips)  # un /16 link no es IP propia
+
+
+class AuthLogTests(unittest.TestCase):
+    """Fuerza bruta SSH desde auth.log con cursor incremental + anti-forense."""
+
+    def setUp(self):
+        self.d = _isolate()
+        from arx.modules import sensors
+        self.s = sensors
+        self.log = os.path.join(self.d, "auth.log")
+        p = mock.patch.object(sensors, "AUTH_LOGS", [self.log])
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _fails(self, ip, n, user="root"):
+        with open(self.log, "a") as f:
+            for _ in range(n):
+                f.write(f"Nov  3 10:00:00 h sshd[1]: Failed password for {user} from {ip} port 5 ssh2\n")
+
+    def test_burst_from_one_ip_fires_once(self):
+        open(self.log, "w").write("Nov  3 09:00:00 h sshd[1]: historia\n")
+        self.assertEqual(self.s.read_auth_log(), [])  # 1ª vez: no re-emitir historia
+        self._fails("203.0.113.7", 6)
+        ev = self.s.read_auth_log()
+        self.assertEqual(len(ev), 1)
+        self.assertEqual(ev[0]["kind"], "auth_bruteforce")
+        self.assertEqual(ev[0]["target"]["ip"], "203.0.113.7")
+        self.assertEqual(ev[0]["target"]["user"], "root")
+        self.assertEqual(self.s.read_auth_log(), [])  # ya disparó en esta ventana
+
+    def test_below_threshold_is_silent(self):
+        open(self.log, "w").write("")
+        self.s.read_auth_log()
+        self._fails("203.0.113.7", 3)
+        self.assertEqual(self.s.read_auth_log(), [])
+
+    def test_truncation_flags_log_tamper(self):
+        open(self.log, "w").write("x" * 500 + "\n")
+        self.s.read_auth_log()
+        with open(self.log, "w") as f:  # `: > auth.log` — mismo inode, tamaño menor
+            f.write("")
+        ev = self.s.read_auth_log()
+        self.assertEqual([e["kind"] for e in ev], ["log_tamper"])
+
+    def test_rotation_is_not_tamper(self):
+        open(self.log, "w").write("x" * 500 + "\n")
+        self.s.read_auth_log()
+        os.unlink(self.log)  # logrotate: inode NUEVO, no truncado
+        open(self.log, "w").write("nuevo\n")
+        ev = self.s.read_auth_log()
+        self.assertEqual([e for e in ev if e["kind"] == "log_tamper"], [])
+
+
+class PortScanTests(unittest.TestCase):
+    """Fallback procfs: una IP tocando ≥8 puertos ACEPTADOS en 10 min = escaneo (L1)."""
+
+    LISTEN = set(range(9001, 9013)) | {22}
+
+    def setUp(self):
+        self.d = _isolate()
+        from arx.modules import recon, sensors
+        self.s = sensors
+        p = mock.patch.object(recon, "local_ips", lambda: {"127.0.0.1", "::1", "10.0.0.5"})
+        p.start()
+        self.addCleanup(p.stop)
+        p = mock.patch.object(sensors, "_scan_from_nft", lambda: None)  # forzar fallback
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _conns(self, ip, ports):
+        return [{"proto": "tcp", "local_port": p, "remote_ip": ip,
+                 "remote_port": 40000 + p, "state": "TIME_WAIT"} for p in ports]
+
+    def test_eight_ports_fires_once(self):
+        ev = self.s.detect_port_scan(self._conns("203.0.113.7", range(9001, 9010)),
+                                     listen_ports=self.LISTEN)
+        self.assertEqual(len(ev), 1)
+        self.assertEqual(ev[0]["kind"], "port_scan")
+        self.assertEqual(ev[0]["target"]["ip"], "203.0.113.7")
+        self.assertEqual(self.s.detect_port_scan(self._conns("203.0.113.7", range(9001, 9010)),
+                                                 listen_ports=self.LISTEN),
+                         [])  # ya disparó en esta ventana
+
+    def test_below_threshold_is_silent(self):
+        self.assertEqual(self.s.detect_port_scan(self._conns("203.0.113.7", [22, 9001]),
+                                                 listen_ports=self.LISTEN), [])
+
+    def test_outbound_sessions_are_not_scans(self):
+        """apt/update contra un mirror: puerto LOCAL efímero → nunca cuenta."""
+        conns = [{"proto": "tcp", "local_port": 40000 + i, "remote_ip": "91.189.91.19",
+                  "remote_port": 80, "state": "TIME_WAIT"} for i in range(12)]
+        self.assertEqual(self.s.detect_port_scan(conns, listen_ports=self.LISTEN), [])
+
+    def test_own_and_loopback_sources_ignored(self):
+        conns = self._conns("10.0.0.5", range(9001, 9012)) + \
+            self._conns("127.0.0.1", range(9001, 9012))
+        self.assertEqual(self.s.detect_port_scan(conns, listen_ports=self.LISTEN), [])
+
+
+class NftScanTrackTests(unittest.TestCase):
+    """Pista de escaneo del kernel: sets inet arx scan4/6 (primario, sin carreras)."""
+
+    NFT_OUT = """table inet arx {
+\tset scan4 {
+\t\ttype ipv4_addr . inet_service
+\t\telements = { 172.18.0.3 . 22 timeout 10m, 172.18.0.3 . 9001,
+\t\t             172.18.0.3 . 9002, 172.18.0.3 . 9003, 172.18.0.3 . 9004,
+\t\t\t     172.18.0.3 . 9005, 172.18.0.3 . 9006, 172.18.0.3 . 9007,
+\t\t\t     91.189.91.19 . 443 }
+\t}
+}
+"""
+
+    def setUp(self):
+        self.d = _isolate()
+        from arx.modules import recon, sensors
+        self.s = sensors
+        p = mock.patch.object(recon, "local_ips", lambda: {"127.0.0.1", "::1", "172.18.0.2"})
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _run_canned(self, out):
+        class R:
+            returncode, stderr = 0, ""
+            stdout = out
+        return lambda *a, **k: R()
+
+    def test_parses_kernel_track_and_fires(self):
+        self._p1 = mock.patch.object(self.s.shutil, "which", lambda c: "/usr/sbin/nft")
+        self._p1.start()
+        self.addCleanup(self._p1.stop)
+        self._p2 = mock.patch.object(self.s.subprocess, "run",
+                                     self._run_canned(self.NFT_OUT))
+        self._p2.start()
+        self.addCleanup(self._p2.stop)
+        hits = self.s._scan_from_nft()
+        self.assertEqual(len(hits["172.18.0.3"]), 8)   # 8 puertos distintos
+        self.assertEqual(hits["91.189.91.19"], {443})  # 1 puerto: no es escaneo
+        ev = self.s.detect_port_scan()
+        self.assertEqual([e["target"]["ip"] for e in ev], ["172.18.0.3"])
+
+    def test_no_nft_means_fallback(self):
+        p = mock.patch.object(self.s.shutil, "which", lambda c: None)
+        p.start()
+        self.addCleanup(p.stop)
+        self.assertIsNone(self.s._scan_from_nft())
+
+    def test_nft_setup_creates_track_sets_and_syn_rules(self):
+        """La pista se instala con la tabla: sets scan4/6 + reglas SYN por familia."""
+        _isolate()
+        from arx.modules import response
+        calls = []
+
+        class R:
+            returncode, stderr, stdout = 0, "", ""
+
+        def fake_run(argv, **kw):
+            calls.append(" ".join(argv))
+            return R()
+        for target, value in [("_is_linux_root", lambda: True),
+                              ("_nft_available", lambda: True)]:
+            p = mock.patch.object(response, target, value)
+            p.start()
+            self.addCleanup(p.stop)
+        p = mock.patch.object(response.subprocess, "run", fake_run)
+        p.start()
+        self.addCleanup(p.stop)
+        self.assertTrue(response.ensure_nft_tracking())
+        self.assertTrue(any("add set inet arx scan4" in c for c in calls))
+        self.assertTrue(any("add set inet arx scan6" in c for c in calls))
+        syn_rules = [c for c in calls if "add @scan" in c]
+        self.assertEqual(len(syn_rules), 2)  # una para ip, otra para ip6
+
+
+class BlockIpActuatorTests(unittest.TestCase):
+    """F5 — bloqueo de IP (escaneo/fuerza bruta) vía nftables con timeout nativo."""
+
+    def setUp(self):
+        _isolate()
+        from arx.modules import response
+        self.r = response
+        self.calls = []
+
+        class R:
+            returncode, stderr, stdout = 0, "", ""
+
+        def fake_run(argv, **kw):
+            self.calls.append(argv)
+            return R()
+        for target, value in [("_is_linux_root", lambda: True),
+                              ("_ufw_active", lambda: False),
+                              ("ssh_ports", lambda: {22})]:
+            p = mock.patch.object(response, target, value)
+            p.start()
+            self.addCleanup(p.stop)
+        self._patch(response.shutil, "which",  # host sin ufw, con nft
+                    lambda c: "/usr/sbin/nft" if c == "nft" else None)
+        self._patch(response.subprocess, "run", fake_run)
+        self._patch(response.recon, "local_ips", lambda: {"127.0.0.1", "::1", "10.0.0.9"})
+        self._patch(response.recon, "collect_connections", lambda: [])
+
+    def _patch(self, obj, name, value):
+        p = mock.patch.object(obj, name, value)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _flat(self):
+        return [" ".join(c) for c in self.calls]
+
+    def _scan(self, ip):
+        return {"kind": "port_scan", "sev": "high", "detail": f"escaneo desde {ip}",
+                "target": {"ip": ip}}
+
+    def test_blocks_ip_via_nft_with_native_timeout(self):
+        o = self.r.handle(self._scan("203.0.113.7"), enforce=True, cfg={})
+        self.assertTrue(any("add element inet arx block_ipv4 { 203.0.113.7 timeout 60m }"
+                            in c for c in self._flat()))
+        self.assertIn("nftables", o["status"])
+        self.assertEqual(self.r._load_blocks()[0]["revert"],
+                         {"tool": "nft_ip", "ip": "203.0.113.7"})
+
+    def test_v6_goes_to_ipv6_set(self):
+        self.r.handle(self._scan("2001:db8::dead"), enforce=True, cfg={})
+        self.assertTrue(any("block_ipv6 { 2001:db8::dead" in c for c in self._flat()))
+
+    def test_expiry_deletes_ip_element(self):
+        self.r.handle(self._scan("203.0.113.7"), enforce=True, cfg={})
+        self.calls.clear()
+        later = datetime.now(timezone.utc) + timedelta(minutes=61)
+        self.r.expire_blocks(now=later)
+        self.assertEqual(self._flat(),
+                         ["nft delete element inet arx block_ipv4 { 203.0.113.7 }"])
+
+    def test_never_blocks_own_ip(self):
+        o = self.r.handle(self._scan("10.0.0.9"), enforce=True, cfg={})
+        self.assertIn("protegido", o["status"])
+        self.assertFalse(any("block_ipv4" in c for c in self._flat()))
+
+    def test_never_blocks_active_operator(self):
+        self._patch(self.r.recon, "collect_connections",
+                    lambda: [{"remote_ip": "198.51.100.2", "local_port": 22,
+                              "state": "ESTABLISHED"}])
+        self.assertNotIn("198.51.100.2", self.r._never_block_ips())  # 1ª vista: efímero ≠ operador
+        self.assertIn("198.51.100.2", self.r._never_block_ips())     # persistente = operador
+        o = self.r.handle(self._scan("198.51.100.2"), enforce=True, cfg={})
+        self.assertIn("protegido", o["status"])
+        self.assertFalse(any("block_ipv4" in c for c in self._flat()))
+
+    def test_ephemeral_ssh_conn_does_not_protect(self):
+        """Anti-evasión: un atacante con un socket ESTABLISHED efímero al 22 (p. ej. a
+        mitad de fuerza bruta) NO se vuelve intocable — proteger eso sería un interruptor
+        de evasión."""
+        self._patch(self.r.recon, "collect_connections",
+                    lambda: [{"remote_ip": "203.0.113.7", "local_port": 22,
+                              "state": "ESTABLISHED"}])
+        o = self.r.handle(self._scan("203.0.113.7"), enforce=True, cfg={})
+        self.assertIn("nftables", o["status"])
+        self.assertTrue(any("block_ipv4 { 203.0.113.7" in c for c in self._flat()))
+
+    def test_revert_shapes_ip_validated(self):
+        self.assertEqual(self.r._revert_argv({"tool": "nft_ip", "ip": "203.0.113.7"}),
+                         ["nft", "delete", "element", "inet", "arx", "block_ipv4",
+                          "{ 203.0.113.7 }"])
+        self.assertEqual(self.r._revert_argv({"tool": "ufw_ip", "ip": "203.0.113.7"}),
+                         ["ufw", "delete", "deny", "from", "203.0.113.7"])
+        self.assertIsNone(self.r._revert_argv({"tool": "nft_ip", "ip": "no-es-ip"}))
+
+
 class ProcfsPortsTests(unittest.TestCase):
     """Sin iproute2 (`ss`) el sensor de puertos NO puede morir: fallback a /proc/net/*."""
-
     def test_parses_tcp_listen_and_udp(self):
         from arx.modules import recon
         tcp = """  sl  local_address rem_address   st

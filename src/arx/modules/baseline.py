@@ -405,8 +405,13 @@ def run(samples: int = 1, interval: int = 0, seal: bool = False, status: bool = 
         # Respaldo de los ficheros críticos al sellar: sin copia buena no hay restauración.
         from arx.modules import response
         n = response.backup_critical(integrity_paths())
+        # La pista de escaneo (nft scan4/6) nace con el sellado: debe estar activa
+        # ANTES del primer ataque, no en la primera respuesta.
+        tracked = response.ensure_nft_tracking()
         print(f"✓ Línea base SELLADA con {baseline['meta']['samples']} muestras. Lista para `arx guard`.")
         print(f"✓ Respaldo de {n} fichero(s) crítico(s) en el vault (habilita restauración Tier 2).")
+        if tracked:
+            print("✓ Pista de escaneo nft activa (inet arx: scan4/scan6 + sets de bloqueo).")
         return 0
 
     for i in range(max(1, samples)):

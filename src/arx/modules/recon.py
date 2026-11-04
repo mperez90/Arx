@@ -222,6 +222,88 @@ def collect_services() -> list[str] | None:
     return [l.split()[0] for l in out.splitlines() if l.strip()]
 
 
+# ── conexiones activas/recientes (procfs, sin dependencias) ──────────────────
+_TCP_STATES = {"01": "ESTABLISHED", "02": "SYN_SENT", "03": "SYN_RECV",
+               "04": "FIN_WAIT1", "05": "FIN_WAIT2", "06": "TIME_WAIT",
+               "07": "CLOSE", "08": "CLOSE_WAIT", "09": "LAST_ACK",
+               "0B": "CLOSING"}
+
+
+def _procfs_ip(hexaddr: str) -> str:
+    """Hex de /proc/net/* → IP legible. v4 es little-endian; v6, 4 palabras LE."""
+    import ipaddress
+    try:
+        if len(hexaddr) == 8:
+            return str(ipaddress.IPv4Address(bytes.fromhex(hexaddr)[::-1]))
+        if len(hexaddr) == 32:
+            raw = bytes.fromhex(hexaddr)
+            words = [raw[i:i + 4][::-1] for i in range(0, 16, 4)]
+            return str(ipaddress.IPv6Address(b"".join(words)))
+    except ValueError:
+        pass
+    return hexaddr
+
+
+def _parse_procfs_conns(text: str, proto: str) -> list[dict]:
+    """Conexiones (no LISTEN) de un /proc/net/{tcp,tcp6} ya leído.
+
+    Incluye TIME_WAIT: un escaneo connect() deja rastro ~60 s después de cerrar,
+    que es lo que permite al detector de escaneo verlo en el siguiente barrido.
+    """
+    conns: list[dict] = []
+    for line in text.splitlines()[1:]:
+        f = line.split()
+        if len(f) < 4 or f[3] == "0A":  # 0A = LISTEN: no es una conexión
+            continue
+        laddr, _, lphex = f[1].rpartition(":")
+        raddr, _, rphex = f[2].rpartition(":")
+        try:
+            lport, rport = int(lphex, 16), int(rphex, 16)
+        except ValueError:
+            continue
+        rip = _procfs_ip(raddr)
+        if rip in ("0.0.0.0", "::"):
+            continue
+        conns.append({"proto": proto, "local_port": lport, "remote_ip": rip,
+                      "remote_port": rport,
+                      "state": _TCP_STATES.get(f[3], f[3])})
+    return conns
+
+
+def collect_connections() -> list[dict]:
+    """Conexiones TCP activas o recientes (cualquier estado salvo LISTEN)."""
+    conns: list[dict] = []
+    for path, proto in (("/proc/net/tcp", "tcp"), ("/proc/net/tcp6", "tcp6")):
+        try:
+            text = Path(path).read_text()
+        except OSError:
+            continue
+        conns += _parse_procfs_conns(text, proto)
+    return conns
+
+
+def local_ips() -> set[str]:
+    """IPs propias del host (fib_trie, entradas /32 host LOCAL) + loopback.
+
+    Sin esto Arx podría autodenunciarse (healthchecks locales, proxies) o peor:
+    bloquear su propia IP de interfaz.
+    """
+    out = {"127.0.0.1", "::1"}
+    try:
+        lines = Path("/proc/net/fib_trie").read_text().splitlines()
+    except OSError:
+        return out
+    candidate = None
+    for line in lines:
+        s = line.strip()
+        if s.startswith(("|--", "+--")):
+            candidate = s[3:].strip()
+        elif "32 host LOCAL" in s and candidate:
+            out.add(candidate)
+            candidate = None
+    return out
+
+
 def collect_packages() -> dict:
     d: dict = {}
     if _has("dpkg-query"):

