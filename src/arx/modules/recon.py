@@ -264,9 +264,10 @@ def _parse_procfs_conns(text: str, proto: str) -> list[dict]:
         rip = _procfs_ip(raddr)
         if rip in ("0.0.0.0", "::"):
             continue
+        inode = f[9] if len(f) > 9 else ""  # inode del socket: une la conexión a su proceso
         conns.append({"proto": proto, "local_port": lport, "remote_ip": rip,
                       "remote_port": rport,
-                      "state": _TCP_STATES.get(f[3], f[3])})
+                      "state": _TCP_STATES.get(f[3], f[3]), "inode": inode})
     return conns
 
 
@@ -280,6 +281,52 @@ def collect_connections() -> list[dict]:
             continue
         conns += _parse_procfs_conns(text, proto)
     return conns
+
+
+def _socket_inode_owners() -> dict[str, tuple[int, str]]:
+    """inode de socket → (pid, ruta real del ejecutable) recorriendo /proc/<pid>/fd.
+
+    Es la correlación conexión→proceso sin herramientas externas: cada fd que es un
+    `socket:[inode]` ata ese socket al proceso que lo tiene abierto. La ruta sale de
+    /proc/<pid>/exe (readlink), nunca del nombre corto que el propio programa elige.
+    """
+    owners: dict[str, tuple[int, str]] = {}
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return owners
+    for name in entries:
+        if not name.isdigit():
+            continue
+        pid = int(name)
+        try:
+            exe = os.readlink(f"/proc/{name}/exe").removesuffix(" (deleted)")
+            fds = os.listdir(f"/proc/{name}/fd")
+        except OSError:
+            continue  # hilo del kernel, proceso ya muerto o sin permiso
+        for fd in fds:
+            try:
+                link = os.readlink(f"/proc/{name}/fd/{fd}")
+            except OSError:
+                continue
+            if link.startswith("socket:["):
+                owners.setdefault(link[8:-1], (pid, exe))  # 'socket:[12345]' → '12345'
+    return owners
+
+
+def connection_owners() -> list[dict]:
+    """Conexiones TCP con su proceso dueño (pid + ejecutable), uniendo por inode.
+
+    Es la base de la detección de reverse shell (L6): un intérprete que posee un
+    socket de red saliente es la anomalía. Sin dueño resoluble, pid/exe quedan None
+    (degradación honesta: sin root no se ve el fd de otros procesos).
+    """
+    owners = _socket_inode_owners()
+    out = []
+    for c in collect_connections():
+        pid, exe = owners.get(c.get("inode", ""), (None, None))
+        out.append({**c, "pid": pid, "exe": exe})
+    return out
 
 
 def local_ips() -> set[str]:

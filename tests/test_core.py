@@ -167,6 +167,9 @@ class ResponseTests(unittest.TestCase):
         self.assertEqual(self.response.classify({"kind": "integrity"})["tier"], 2)
         self.assertEqual(self.response.classify({"kind": "listen_ports"})["tier"], 1)
         self.assertEqual(self.response.classify({"kind": "gauge"})["tier"], 0)
+        # binario nuevo: desde /tmp se suspende; de sistema (sev low) solo se observa (B9)
+        self.assertEqual(self.response.classify({"kind": "executables", "sev": "high"})["tier"], 1)
+        self.assertEqual(self.response.classify({"kind": "executables", "sev": "low"})["tier"], 0)
 
     def test_pending_and_authorize(self):
         self.response.handle({"kind": "integrity", "sev": "high", "detail": "passwd cambió"})
@@ -560,6 +563,17 @@ class SuspendActuatorTests(unittest.TestCase):
         o = self.r.handle(self._exe("minerd"), enforce=True, cfg={})  # sin ruta → inseguro
         self.assertEqual(self.kills, [])
         self.assertIn("no se suspende por nombre", o["status"])
+
+    def test_low_severity_system_binary_is_never_suspended(self):
+        """B9: un binario de sistema fuera de la base (sev low) solo se observa. Suspenderlo
+        congelaría TODOS sus procesos — con /usr/bin/bash, la shell del propio operador."""
+        self._live((111, 222))
+        f = {**self._exe("/usr/bin/bash"), "sev": "low"}
+        o = self.r.handle(f, enforce=True, cfg={})
+        self.assertEqual(self.kills, [])
+        self.assertEqual(o["tier"], 0)
+        self.assertEqual(self.r._load_blocks(), [])
+        self.assertEqual(self.r.recent_actions(), [])  # tampoco gasta el freno de seguridad
 
     def test_refuses_protected_exe(self):
         o = self.r.handle(self._exe("/usr/sbin/sshd"), enforce=True, cfg={})
@@ -984,6 +998,119 @@ class BlockIpActuatorTests(unittest.TestCase):
         self.assertIsNone(self.r._revert_argv({"tool": "nft_ip", "ip": "no-es-ip"}))
 
 
+class TarpitActuatorTests(unittest.TestCase):
+    """F5 (Core) — tarpit/estrangulamiento per-IP: política ip_response='tarpit'.
+
+    Estrangula (rate-limit nft per-IP) en vez de bloquear. Reutiliza TODA la doctrina
+    de bloqueo de IP (protección del operador/propias, auto-expiración, revert validado).
+    """
+
+    def setUp(self):
+        _isolate()
+        from arx.modules import response
+        self.r = response
+        self.calls = []
+
+        class R:
+            returncode, stderr, stdout = 0, "", ""
+
+        def fake_run(argv, **kw):
+            self.calls.append(argv)
+            return R()
+        for target, value in [("_is_linux_root", lambda: True),
+                              ("_ufw_active", lambda: False),
+                              ("ssh_ports", lambda: {22})]:
+            self._patch(response, target, value)
+        self._patch(response.shutil, "which",
+                    lambda c: "/usr/sbin/nft" if c == "nft" else None)
+        self._patch(response.subprocess, "run", fake_run)
+        self._patch(response.recon, "local_ips", lambda: {"127.0.0.1", "::1", "10.0.0.9"})
+        self._patch(response.recon, "collect_connections", lambda: [])
+        self.tarpit = {"ip_response": "tarpit"}
+
+    def _patch(self, obj, name, value):
+        p = mock.patch.object(obj, name, value)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _flat(self):
+        return [" ".join(c) for c in self.calls]
+
+    def _scan(self, ip):
+        return {"kind": "port_scan", "sev": "high", "detail": f"escaneo desde {ip}",
+                "target": {"ip": ip}}
+
+    def test_tarpit_mode_throttles_not_blocks(self):
+        o = self.r.handle(self._scan("203.0.113.7"), enforce=True, cfg=self.tarpit)
+        self.assertTrue(any("add element inet arx tarpit4 { 203.0.113.7 timeout 60m }"
+                            in c for c in self._flat()))
+        # el set block_ipv4 lo crea _nft_setup, pero NO debe añadirse el elemento (bloqueo)
+        self.assertFalse(any("add element inet arx block_ipv4" in c for c in self._flat()))
+        self.assertIn("ESTRANGULADA", o["status"])
+        self.assertEqual(self.r._load_blocks()[0]["revert"],
+                         {"tool": "nft_tarpit", "ip": "203.0.113.7"})
+
+    def test_default_mode_still_blocks(self):
+        """Regresión del lab: sin política (o 'block') se bloquea como siempre."""
+        self.r.handle(self._scan("203.0.113.7"), enforce=True, cfg={})
+        self.assertTrue(any("add element inet arx block_ipv4 { 203.0.113.7" in c
+                            for c in self._flat()))
+        # el set tarpit4 lo crea _nft_setup, pero NO debe añadirse el elemento (estrangular)
+        self.assertFalse(any("add element inet arx tarpit4" in c for c in self._flat()))
+
+    def test_v6_goes_to_tarpit6(self):
+        self.r.handle(self._scan("2001:db8::dead"), enforce=True, cfg=self.tarpit)
+        self.assertTrue(any("tarpit6 { 2001:db8::dead" in c for c in self._flat()))
+
+    def test_expiry_deletes_tarpit_element(self):
+        self.r.handle(self._scan("203.0.113.7"), enforce=True, cfg=self.tarpit)
+        self.calls.clear()
+        later = datetime.now(timezone.utc) + timedelta(minutes=61)
+        self.r.expire_blocks(now=later)
+        self.assertEqual(self._flat(),
+                         ["nft delete element inet arx tarpit4 { 203.0.113.7 }"])
+
+    def test_own_ip_never_tarpitted(self):
+        o = self.r.handle(self._scan("10.0.0.9"), enforce=True, cfg=self.tarpit)
+        self.assertIn("protegido", o["status"])
+        self.assertFalse(any("tarpit4" in c for c in self._flat()))
+
+    def test_tarpit_without_nft_falls_back_to_block_honestly(self):
+        """Sin nftables no hay estrangulamiento posible → se cae a bloqueo (ufw), no se finge."""
+        self._patch(self.r.shutil, "which", lambda c: "/usr/sbin/ufw" if c == "ufw" else None)
+        self._patch(self.r, "_ufw_active", lambda: True)
+        o = self.r.handle(self._scan("203.0.113.7"), enforce=True, cfg=self.tarpit)
+        self.assertTrue(any("ufw deny from 203.0.113.7" in c for c in self._flat()))
+        self.assertIn("ufw", o["status"])
+
+    def test_nft_setup_creates_tarpit_sets_and_meter_rules(self):
+        from arx.modules import response
+        calls = []
+
+        class R:
+            returncode, stderr, stdout = 0, "", ""
+
+        def fake_run(argv, **kw):
+            calls.append(" ".join(argv))
+            return R()
+        self._patch(response, "_nft_available", lambda: True)
+        self._patch(response.subprocess, "run", fake_run)
+        self.assertTrue(response.ensure_nft_tracking())
+        self.assertTrue(any("add set inet arx tarpit4" in c for c in calls))
+        self.assertTrue(any("add set inet arx tarpit6" in c for c in calls))
+        meter_rules = [c for c in calls if "meter arx_tp" in c and "@tarpit" in c]
+        self.assertEqual(len(meter_rules), 4)  # conexiones-nuevas + caudal, por familia
+
+    def test_revert_shape_tarpit_validated(self):
+        self.assertEqual(self.r._revert_argv({"tool": "nft_tarpit", "ip": "203.0.113.7"}),
+                         ["nft", "delete", "element", "inet", "arx", "tarpit4",
+                          "{ 203.0.113.7 }"])
+        self.assertEqual(self.r._revert_argv({"tool": "nft_tarpit", "ip": "2001:db8::1"}),
+                         ["nft", "delete", "element", "inet", "arx", "tarpit6",
+                          "{ 2001:db8::1 }"])
+        self.assertIsNone(self.r._revert_argv({"tool": "nft_tarpit", "ip": "no-es-ip"}))
+
+
 class ProcfsPortsTests(unittest.TestCase):
     """Sin iproute2 (`ss`) el sensor de puertos NO puede morir: fallback a /proc/net/*."""
     def test_parses_tcp_listen_and_udp(self):
@@ -1112,6 +1239,235 @@ class Tier2ExecutorTests(unittest.TestCase):
         out = self.r._restore_from_vault("cron", current_files=[])
         self.assertIn("restaurado", out)
         self.assertEqual(open(good).read(), "* * * * * root /bin/legit\n")
+
+
+class ConnOwnersTests(unittest.TestCase):
+    """Correlación conexión→proceso por inode de socket (base del L6)."""
+
+    def test_parse_captures_socket_inode(self):
+        from arx.modules import recon
+        tcp = ("  sl  local_address rem_address   st ... inode\n"
+               "   0: 0100007F:1A0B 0200000A:115C 01 00000000:00000000 "
+               "00:00000000 00000000  1000        0 55512 1 ffff 100\n")
+        conns = recon._parse_procfs_conns(tcp, "tcp")
+        self.assertEqual(len(conns), 1)
+        self.assertEqual(conns[0]["remote_ip"], "10.0.0.2")   # 0200000A little-endian
+        self.assertEqual(conns[0]["remote_port"], 4444)       # 115C
+        self.assertEqual(conns[0]["inode"], "55512")
+
+    def test_owners_joined_by_inode(self):
+        from arx.modules import recon
+        conns = [{"proto": "tcp", "local_port": 55000, "remote_ip": "10.0.0.2",
+                  "remote_port": 4444, "state": "ESTABLISHED", "inode": "55512"},
+                 {"proto": "tcp", "local_port": 40000, "remote_ip": "10.0.0.3",
+                  "remote_port": 443, "state": "ESTABLISHED", "inode": "99999"}]
+        with mock.patch.object(recon, "collect_connections", lambda: conns), \
+             mock.patch.object(recon, "_socket_inode_owners",
+                               lambda: {"55512": (4242, "/bin/bash")}):
+            out = recon.connection_owners()
+        self.assertEqual(out[0]["pid"], 4242)
+        self.assertEqual(out[0]["exe"], "/bin/bash")
+        self.assertIsNone(out[1]["pid"])   # inode sin dueño resoluble → None honesto
+        self.assertIsNone(out[1]["exe"])
+
+
+class ReverseShellSensorTests(unittest.TestCase):
+    """L6 — un shell/nc con socket saliente establecido = reverse shell."""
+
+    def setUp(self):
+        _isolate()
+        from arx.modules import recon, sensors
+        self.s = sensors
+        p = mock.patch.object(recon, "local_ips",
+                              lambda: {"127.0.0.1", "::1", "10.0.0.9"})
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _conn(self, exe, ip="10.0.0.2", port=4444, state="ESTABLISHED", pid=4242,
+              local_port=55000):
+        return {"proto": "tcp", "local_port": local_port, "remote_ip": ip,
+                "remote_port": port, "state": state, "inode": "1", "pid": pid, "exe": exe}
+
+    def _detect(self, conns, listen=frozenset({22})):
+        return self.s.detect_reverse_shell(conns, listen_ports=set(listen))
+
+    def test_bash_with_outbound_socket_fires_crit(self):
+        ev = self._detect([self._conn("/bin/bash")])
+        self.assertEqual(len(ev), 1)
+        self.assertEqual(ev[0]["kind"], "reverse_shell")
+        self.assertEqual(ev[0]["sev"], "crit")
+        self.assertEqual(ev[0]["target"], {"ip": "10.0.0.2", "port": 4444,
+                                           "exe": "/bin/bash", "pids": [4242]})
+
+    def test_non_shell_with_socket_is_ignored(self):
+        """Un servidor normal (nginx) con conexiones de red NO es un reverse shell."""
+        self.assertEqual(self._detect([self._conn("/usr/sbin/nginx")]), [])
+
+    def test_inbound_to_listener_is_not_a_reverse_shell(self):
+        """nc ESCUCHANDO (bind shell/servicio): conexión ENTRANTE al puerto de escucha
+        → no es reverse shell. Lo saliente es la firma; lo entrante lo caza L4."""
+        c = self._conn("/usr/bin/nc", local_port=9001)   # 9001 = puerto en escucha
+        self.assertEqual(self._detect([c], listen={22, 9001}), [])
+
+    def test_loopback_and_own_ip_not_flagged(self):
+        self.assertEqual(self._detect([self._conn("/bin/bash", ip="127.0.0.1")]), [])
+        self.assertEqual(self._detect([self._conn("/bin/bash", ip="10.0.0.9")]), [])
+
+    def test_non_established_not_flagged(self):
+        self.assertEqual(self._detect([self._conn("/bin/bash", state="TIME_WAIT")]), [])
+
+    def test_same_channel_reported_once(self):
+        two = [self._conn("/bin/bash"), self._conn("/bin/bash")]
+        self.assertEqual(len(self._detect(two)), 1)
+
+    def test_fp_key_is_stable_across_pid_changes(self):
+        """El pid cambia entre barridos; la huella (canal C2) no → dedup correcta."""
+        a = self._detect([self._conn("/bin/bash", pid=10)])[0]
+        b = self._detect([self._conn("/bin/bash", pid=20)])[0]
+        self.assertEqual(a["fp_key"], b["fp_key"])
+
+
+class RevShellActuatorTests(unittest.TestCase):
+    """L6 — bloqueo del canal C2 en nftables + suspensión del proceso dueño (reversibles)."""
+
+    def setUp(self):
+        _isolate()
+        from arx.modules import response
+        self.r = response
+        self.calls, self.kills = [], []
+
+        class R:
+            returncode, stderr, stdout = 0, "", ""
+
+        def fake_run(argv, **kw):
+            self.calls.append(argv)
+            return R()
+        for target, value in [("_is_linux_root", lambda: True), ("ssh_ports", lambda: {22})]:
+            self._patch(response, target, value)
+        self._patch(response.shutil, "which", lambda c: f"/usr/bin/{c}")
+        self._patch(response.subprocess, "run", fake_run)
+        self._patch(response.recon, "local_ips", lambda: {"127.0.0.1", "::1", "10.0.0.9"})
+        self._patch(response.recon, "collect_connections", lambda: [])
+        self._patch(response.os, "kill", lambda pid, sig: self.kills.append((pid, sig)))
+        self._patch(response.os, "readlink", lambda p: "/bin/bash")  # exe estable (anti-reuso)
+
+    def _patch(self, obj, name, value):
+        p = mock.patch.object(obj, name, value)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _flat(self):
+        return [" ".join(c) for c in self.calls]
+
+    def _rev(self, ip="10.0.0.2", port=4444, exe="/bin/bash", pids=(4242,)):
+        return {"kind": "reverse_shell", "sev": "crit",
+                "detail": f"shell con conexión saliente: {exe} → {ip}:{port}",
+                "target": {"ip": ip, "port": port, "exe": exe, "pids": list(pids)},
+                "fp_key": f"reverse_shell|{exe}|{ip}:{port}"}
+
+    def test_blocks_channel_and_suspends_only_the_owner(self):
+        import signal
+        o = self.r.handle(self._rev(), enforce=True, cfg={})
+        self.assertTrue(any("add element inet arx c2_out4 { 10.0.0.2 . 4444 timeout 60m }" in c
+                            for c in self._flat()))
+        self.assertEqual(self.kills, [(4242, signal.SIGSTOP)])
+        self.assertIn("canal C2 cortado", o["status"])
+        self.assertIn("suspendido", o["status"])
+        self.assertEqual([b["revert"] for b in self.r._load_blocks()],
+                         [{"tool": "nft_c2", "ip": "10.0.0.2", "port": 4444},
+                          {"tool": "sigstop", "exe": "/bin/bash", "pids": [4242]}])
+
+    def test_never_uses_ss_kill(self):
+        """`ss -K` destruye el socket (irreversible, prohibido en Tier 1) y puede devolver
+        rc=0 sin cortar nada si el kernel no trae INET_DIAG_DESTROY."""
+        self.r.handle(self._rev(), enforce=True, cfg={})
+        self.assertFalse(any(c.startswith("ss ") for c in self._flat()))
+
+    def test_ipv6_channel_goes_to_its_set(self):
+        self.r.handle(self._rev(ip="2001:db8::7"), enforce=True, cfg={})
+        self.assertTrue(any("c2_out6 { 2001:db8::7 . 4444 timeout 60m }" in c
+                            for c in self._flat()))
+
+    def test_without_nft_says_the_channel_stays_open(self):
+        """Sin ejecutor no se finge contención: se suspende y se avisa de que sigue abierto."""
+        import signal
+        self._patch(self.r.shutil, "which", lambda c: None)
+        o = self.r.handle(self._rev(), enforce=True, cfg={})
+        self.assertIn("SIGUE ABIERTO", o["status"])
+        self.assertEqual(self.kills, [(4242, signal.SIGSTOP)])
+        self.assertEqual([b["revert"]["tool"] for b in self.r._load_blocks()], ["sigstop"])
+
+    def test_failed_nft_element_is_not_reported_as_cut(self):
+        class Bad:
+            returncode, stderr, stdout = 1, "boom", ""
+        real = self.r.subprocess.run
+
+        def run(argv, **kw):
+            return Bad() if "element" in argv else real(argv, **kw)
+        self._patch(self.r.subprocess, "run", run)
+        o = self.r.handle(self._rev(), enforce=True, cfg={})
+        self.assertIn("SIGUE ABIERTO", o["status"])
+        self.assertNotIn("canal C2 cortado", o["status"])
+
+    def test_nft_setup_creates_channel_set_and_both_directions(self):
+        self.r._nft_setup()
+        flat = self._flat()
+        for expected in ("add set inet arx c2_out4", "add set inet arx c2_out6",
+                         "add chain inet arx output",
+                         "add rule inet arx output ip daddr . tcp dport @c2_out4 drop",
+                         "add rule inet arx input ip saddr . tcp sport @c2_out4 drop",
+                         "add rule inet arx output ip6 daddr . tcp dport @c2_out6 drop",
+                         "add rule inet arx input ip6 saddr . tcp sport @c2_out6 drop"):
+            self.assertTrue(any(expected in c for c in flat), expected)
+
+    def test_revert_shape_channel_validated(self):
+        self.assertEqual(self.r._revert_argv({"tool": "nft_c2", "ip": "10.0.0.2", "port": 4444}),
+                         ["nft", "delete", "element", "inet", "arx", "c2_out4",
+                          "{ 10.0.0.2 . 4444 }"])
+        self.assertIsNone(self.r._revert_argv({"tool": "nft_c2", "ip": "x; rm", "port": 4444}))
+        self.assertIsNone(self.r._revert_argv({"tool": "nft_c2", "ip": "10.0.0.2", "port": 70000}))
+
+    def test_untouchable_counterpart_is_only_observed(self):
+        """Si la contraparte es una IP propia del host, se observa — no se corta nada."""
+        o = self.r.handle(self._rev(ip="10.0.0.9"), enforce=True, cfg={})
+        self.assertEqual(o["tier"], 0)
+        self.assertIn("protegido", o["status"])
+        self.assertEqual(self.kills, [])
+        self.assertFalse(any("c2_out" in c for c in self._flat()))
+
+    def test_critical_owner_is_never_suspended(self):
+        """Un exe crítico (p. ej. python3) no se suspende: se baja a observar."""
+        o = self.r.handle(self._rev(exe="/usr/bin/python3"), enforce=True, cfg={})
+        self.assertEqual(o["tier"], 0)
+        self.assertEqual(self.kills, [])
+
+    def test_reused_pid_is_not_suspended_but_channel_stays_cut(self):
+        """PID reutilizado por otro binario → no se suspende; el canal sí queda cortado."""
+        self._patch(self.r.os, "readlink", lambda p: "/usr/bin/otro")
+        o = self.r.handle(self._rev(), enforce=True, cfg={})
+        self.assertEqual(self.kills, [])
+        self.assertIn("sin proceso vivo", o["status"])
+        self.assertEqual([b["revert"]["tool"] for b in self.r._load_blocks()], ["nft_c2"])
+
+    def test_expiry_undoes_both_actions(self):
+        import signal
+        self.r.handle(self._rev(), enforce=True, cfg={})
+        self.kills.clear()
+        self.calls.clear()
+        later = datetime.now(timezone.utc) + timedelta(minutes=61)
+        self.r.expire_blocks(now=later)  # mismo exe (readlink→/bin/bash) → SIGCONT real
+        self.assertEqual(self.kills, [(4242, signal.SIGCONT)])
+        self.assertEqual(self._flat(), ["nft delete element inet arx c2_out4 { 10.0.0.2 . 4444 }"])
+        self.assertEqual(self.r._load_blocks(), [])
+
+    def test_counts_as_one_action_for_the_breaker(self):
+        self.r.handle(self._rev(), enforce=True, cfg={})
+        self.assertEqual(len(self.r.recent_actions()), 1)
+
+    def test_invalid_ip_does_nothing(self):
+        o = self.r.handle(self._rev(ip="no-es-ip"), enforce=True, cfg={})
+        self.assertIn("inválida", o["status"])
+        self.assertEqual(self.kills, [])
 
 
 if __name__ == "__main__":

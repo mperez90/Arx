@@ -59,6 +59,8 @@ _PLAN: dict[str, tuple[int, str, bool, str]] = {
                   "cortar el reconocimiento es reversible y no toca nada local"),
     "auth_bruteforce": (1, "bloquear la IP de origen en el firewall (temporal, auto-expira)", True,
                         "corta la fuerza bruta sin tocar la cuenta atacada (eso es Tier 2)"),
+    "reverse_shell": (1, "bloquear el canal C2 en nftables y suspender el proceso dueño (auto-expira)", True,
+                      "ambas acciones se deshacen al expirar: ni se destruye evidencia ni se pierde el flujo"),
     "log_tamper": (0, "registrar y alertar — alguien está borrando huellas", True,
                    "borrar logs es señal de intruso DENTRO: observar y escalar, no actuar a ciegas"),
     "gauge": (0, "registrar y vigilar la tendencia", True, "señal débil; observar primero"),
@@ -70,6 +72,11 @@ _PROTECTED_EXES = {"sshd", "systemd", "init", "dbus-daemon", "journald", "system
 
 
 def classify(finding: dict) -> dict:
+    # Un binario de sistema no visto al aprender es lo normal (un admin, una actualización).
+    # Suspenderlo congelaría TODOS sus procesos, incluida la shell del operador (B9).
+    if finding.get("kind") in ("executables", "processes") and finding.get("sev") == "low":
+        return {"tier": 0, "action": "registrar y vigilar (binario de sistema nuevo)",
+                "reversible": True, "why": "señal de baja confianza: no justifica suspender nada"}
     tier, action, reversible, why = _PLAN.get(
         finding.get("kind", ""), (0, "registrar y vigilar", True, "señal débil; observar primero")
     )
@@ -185,6 +192,16 @@ def protected_reason(finding: dict, cfg: dict | None = None) -> str | None:
             return "IP intocable (propia del host o con sesión de operador activa)"
         if ip in oob:
             return "IP marcada fuera-de-límites"
+    if kind == "reverse_shell":
+        ip = str(target.get("ip") or "")
+        if ip and ip in _never_block_ips():
+            return "la contraparte es intocable (propia del host o sesión de operador)"
+        if ip in oob:
+            return "IP marcada fuera-de-límites"
+        exe = str(target.get("exe") or "")
+        base = exe.rsplit("/", 1)[-1]
+        if base in _PROTECTED_EXES or exe == sys.executable:
+            return f"proceso crítico ({base}): solo se observa"
     if kind in ("executables", "processes"):
         name = str(target.get("exe") or target.get("process") or "")
         base = name.rsplit("/", 1)[-1]
@@ -255,6 +272,23 @@ def _revert_argv(revert) -> list[str] | None:
         except ValueError:
             return None
         return ["ufw", "delete", "deny", "from", str(revert["ip"])]
+    if isinstance(revert, dict) and revert.get("tool") == "nft_c2":
+        port = revert.get("port")
+        try:
+            fam = ipaddress.ip_address(str(revert.get("ip", ""))).version
+        except ValueError:
+            return None
+        if not (isinstance(port, int) and 0 < port < 65536):
+            return None
+        return ["nft", "delete", "element", "inet", "arx", f"c2_out{fam}",
+                f"{{ {revert['ip']} . {port} }}"]
+    if isinstance(revert, dict) and revert.get("tool") == "nft_tarpit":
+        try:
+            fam = ipaddress.ip_address(str(revert.get("ip", ""))).version
+        except ValueError:
+            return None
+        return ["nft", "delete", "element", "inet", "arx", f"tarpit{fam}",
+                f"{{ {revert['ip']} }}"]
     if isinstance(revert, str):  # formato antiguo (texto): solo si encaja exactamente
         m = _LEGACY_REVERT.match(revert)
         if m:
@@ -302,7 +336,7 @@ def _apply_revert(revert) -> str | None:
         for pid in pids:
             try:
                 # anti reutilización de PID: solo SIGCONT si sigue siendo el mismo binario
-                if os.readlink(f"/proc/{pid}/exe") == exe:
+                if os.readlink(f"/proc/{pid}/exe").removesuffix(" (deleted)") == exe:
                     os.kill(pid, signal.SIGCONT)
                     done += 1
             except OSError:
@@ -612,10 +646,31 @@ def _nft_setup() -> bool:
                  ["nft", "add", "set", "inet", "arx", "scan6",
                   "{", "type", "ipv6_addr", ".", "inet_service;", "flags", "timeout;",
                   "timeout", "10m;", "}"]]
+    # Canal de un reverse shell (destino . puerto). Se corta con DROP en ambos sentidos, no
+    # con RST ni `ss -K`: al expirar el flujo se reanuda por retransmisión TCP (reversible
+    # de verdad) y no depende de que el kernel traiga INET_DIAG_DESTROY.
+    if "c2_out4" not in ruleset:
+        cmds += [["nft", "add", "set", "inet", "arx", "c2_out4",
+                  "{", "type", "ipv4_addr", ".", "inet_service;", "flags", "timeout;", "}"],
+                 ["nft", "add", "set", "inet", "arx", "c2_out6",
+                  "{", "type", "ipv6_addr", ".", "inet_service;", "flags", "timeout;", "}"]]
     if "chain input" not in ruleset.split("table inet arx")[-1]:
         cmds.append(["nft", "add", "chain", "inet", "arx", "input",
                      "{", "type", "filter", "hook", "input", "priority", "0;",
                      "policy", "accept;", "}"])
+    if "chain output" not in ruleset.split("table inet arx")[-1]:
+        cmds.append(["nft", "add", "chain", "inet", "arx", "output",
+                     "{", "type", "filter", "hook", "output", "priority", "0;",
+                     "policy", "accept;", "}"])
+    if "@c2_out4" not in ruleset:
+        cmds += [["nft", "add", "rule", "inet", "arx", "output", "ip", "daddr", ".", "tcp",
+                  "dport", "@c2_out4", "drop"],
+                 ["nft", "add", "rule", "inet", "arx", "output", "ip6", "daddr", ".", "tcp",
+                  "dport", "@c2_out6", "drop"],
+                 ["nft", "add", "rule", "inet", "arx", "input", "ip", "saddr", ".", "tcp",
+                  "sport", "@c2_out4", "drop"],
+                 ["nft", "add", "rule", "inet", "arx", "input", "ip6", "saddr", ".", "tcp",
+                  "sport", "@c2_out6", "drop"]]
     if "tcp dport @block_tcp" not in ruleset:
         cmds += [["nft", "add", "rule", "inet", "arx", "input", "tcp", "dport",
                   "@block_tcp", "drop"],
@@ -633,6 +688,31 @@ def _nft_setup() -> bool:
                  ["nft", "add", "rule", "inet", "arx", "input", "tcp", "flags", "&",
                   "(", "syn", "|", "ack", ")", "==", "syn", "add", "@scan6",
                   "{", "ip6", "saddr", ".", "tcp", "dport", "}"]]
+    # TARPIT / estrangulamiento (Core): la IP hostil entra en tarpit4/6 y DOS reglas la
+    # limitan POR ORIGEN con meters dinámicos per-IP — pocas conexiones nuevas/s y poco
+    # caudal/s. No es un tarpit clásico de RETENCIÓN de conexión (eso exige userspace y es
+    # la vía Pro/Business del honeypot); es rate-limiting agresivo que ahoga a escáneres y
+    # fuerza bruta dejándoles solo un hilillo, reversible y con timeout nativo.
+    if "tarpit4" not in ruleset:
+        cmds += [["nft", "add", "set", "inet", "arx", "tarpit4",
+                  "{", "type", "ipv4_addr;", "flags", "timeout;", "}"],
+                 ["nft", "add", "set", "inet", "arx", "tarpit6",
+                  "{", "type", "ipv6_addr;", "flags", "timeout;", "}"]]
+    if "@tarpit4" not in ruleset:
+        cmds += [  # conexiones NUEVAS por IP: ~2/s (ráfaga 2) → el escaneo/fuerza bruta se arrastra
+            ["nft", "add", "rule", "inet", "arx", "input", "ct", "state", "new", "ip",
+             "saddr", "@tarpit4", "meter", "arx_tpn4", "{", "ip", "saddr", "limit", "rate",
+             "over", "2/second", "burst", "2", "packets", "}", "drop"],
+            ["nft", "add", "rule", "inet", "arx", "input", "ct", "state", "new", "ip6",
+             "saddr", "@tarpit6", "meter", "arx_tpn6", "{", "ip6", "saddr", "limit", "rate",
+             "over", "2/second", "burst", "2", "packets", "}", "drop"],
+            # caudal por IP: ~50 paquetes/s → throughput ahogado sin cortar del todo
+            ["nft", "add", "rule", "inet", "arx", "input", "ip", "saddr", "@tarpit4",
+             "meter", "arx_tpp4", "{", "ip", "saddr", "limit", "rate", "over", "50/second",
+             "}", "drop"],
+            ["nft", "add", "rule", "inet", "arx", "input", "ip6", "saddr", "@tarpit6",
+             "meter", "arx_tpp6", "{", "ip6", "saddr", "limit", "rate", "over", "50/second",
+             "}", "drop"]]
     for argv in cmds:
         try:
             subprocess.run(argv, capture_output=True, text=True, timeout=15)
@@ -641,11 +721,12 @@ def _nft_setup() -> bool:
     return True
 
 
-def _execute_tier1(finding: dict) -> tuple[str, dict | None]:
+def _execute_tier1(finding: dict, cfg: dict | None = None) -> tuple[str, dict | None]:
     """Ejecuta una remediación Tier 1 reversible SOLO en Linux+root.
 
     Devuelve (status, revert). Fuera de Linux+root NO finge: informa que queda listo para
-    ejecutar en el destino. Nunca hace nada irreversible.
+    ejecutar en el destino. Nunca hace nada irreversible. `cfg["ip_response"]` elige la
+    respuesta a escaneo/fuerza bruta: "block" (por defecto) o "tarpit" (estrangular).
     """
     if not _is_linux_root():
         return "listo para ejecutar en destino (requiere Linux + root)", None
@@ -711,6 +792,23 @@ def _execute_tier1(finding: dict) -> tuple[str, dict | None]:
             fam = ipaddress.ip_address(ip).version
         except ValueError:
             return f"IP inválida ({ip}): no se bloquea", None
+        # Política de respuesta (Core): "tarpit" estrangula per-IP en vez de bloquear.
+        # Necesita nftables (ufw no limita por IP de origen); sin nft, se informa y se
+        # cae a bloqueo honesto en vez de fingir un estrangulamiento que no existe.
+        if (cfg or {}).get("ip_response") == "tarpit":
+            if _nft_available():
+                if not _nft_setup():
+                    return "nftables presente pero no se pudo preparar la tabla arx", None
+                r = subprocess.run(["nft", "add", "element", "inet", "arx", f"tarpit{fam}",
+                                    f"{{ {ip} timeout {DEFAULT_TTL_MIN}m }}"],
+                                   capture_output=True, text=True, timeout=15)
+                if r.returncode == 0:
+                    revert = {"tool": "nft_tarpit", "ip": ip}
+                    register_block(finding, revert)
+                    return (f"IP {ip} ESTRANGULADA en nftables (rate-limit per-IP ~2 conx/s "
+                            f"y ~50 paq/s; auto-expira en {DEFAULT_TTL_MIN} min)"), revert
+                return f"nft falló al estrangular la IP ({r.stderr.strip()[:48]})", None
+            # sin nft no hay tarpit posible → se sigue por la rama de bloqueo (honesto)
         if shutil.which("ufw") and _ufw_active():
             r = subprocess.run(["ufw", "deny", "from", ip],
                                capture_output=True, text=True, timeout=15)
@@ -735,6 +833,48 @@ def _execute_tier1(finding: dict) -> tuple[str, dict | None]:
         if shutil.which("ufw"):
             return "ufw está INACTIVO: un bloqueo no tendría efecto (actívalo o decide tú)", None
         return "sin ufw ni nftables: no hay ejecutor seguro de bloqueo en este host", None
+    if kind == "reverse_shell" and target.get("ip"):
+        ip = str(target["ip"])
+        try:
+            fam = ipaddress.ip_address(ip).version
+        except ValueError:
+            return f"IP inválida ({ip}): no se actúa", None
+        port, exe = target.get("port"), str(target.get("exe") or "")
+        actions, reverts = [], []
+        # 1) cortar el canal: el rc de `nft add element` es fiable; el de `ss -K` no lo es
+        #    (devuelve 0 sin cortar nada si el kernel no trae INET_DIAG_DESTROY).
+        if isinstance(port, int) and 0 < port < 65536 and _nft_available() and _nft_setup():
+            r = subprocess.run(["nft", "add", "element", "inet", "arx", f"c2_out{fam}",
+                                f"{{ {ip} . {port} timeout {DEFAULT_TTL_MIN}m }}"],
+                               capture_output=True, text=True, timeout=15)
+            if r.returncode == 0:
+                reverts.append({"tool": "nft_c2", "ip": ip, "port": port})
+                actions.append(f"canal C2 cortado en nftables ({ip}:{port})")
+        if not reverts:
+            actions.append("el canal C2 SIGUE ABIERTO (sin nftables utilizable)")
+        # 2) suspender SOLO el proceso dueño; anti reutilización de PID: solo si
+        #    /proc/<pid>/exe sigue siendo el mismo binario (nunca se suspende por nombre).
+        stopped = []
+        if exe.startswith("/"):
+            for pid in target.get("pids") or []:
+                if not (isinstance(pid, int) and pid > 1 and pid != os.getpid()):
+                    continue
+                try:
+                    if os.readlink(f"/proc/{pid}/exe").removesuffix(" (deleted)") == exe:
+                        os.kill(pid, signal.SIGSTOP)
+                        stopped.append(pid)
+                except OSError:
+                    continue
+        if stopped:
+            reverts.append({"tool": "sigstop", "exe": exe, "pids": stopped})
+            actions.append(f"proceso dueño suspendido ({len(stopped)} pid)")
+        else:
+            actions.append("sin proceso vivo que suspender")
+        if not reverts:
+            return " · ".join(actions), None
+        for revert in reverts:
+            register_block(finding, revert)
+        return " · ".join(actions) + f" — se deshace solo en {DEFAULT_TTL_MIN} min", reverts[0]
     return "propuesta (sin ejecutor automático seguro para este tipo)", None
 
 
@@ -786,7 +926,7 @@ def handle(finding: dict, enforce: bool = False, authorized: bool = False,
             status = (f"FRENO DE SEGURIDAD: ya hubo {MAX_TIER1_PER_HOUR} acciones automáticas en la "
                       "última hora → solo observo")
         elif tier == 1:
-            status, revert = _execute_tier1(finding)
+            status, revert = _execute_tier1(finding, cfg)
             if revert:
                 outcome["revert"] = revert
                 _note_action(now)
