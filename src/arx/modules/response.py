@@ -51,8 +51,9 @@ _PLAN: dict[str, tuple[int, str, bool, str]] = {
                     "suspender es reversible (SIGCONT); no destruye evidencia"),
     "processes": (1, "suspender el proceso (SIGSTOP) para análisis", True,
                   "suspender es reversible (SIGCONT); no destruye evidencia"),
-    "login_users": (2, "terminar la sesión y rotar credenciales", False,
-                    "podría ser un admin legítimo → requiere tu palabra"),
+    "login_users": (2, "bloquear la cuenta (usermod -L, reversible, auto-expira)", True,
+                    "una cuenta nueva conectada puede ser un admin legítimo → requiere tu "
+                    "palabra; el bloqueo se deshace solo y jamás toca root ni cuentas de sistema"),
     "canary": (1, "elevar el nivel de alerta y capturar el contexto del acceso al señuelo", True,
                "un señuelo tocado es señal fuerte de intruso; elevar y capturar es reversible"),
     "port_scan": (1, "bloquear la IP de origen en el firewall (temporal, auto-expira)", True,
@@ -69,6 +70,10 @@ _PLAN: dict[str, tuple[int, str, bool, str]] = {
 # Procesos que jamás se suspenden automáticamente (dejarían el host inaccesible o a Arx ciego).
 _PROTECTED_EXES = {"sshd", "systemd", "init", "dbus-daemon", "journald", "systemd-journald",
                    "auditd", "falco", "osqueryd", "python3", "arx"}
+
+# Nombre de cuenta válido (login POSIX). Clave de seguridad: un valor que empiece por "-"
+# NO casa → imposible colar una opción a `usermod` por el nombre de la cuenta.
+_USERNAME_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
 
 
 def classify(finding: dict) -> dict:
@@ -342,6 +347,23 @@ def _apply_revert(revert) -> str | None:
             except OSError:
                 continue
         return f"SIGCONT a {done} proceso(s) de {exe}"
+    if isinstance(revert, dict) and revert.get("tool") == "usermod":
+        import pwd
+
+        user, uid = revert.get("user"), revert.get("uid")
+        if not (isinstance(user, str) and _USERNAME_RE.match(user) and isinstance(uid, int)):
+            return None
+        try:
+            # anti recreación de cuenta: solo se desbloquea si sigue siendo el mismo uid
+            if pwd.getpwnam(user).pw_uid != uid:
+                return f"cuenta '{user}' recreada con otro uid: no se desbloquea"
+        except KeyError:
+            return f"cuenta '{user}' ya no existe: nada que desbloquear"
+        try:
+            subprocess.run(["usermod", "-U", user], capture_output=True, text=True, timeout=15)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        return f"usermod -U {user} (cuenta desbloqueada)"
     return None
 
 
@@ -515,6 +537,36 @@ def _restore_from_vault(key: str, current_files: list[str] | None = None) -> str
             f"versiones hostiles en cuarentena: {len(quarantined)}")
 
 
+def _lock_account(user: str, finding: dict) -> str:
+    """Bloquea una cuenta (usermod -L), reversible y auto-expirable.
+
+    Jamás root ni cuentas de sistema (uid < 1000) ni cuentas fuera-de-límites: bloquear
+    una de esas dejaría el host sin acceso. El desbloqueo al expirar solo ocurre si sigue
+    siendo la MISMA cuenta (mismo uid), análogo al anti reutilización de PID del SIGSTOP:
+    si alguien recreó el usuario con otro uid entre medias, no se toca.
+    """
+    import pwd
+
+    if not _USERNAME_RE.match(user):
+        return f"nombre de cuenta inválido ({user}): no se bloquea"
+    try:
+        uid = pwd.getpwnam(user).pw_uid
+    except KeyError:
+        return f"la cuenta '{user}' ya no existe: nada que bloquear"
+    if user == "root" or uid < 1000:
+        return f"cuenta de sistema ({user}, uid {uid}): jamás se bloquea automáticamente"
+    if user in _out_of_bounds(config.load_config()):
+        return f"cuenta '{user}' marcada fuera-de-límites: no se bloquea"
+    if not shutil.which("usermod"):
+        return "sin usermod en este host: no hay ejecutor seguro de bloqueo de cuenta"
+    r = subprocess.run(["usermod", "-L", user], capture_output=True, text=True, timeout=15)
+    if r.returncode != 0:
+        return f"no se pudo bloquear la cuenta ({r.stderr.strip()[:48]})"
+    register_block(finding, {"tool": "usermod", "user": user, "uid": uid})
+    return (f"cuenta '{user}' bloqueada (usermod -L) — se desbloquea sola en "
+            f"{DEFAULT_TTL_MIN} min si sigue siendo la misma cuenta (uid {uid})")
+
+
 def _execute_tier2(finding: dict) -> str:
     """Ejecuta una remediación Tier 2 ya autorizada por el humano. Nunca antes."""
     kind, target = finding.get("kind"), finding.get("target") or {}
@@ -522,6 +574,9 @@ def _execute_tier2(finding: dict) -> str:
         return "listo para ejecutar en destino (requiere Linux + root)"
     if kind == "integrity" and target.get("file"):
         return _restore_from_vault(str(target["file"]))
+    if kind == "login_users" and target.get("user"):
+        # el item de baseline es "usuario@origen": la cuenta es la parte antes de la @
+        return _lock_account(str(target["user"]).split("@")[0], finding)
     return "plan registrado — aún sin ejecutor Tier 2 para este tipo"
 
 

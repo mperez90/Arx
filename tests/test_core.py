@@ -1192,8 +1192,8 @@ class Tier2ExecutorTests(unittest.TestCase):
         self.assertIn("sin respaldo", item["executed"])
 
     def test_unknown_kind_registers_plan(self):
-        finding = {"kind": "login_users", "sev": "high", "detail": "x",
-                   "target": {"user": "bob"}}
+        # un tipo sin ejecutor Tier 2 propio queda registrado como plan, sin fingir acción
+        finding = {"kind": "network_anomaly", "sev": "high", "detail": "x", "target": {}}
         item = self.r.authorize_pending(self.r._add_pending(finding, {"action": "a"}))
         self.assertIn("sin ejecutor", item["executed"])
 
@@ -1468,6 +1468,104 @@ class RevShellActuatorTests(unittest.TestCase):
         o = self.r.handle(self._rev(ip="no-es-ip"), enforce=True, cfg={})
         self.assertIn("inválida", o["status"])
         self.assertEqual(self.kills, [])
+
+
+class IdentityActuatorTests(unittest.TestCase):
+    """F5 (Core) — bloqueo de cuenta (usermod -L) Tier 2: reversible, auto-expira,
+    jamás root/sistema, desbloqueo solo si sigue siendo la misma cuenta (mismo uid)."""
+
+    def setUp(self):
+        _isolate()
+        from arx.modules import response
+        self.r = response
+        self.calls = []
+
+        class R:
+            returncode, stderr, stdout = 0, "", ""
+
+        def fake_run(argv, **kw):
+            self.calls.append(argv)
+            return R()
+        self._patch(response, "_is_linux_root", lambda: True)
+        self._patch(response.shutil, "which", lambda c: f"/usr/sbin/{c}")
+        self._patch(response.subprocess, "run", fake_run)
+
+    def _patch(self, obj, name, value):
+        p = mock.patch.object(obj, name, value)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _pwuid(self, uid):
+        import types
+        self._patch_pwd(lambda u: types.SimpleNamespace(pw_name=u, pw_uid=uid))
+
+    def _patch_pwd(self, fn):
+        p = mock.patch("pwd.getpwnam", fn)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _flat(self):
+        return [" ".join(c) for c in self.calls]
+
+    def _login(self, user):
+        return {"kind": "login_users", "sev": "high",
+                "detail": f"nuevo en login_users: {user}", "target": {"user": user}}
+
+    def test_locks_human_account_reversibly(self):
+        self._pwuid(1001)
+        res = self.r._execute_tier2(self._login("mallory@198.51.100.9"))
+        self.assertIn("bloqueada", res)
+        self.assertTrue(any("usermod -L mallory" in c for c in self._flat()))
+        self.assertEqual(self.r._load_blocks()[0]["revert"],
+                         {"tool": "usermod", "user": "mallory", "uid": 1001})
+
+    def test_never_locks_root_or_system(self):
+        self._pwuid(0)
+        res = self.r._execute_tier2(self._login("root"))
+        self.assertIn("jamás se bloquea", res)
+        self.assertEqual(self.calls, [])
+        self._pwuid(120)  # cuenta de servicio
+        self.assertIn("sistema", self.r._execute_tier2(self._login("mysql")))
+
+    def test_invalid_username_is_rejected(self):
+        self._pwuid(1001)
+        # un valor que empieza por '-' no casa el regex → no puede colar una opción a usermod
+        self.assertIn("inválido", self.r._execute_tier2(self._login("-R")))
+        self.assertEqual(self.calls, [])
+
+    def test_out_of_bounds_account_not_locked(self):
+        self._pwuid(1002)
+        self.r.config.save_config({"out_of_bounds": "deploy"})  # el operador la protege
+        res = self.r._execute_tier2(self._login("deploy"))
+        self.assertIn("fuera-de-límites", res)
+        self.assertEqual(self.calls, [])
+
+    def test_expiry_unlocks_only_if_same_uid(self):
+        self._pwuid(1001)
+        self.r._execute_tier2(self._login("mallory"))
+        self.calls.clear()
+        later = datetime.now(timezone.utc) + timedelta(minutes=61)
+        # mismo uid → desbloquea
+        self.r.expire_blocks(now=later)
+        self.assertIn("usermod -U mallory", self._flat()[-1])
+
+    def test_expiry_does_not_unlock_recreated_account(self):
+        self._pwuid(1001)
+        self.r._execute_tier2(self._login("mallory"))
+        self.calls.clear()
+        self._patch_pwd(lambda u: __import__("types").SimpleNamespace(pw_uid=1500))  # recreada
+        later = datetime.now(timezone.utc) + timedelta(minutes=61)
+        self.r.expire_blocks(now=later)
+        self.assertFalse(any("usermod -U" in c for c in self._flat()))
+
+    def test_authorize_flow_locks_account(self):
+        """De punta a punta: login_users → PENDIENTE Tier 2 → authorize → usermod -L."""
+        self._pwuid(1001)
+        o = self.r.handle(self._login("intruso@203.0.113.9"), enforce=True, cfg={})
+        self.assertEqual(o["tier"], 2)
+        item = self.r.authorize_pending(o["pending_id"])
+        self.assertIn("bloqueada", item["executed"])
+        self.assertTrue(any("usermod -L intruso" in c for c in self._flat()))
 
 
 if __name__ == "__main__":
