@@ -1,10 +1,10 @@
 name: arx
 base: core24
-version: "0.0.1"
+version: "0.0.2"
 summary: Autonomous defensive security agent for servers
 description: |
-  Arx learns your server's normal and answers threats in real time — reversible
-  by doctrine, human-gated for the irreversible. Console-first, no external deps.
+  Arx learns your server's normal and contains threats automatically with actions
+  that undo themselves, human-gated for the irreversible. Python stdlib only.
 
   NOTE ON CONFINEMENT: Arx defends the WHOLE host, so it needs broad visibility
   (processes, network, files, users). That's a poor fit for strict snap

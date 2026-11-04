@@ -5,7 +5,7 @@ Solo usa la biblioteca estándar de Python.
 
 Herramientas del sistema que Arx puede invocar si están instaladas en el host (se
 ejecutan como programas externos, no se distribuyen con Arx y conservan sus propias
-licencias): osquery, auditd/ausearch, Falco, ufw, systemd, iproute2 (ss/ip), procps.
+licencias): osquery, auditd/ausearch, Falco, ufw, nftables, systemd, iproute2 (ss/ip), procps.
 
 Si en el futuro Arx incorpora o redistribuye código de terceros, su aviso de copyright
 y licencia se añadirán aquí.

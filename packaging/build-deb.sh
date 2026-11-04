@@ -45,8 +45,8 @@ Depends: python3 (>= 3.10)
 Maintainer: $MAINTAINER
 Installed-Size: $INSTALLED_KB
 Description: Arx - autonomous defensive security agent
- Learns your server's normal and answers threats in real time, reversible by
- doctrine. Human-gated for irreversible actions. Console-first, no external deps.
+ Learns your server's normal and contains threats automatically with actions that
+ undo themselves. Human-gated for irreversible actions. Python stdlib only.
 EOF
 
 cat > "$PKG/DEBIAN/postinst" <<'EOF'

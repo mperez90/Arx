@@ -2,9 +2,9 @@
 
 ## 1. Dos capas
 
-**Capa rápida (determinista).** Sensores + reglas en tiempo real, sin modelo en el hot
-path: estado del sistema, syscalls/ficheros, comportamiento en kernel (eBPF), integridad.
-Produce eventos normalizados.
+**Capa rápida (determinista).** Sensores + reglas en barridos periódicos (30 s por defecto),
+sin modelo en el hot path: estado del sistema, integridad, pista de escaneo en el kernel
+(nftables) y, si están instalados, auditd y Falco (eBPF). Produce eventos normalizados.
 
 **Capa lenta (razonamiento).** El motor de Arx (cliente LLM propio, con las claves del
 cliente) trabaja **fuera del hot path** y **solo cuando la capa rápida encuentra algo
@@ -21,18 +21,22 @@ explica y refina después. Nunca es requisito para contener.
 
 | Tier | Ejemplos | Autoridad |
 |------|----------|-----------|
-| **0** | aislar proceso, snapshot, throttle, tarpit | auto, siempre reversible |
-| **1** | cortar conexión, bloquear puerto nuevo | auto alta-confianza, **auto-expira** |
-| **2** | borrar, rotar credenciales durables | **humano + palabra** |
+| **0** | registrar evidencia y alertar | automático, siempre |
+| **1** | bloquear IP, puerto o canal de reverse shell; suspender un proceso sospechoso | automático con `--enforce`, **se deshace solo a los 60 min** |
+| **2** | restaurar ficheros críticos, poner en cuarentena lo plantado | **humano + palabra** |
 
 "Voluntad de acero" = Tier 0/1 implacables y sin fatiga. Lo irreversible es del humano.
 
-## 3. Línea base de comportamiento (UEBA)
+Un binario nuevo en un directorio de sistema es señal de baja confianza y solo se registra
+(Tier 0): suspenderlo congelaría todos sus procesos. Un canal de reverse shell se corta con
+DROP en nftables, no destruyendo el socket: al expirar, el flujo se reanuda.
 
-No solo red: **software** (procesos, binarios, servicios, cron, paquetes), **hardware**
-(perfiles de uso y horarios), **red** (flujos, destinos, puertos), **usuarios** (accesos,
-privilegios, horarios). Aprender > bloquear durante la ventana. Integridad de arranque
-para no aprender a un intruso como "normal". Deriva controlada.
+## 3. Línea base de comportamiento
+
+**Software** (ejecutables por ruta real, servicios), **red** (puertos en escucha),
+**usuarios** (sesiones) y **medidores** (carga, memoria, disco, conexiones). Aprender >
+bloquear durante la ventana. Integridad de arranque para no aprender a un intruso como
+"normal". Horarios y flujos de red todavía no se modelan.
 
 ## 4. Ejecución de herramientas aislada (defensivo) — *planificado*
 
@@ -41,14 +45,16 @@ capacidades amplias en el proceso principal: se ejecutan en **contenedores herma
 efímeros con capacidades mínimas**, acotadas al propio host/segmento de Arx, y se destruyen
 al terminar. Menor superficie, aislamiento y auditabilidad.
 
-**Línea dura — sin arsenal ofensivo.** Arx **no** empaqueta herramientas ofensivas de red
-(MITM, envenenamiento de credenciales, pivoting hacia otros hosts) en **ningún** tier.
-Razones: control de exportación / doble uso, responsabilidad legal y coherencia con el
-posicionamiento defensivo. Un instalable con privilegios altos + arsenal ofensivo a escala
-es una plataforma armable, no un guardián.
+**Core es solo defensivo.** No incluye herramientas ofensivas de ningún tipo.
 
-**El "red" que sí existe (Pro+):** auto-pentest **autorizado del propio host** — Arx prueba
-sus propias defensas, con aprobación humana (Tier 2). Nunca contra terceros.
+**Evaluación autorizada, solo de pago y solo sobre activos propios** (*planificada*): Pro
+añade un auto-pentest curado del propio host; Business, una evaluación con herramientas de
+Kali/Parrot sobre la flota enrolada del cliente. Con puertas duras siempre: alcance impuesto
+por código, aprobación humana por ejercicio, dry-run primero, kill-switch y auditoría. Sin
+C2 ni pivoting empaquetados, y su código no vive en este repositorio.
+
+**Nunca contra terceros:** no hay hack-back en ningún tier, ni siquiera contra quien te
+ataca (la IP atacante suele ser otra víctima).
 
 ## 5. Lado cliente vs. lado servidor
 

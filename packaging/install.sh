@@ -1,7 +1,8 @@
 #!/bin/sh
 # Arx Core — instalador.
 #
-#   curl -fsSL https://<host>/install.sh | sudo sh
+#   curl -fsSLO https://raw.githubusercontent.com/mperez90/Arx/f1-core-mvp/packaging/install.sh
+#   sudo sh install.sh
 #
 # Variables:
 #   ARX_DEB_URL   URL del .deb (por defecto: última release de GitHub)
@@ -12,13 +13,13 @@
 set -eu
 
 if [ "$(id -u)" != "0" ]; then
-  echo "Arx se instala como root:  curl -fsSL <url>/install.sh | sudo sh"
+  echo "Arx se instala como root:  sudo sh install.sh"
   exit 1
 fi
 
 if ! command -v dpkg >/dev/null 2>&1; then
   echo "Este instalador es para sistemas Debian/Ubuntu (dpkg)."
-  echo "En otros sistemas: descarga arx.pyz y córrelo con python3 (>= 3.11)."
+  echo "En otros sistemas: descarga arx.pyz y córrelo con python3 (>= 3.10)."
   exit 1
 fi
 

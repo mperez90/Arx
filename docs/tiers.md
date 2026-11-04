@@ -1,27 +1,30 @@
 # Arx — matriz de tiers
 
-El **Core** es defensa real y completa en lo esencial. **Pro** y **Business** añaden
-inteligencia gestionada, detecciones avanzadas y operación de flota — lo que un usuario o
-una empresa serios necesitan.
+El **Core** es defensa real y gratuita, y es lo único disponible hoy. **Pro** y **Business**
+están **planificados**: abren después de la fase de pruebas públicas de Core, y esta tabla
+describe lo previsto, no lo que ya se puede comprar. Cada ✅ de pago debe existir y estar
+probado antes de abrir su venta.
 
-| Capacidad | Core (libre) | Pro (3 años · 3 activ.) | Business (2 años · por servidor) |
+| Capacidad | Core (gratis) | Pro (1 dispositivo) | Business (por dispositivo) |
 |---|---|---|---|
 | Wizard de instalación (consola) | ✅ | ✅ | ✅ |
 | Reconocimiento inicial + inventario | ✅ | ✅ | ✅ |
-| Línea base de comportamiento (SW·HW·red·usuarios) | ✅ | ✅ | ✅ |
+| Línea base (ejecutables·puertos·servicios·usuarios + medidores) | ✅ | ✅ | ✅ |
 | Canarios / honeytokens | ✅ | ✅ | ✅ |
-| Sensores (osquery·auditd·Falco) | ✅ | ✅ | ✅ |
-| Respuesta Tier 0/1 (auto reversible) | ✅ | ✅ | ✅ |
+| Sensores (osquery·auditd·Falco, si están instalados) | ✅ | ✅ | ✅ |
+| Respuesta Tier 0/1 (automática y reversible) | ✅ | ✅ | ✅ |
 | Respuesta Tier 2 (humano + palabra) | ✅ | ✅ | ✅ |
 | Intel de amenazas | comunitaria (retraso) | **gestionada, tiempo real** | gestionada + privada |
-| Detecciones avanzadas (playbooks purple) | básicas | ✅ | ✅ |
-| Auto-pentest autorizado del propio host | — | ✅ | ✅ |
-| Reportes de incidente / postura | básico | ✅ | compliance (SOC2/ISO) |
-| Hosts | 1 | 1–pocos | **flota + consola central** |
-| Correlación entre hosts | — | — | ✅ |
+| Detecciones avanzadas por TTP | básicas | ✅ | ✅ |
+| Auto-pentest del propio host | — | ✅ (curado) | ✅ |
+| Evaluación autorizada de los activos propios (Kali/Parrot) | — | — | ✅ |
+| Informes de postura | básico | ✅ | compliance (SOC2/ISO) |
+| Consola central + correlación entre hosts | — | — | ✅ |
+| Hosts que se defienden entre sí | — | — | ✅ |
 | Integración SIEM/SOAR · RBAC · auditoría | — | — | ✅ |
-| Modelo local / air-gap | — | — | ✅ (a futuro) |
-| Soporte | comunidad | estándar | **SLA + MDR opcional** |
+| Soporte | comunidad | estándar | SLA (+MDR opcional, por contrato aparte) |
 
-Nota: **ninguna herramienta ofensiva de red** (MITM, envenenamiento, pivoting) se distribuye en
-ningún tier. El "red" del producto = auto-prueba autorizada del propio host. Ver README §Alcance.
+**Core es solo defensivo.** Los tiers de pago añaden evaluación autorizada de los activos
+propios, con alcance impuesto por código y aprobación humana por ejercicio. Sin C2 ni
+pivoting empaquetados, y nunca contra terceros: no hay hack-back en ningún tier. El código
+de esa evaluación no vive en este repositorio.
