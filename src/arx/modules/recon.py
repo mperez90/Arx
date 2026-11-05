@@ -283,14 +283,15 @@ def collect_connections() -> list[dict]:
     return conns
 
 
-def _socket_inode_owners() -> dict[str, tuple[int, str]]:
-    """inode de socket → (pid, ruta real del ejecutable) recorriendo /proc/<pid>/fd.
+def _socket_inode_owners() -> dict[str, list[tuple[int, str]]]:
+    """inode de socket → [(pid, ruta real del ejecutable)] recorriendo /proc/<pid>/fd.
 
     Es la correlación conexión→proceso sin herramientas externas: cada fd que es un
     `socket:[inode]` ata ese socket al proceso que lo tiene abierto. La ruta sale de
     /proc/<pid>/exe (readlink), nunca del nombre corto que el propio programa elige.
+    Un socket puede tener varios dueños: un hijo que lo hereda sigue usando el canal.
     """
-    owners: dict[str, tuple[int, str]] = {}
+    owners: dict[str, list[tuple[int, str]]] = {}
     try:
         entries = os.listdir("/proc")
     except OSError:
@@ -304,18 +305,21 @@ def _socket_inode_owners() -> dict[str, tuple[int, str]]:
             fds = os.listdir(f"/proc/{name}/fd")
         except OSError:
             continue  # hilo del kernel, proceso ya muerto o sin permiso
+        inodes = set()
         for fd in fds:
             try:
                 link = os.readlink(f"/proc/{name}/fd/{fd}")
             except OSError:
                 continue
             if link.startswith("socket:["):
-                owners.setdefault(link[8:-1], (pid, exe))  # 'socket:[12345]' → '12345'
+                inodes.add(link[8:-1])  # 'socket:[12345]' → '12345'
+        for inode in inodes:
+            owners.setdefault(inode, []).append((pid, exe))
     return owners
 
 
 def connection_owners() -> list[dict]:
-    """Conexiones TCP con su proceso dueño (pid + ejecutable), uniendo por inode.
+    """Conexiones TCP con sus procesos dueños, uniendo por inode: una fila por dueño.
 
     Es la base de la detección de reverse shell (L6): un intérprete que posee un
     socket de red saliente es la anomalía. Sin dueño resoluble, pid/exe quedan None
@@ -324,8 +328,8 @@ def connection_owners() -> list[dict]:
     owners = _socket_inode_owners()
     out = []
     for c in collect_connections():
-        pid, exe = owners.get(c.get("inode", ""), (None, None))
-        out.append({**c, "pid": pid, "exe": exe})
+        for pid, exe in owners.get(c.get("inode", "")) or [(None, None)]:
+            out.append({**c, "pid": pid, "exe": exe})
     return out
 
 

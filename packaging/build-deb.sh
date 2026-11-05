@@ -42,6 +42,7 @@ Section: admin
 Priority: optional
 Architecture: all
 Depends: python3 (>= 3.10)
+Recommends: nftables
 Maintainer: $MAINTAINER
 Installed-Size: $INSTALLED_KB
 Description: Arx - autonomous defensive security agent

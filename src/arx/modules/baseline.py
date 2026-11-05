@@ -117,9 +117,21 @@ def _login_users() -> list[str]:
             continue
         src = ""
         if line.rstrip().endswith(")") and "(" in line:
-            src = "@" + line[line.rfind("(") + 1 : line.rfind(")")]
+            src = "@" + _login_origin(line[line.rfind("(") + 1 : line.rfind(")")])
         users.add(f[0] + src)
     return sorted(users)
+
+
+def _login_origin(origin: str) -> str:
+    """tmux, screen y mosh ponen un pid o un panel en el origen: cada ventana nueva parecería
+    un acceso nuevo. Se conserva lo estable (la IP o el nombre), nunca lo que cambia."""
+    if origin.startswith("tmux("):
+        return "tmux"
+    if origin.startswith("mosh"):
+        return "mosh"
+    if origin.startswith(":"):
+        return "local"
+    return origin
 
 
 def _gauges() -> dict:
@@ -355,6 +367,8 @@ def accept(key: str, item: str) -> bool:
     """Incorpora a la base un cambio legítimo (p. ej. instalaste nginx → 'tcp 80 all')."""
     with config.locked("baseline"):
         b = load()
+        if key == "uid0_accounts" and b:  # jamás se aprende sola: nace con la primera aceptación
+            b.setdefault("sets", {}).setdefault(key, {})
         if not b or key not in b.get("sets", {}):
             return False
         b["sets"][key][item] = b["sets"][key].get(item, 0) + 1
@@ -401,6 +415,10 @@ def run(samples: int = 1, interval: int = 0, seal: bool = False, status: bool = 
             print("No puedes sellar una base vacía. Ejecuta `arx learn` primero.")
             return 1
         baseline["meta"]["sealed"] = True
+        # la huella dice QUE cambió el conjunto SUID, no cuál: sin la lista no se sabe qué hay de nuevo
+        suid = recon.collect_users().get("suid_binaries")
+        if suid is not None:
+            baseline["sets"]["suid_binaries"] = {p: 1 for p in suid}
         save(baseline)
         # Respaldo de los ficheros críticos al sellar: sin copia buena no hay restauración.
         from arx.modules import response
@@ -414,8 +432,12 @@ def run(samples: int = 1, interval: int = 0, seal: bool = False, status: bool = 
             print("✓ Pista de escaneo nft activa (inet arx: scan4/scan6 + sets de bloqueo).")
         return 0
 
+    from arx.modules import sensors
     for i in range(max(1, samples)):
-        fold(baseline, snapshot())
+        snap = snapshot()
+        # lo normal también son los accesos sin terminal que ya ocurrieron: scp, Ansible, túneles
+        snap["sets"]["login_users"] = sorted(set(snap["sets"]["login_users"]) | sensors.accepted_logins())
+        fold(baseline, snap)
         if i < samples - 1 and interval > 0:
             time.sleep(interval)
     save(baseline)

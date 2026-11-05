@@ -12,7 +12,13 @@ Modos (los orquesta lab/docker-lab.sh con un contenedor atacante separado):
   sandbox           F6 estático: distingue un fichero malicioso de uno benigno (sin ejecutar)
   forensics         F16: informe forense sellado de los incidentes + detección de manipulación
   hostile           ficheros-trampa contra el bucle de guardia: no debe colgarse ni morir
-  identity          bloqueo de cuenta real: la llave SSH deja de entrar y se restaura
+  identity          bloqueo de cuenta real: sesiones cerradas, llave fuera, solo `unlock` la abre
+  identity-llm <ip> veredicto del modelo sobre un acceso real sin terminal desde el atacante
+  identity-forged   una línea falsa en auth.log no debe bloquear a nadie
+  identity-unlock   levanta el bloqueo de bob (lo decide una persona)
+  uid0              alias de root: alerta crítica; bloquearlo no afecta a root
+  forward-up        un "contenedor" con un servicio publicado por DNAT
+  forward-block <ip> bloquea esa IP; el efecto se mide desde el atacante
   levels            L4, L5, L7, L8, L9 en la víctima + scoreboard
   all               prep + levels (modo clásico de contenedor único)
 
@@ -218,9 +224,7 @@ def net_tarpit(ip):
     (rate-limit per-IP en nftables) en vez de bloquearla. Pizarra limpia: el tarpit es un
     PRIMER contacto, no una reaparición tras bloqueo. Reutiliza el escaneo real del L1.
     """
-    from arx.modules import response
-    for path in (response._findings_path(), response._blocks_path(), response._actions_path()):
-        config.write_json(path, {} if "findings" in path.name else [])
+    _slate(keep_scan=True)  # la pista la acaba de llenar el escaneo: es lo que se va a medir
     cfg = config.load_config()
     cfg["ip_response"] = "tarpit"       # política Core: estrangular, no bloquear
     config.save_config(cfg)
@@ -236,11 +240,15 @@ def net_tarpit(ip):
     return 0 if ok else 1  # docker-lab.sh mide el efecto desde el atacante y luego libera
 
 
-def _slate():
+def _slate(keep_scan=False):
     """Pizarra limpia entre escenarios independientes: el freno no debe mezclarlos."""
     from arx.modules import response
-    for path in (response._findings_path(), response._blocks_path(), response._actions_path()):
+    for path in (response._findings_path(), response._blocks_path(), response._actions_path(),
+                 response._llm_locks_path()):
         config.write_json(path, {} if "findings" in path.name else [])
+    # el estado y el kernel van juntos: si no, una IP sigue bloqueada sin que Arx lo sepa
+    for name in ("block_ipv4", "tarpit4", "c2_out4") + (() if keep_scan else ("scan4",)):
+        sh(["nft", "flush", "set", "inet", "arx", name])
 
 
 def hostile():
@@ -281,8 +289,16 @@ def hostile():
     return 0 if ok_all else 1
 
 
+def _alive_of(user):
+    """Procesos vivos de una cuenta. En el contenedor nadie recoge a los zombis: no cuentan."""
+    rows = sh(["ps", "-u", user, "-o", "pid=,stat="]).stdout.splitlines()
+    return [r.split()[0] for r in rows if not r.split()[1].startswith("Z")]
+
+
 def identity():
-    """Bloqueo de cuenta REAL con sshd: lo que importa es si el acceso entra o no."""
+    """Bloqueo de cuenta REAL con sshd: lo que importa es si el acceso entra o no, si lo que
+    dejó corriendo muere y si el reloj la desbloquea (no debe)."""
+    import pwd
     from datetime import datetime, timedelta, timezone
     from arx.modules import response
     _slate()
@@ -291,27 +307,175 @@ def identity():
        "mkdir -p /home/bob/.ssh; cp /tmp/bobkey.pub /home/bob/.ssh/authorized_keys; "
        "chown -R bob: /home/bob/.ssh; chmod 700 /home/bob/.ssh; echo bob:clave-bob | chpasswd",
        executable="/bin/bash")
+    ssh = ["ssh", "-i", "/tmp/bobkey", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
+           "-o", "ConnectTimeout=5", "bob@127.0.0.1"]
 
     def key_enters():
-        return sh(["ssh", "-i", "/tmp/bobkey", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
-                   "-o", "ConnectTimeout=5", "bob@127.0.0.1", "true"]).returncode == 0
+        return sh([*ssh, "true"]).returncode == 0
     before = key_enters()
-    msg = response._lock_account("bob", {"kind": "login_users", "detail": "lab bob"})
-    locked = "bloqueada" in msg and not key_enters()
-    later = datetime.now(timezone.utc) + timedelta(minutes=61)
+    # lo que un intruso dejaría: sesión sin terminal, con terminal, un proceso desligado y un
+    # proceso de root nacido de su sesión (lo que deja un `sudo -i`: uid 0, loginuid suyo)
+    plain = subprocess.Popen([*ssh, "sleep 600"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    tty = subprocess.Popen([*ssh[:-1], "-tt", "bob@127.0.0.1", "sleep 600"], stdin=subprocess.PIPE,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    sh([*ssh, "nohup sleep 900 >/dev/null 2>&1 &"])
+    uid = pwd.getpwnam("bob").pw_uid
+    root_child = subprocess.Popen(["sh", "-c", f"echo {uid} > /proc/self/loginuid; exec sleep 900"])
+    time.sleep(1.5)
+    bob_procs = _alive_of("bob")
+    rep = response.contain_identity(
+        {"kind": "login_users", "sev": "high", "detail": "nuevo en login_users: bob@127.0.0.1",
+         "set": "login_users", "item": "bob@127.0.0.1", "target": {"user": "bob@127.0.0.1"}}, "lab")
+    locked = rep["locked"] and not key_enters()
+    try:
+        plain.wait(10), tty.wait(10), root_child.wait(10)
+    except subprocess.TimeoutExpired:
+        pass
+    sessions_dead = plain.poll() is not None and tty.poll() is not None
+    root_dead = root_child.poll() is not None
+    left = _alive_of("bob")
+    print(f"  procesos de bob antes: {len(bob_procs)} · cerrados según Arx: {len(rep['closed'])} · "
+          f"después: {len(left)}")
+    # el reloj nunca desbloquea
+    later = datetime.now(timezone.utc) + timedelta(days=30)
     response.expire_blocks(now=later)
+    still_locked = not key_enters()
+    in_list = [a["user"] for a in response.locked_accounts()] == ["bob"]
+    done = response.unlock_account("bob")
     restored = key_enters()
-    # una cuenta que el admin ya tenía bloqueada debe seguir bloqueada al expirar
+    # una cuenta que el admin ya tenía bloqueada debe seguir bloqueada al desbloquear
     sh("id carol >/dev/null 2>&1 || useradd -m carol; echo carol:x | chpasswd; usermod -L carol")
     response._lock_account("carol", {"kind": "login_users", "detail": "lab carol"})
-    response.expire_blocks(now=later)
+    response.unlock_account("carol")
     admin_lock = sh(["passwd", "-S", "carol"]).stdout.split()[1] == "L"
-    ok = before and locked and restored and admin_lock
-    print(f"[{'PASS' if ok else 'FAIL'}] identidad: llave entra antes={before} · "
-          f"bloqueada de verdad={locked} · restaurada al expirar={restored} · "
+    ok = (before and bob_procs and locked and sessions_dead and root_dead and not left and still_locked
+          and in_list and restored and admin_lock)
+    print(f"[{'PASS' if ok else 'FAIL'}] identidad: llave entra antes={before} · bloqueada de verdad={locked} · "
+          f"sesiones cerradas={sessions_dead} · nada de bob vivo={not left} · root de su sesión cerrado={root_dead} · "
+          f"sigue bloqueada al mes={still_locked} · unlock={restored} ({done}) · "
           f"bloqueo previo del admin respetado={admin_lock}")
     _slate()
     return 0 if ok else 1
+
+
+def _lab_answer(fp, veredicto="amenaza", confianza=92):
+    return ("Acceso desconocido en sesión viva.\nVEREDICTOS: "
+            + json.dumps([{"id": fp, "veredicto": veredicto, "confianza": confianza, "razon": "lab"}]))
+
+
+def identity_llm(ip):
+    """Veredicto del modelo de punta a punta. El modelo se sustituye por su respuesta: lo que se
+    prueba es qué hace Arx con ella. El acceso (sin terminal) y la línea falsa son reales."""
+    from arx.modules import baseline, guard, response
+    _slate()
+    base = baseline.load()
+    cfg = {"lab": True}
+    findings, outcomes = guard.sweep(base, enforce=True, include_suid=False, cfg=cfg)
+    pairs = list(zip(findings, outcomes))
+    real = next((p for p in pairs if p[0].get("item") == f"bob@{ip}"), None)
+    if real is None:
+        print(f"[FAIL] identidad+modelo: un acceso sin terminal de bob@{ip} no se detectó")
+        return 1
+    print(f"  hechos que recibe el modelo: {guard.build_dossier([real], base)['hallazgos_nuevos'][0]['hechos']}")
+    guard._assess_with_engine = lambda new, b, c: _lab_answer(real[1]["fp"])
+    slow = guard.SlowLayer(cfg, base, enforce=True)
+    slow.feed([real[0]], [real[1]])
+    rep = slow.reports[0] if slow.reports else {}
+    print("  " + (rep.get("summary") or "").replace("\n", "\n  "))
+    locked = sh(["passwd", "-S", "bob"]).stdout.split()[1] == "L"
+    ip_blocked = ip in _nft_set("block_ipv4")
+    ok = bool(rep.get("locked")) and locked and ip_blocked and not _alive_of("bob")
+    print(f"[{'PASS' if ok else 'FAIL'}] identidad+modelo: cuenta bloqueada={locked} · nada de bob vivo · "
+          f"IP de origen bloqueada={ip_blocked}")
+    return 0 if ok else 1
+
+
+def identity_forged():
+    """Un usuario sin privilegios escribe en auth.log: el veredicto no debe tocar a la víctima."""
+    from arx.modules import baseline, guard, response
+    _slate()
+    base = baseline.load()
+    sh("id dana >/dev/null 2>&1 || useradd -m dana; echo dana:x | chpasswd")
+    guard.sweep(base, enforce=True, include_suid=False, cfg={})  # pone al día el cursor de auth.log
+    sh(["su", "nobody", "-s", "/bin/sh", "-c",
+        "logger -p auth.info -t 'sshd[1]' 'Accepted password for dana from 198.51.100.7 port 1 ssh2'"])
+    time.sleep(1)
+    findings, outcomes = guard.sweep(base, enforce=True, include_suid=False, cfg={})
+    forged = next((p for p in zip(findings, outcomes) if p[0].get("item") == "dana@198.51.100.7"), None)
+    if forged is None:
+        print("[FAIL] línea falsa: logger no llegó a auth.log; la prueba no prueba nada")
+        return 1
+    guard._assess_with_engine = lambda new, b, c: _lab_answer(forged[1]["fp"])
+    slow = guard.SlowLayer({}, base, enforce=True)
+    slow.feed([forged[0]], [forged[1]])
+    untouched = sh(["passwd", "-S", "dana"]).stdout.split()[1] == "P"
+    said = "falsificar" in (slow.reports[0]["summary"] if slow.reports else "")
+    ok = untouched and said
+    print(f"[{'PASS' if ok else 'FAIL'}] línea falsificada con logger: dana intacta={untouched} · el dueño lo sabe={said}")
+    return 0 if ok else 1
+
+
+def identity_unlock():
+    from arx.modules import response
+    done = response.unlock_account("bob")
+    print(f"── bob desbloqueado: {done} ──")
+    return 0 if done and not done.startswith("no se pudo") else 1
+
+
+def uid0():
+    """Un alias de root: alerta crítica, y bloquearlo no debe afectar a root."""
+    from arx.modules import baseline, guard, response
+    _slate()
+    sh("useradd -o -u 0 -M -s /bin/bash toor; echo toor:x | chpasswd")
+    base = baseline.load()
+    findings, outcomes = guard.sweep(base, enforce=True, include_suid=False, cfg={})
+    pair = next((p for p in zip(findings, outcomes) if p[0].get("kind") == "uid0_account"), None)
+    if pair is None:
+        print("[FAIL] alias de root: no se detectó")
+        sh("sed -i '/^toor:/d' /etc/passwd /etc/shadow")
+        return 1
+    crit, tier2 = pair[0]["sev"] == "crit", pair[1]["tier"] == 2
+    item = response.authorize_pending(pair[1]["pending_id"])
+    alias_locked = sh(["passwd", "-S", "toor"]).stdout.split()[1] == "L"
+    root_ok = sh(["passwd", "-S", "root"]).stdout.split()[1] == "P"
+    arx_alive = os.getuid() == 0 and sh(["id", "-u"]).stdout.strip() == "0"
+    ok = crit and tier2 and alias_locked and root_ok and arx_alive
+    print(f"[{'PASS' if ok else 'FAIL'}] alias de root: crítico={crit} · espera al humano={tier2} · "
+          f"alias bloqueado={alias_locked} · root intacto={root_ok} · {item['executed'][:60]}…")
+    sh("sed -i '/^toor:/d' /etc/passwd /etc/shadow")
+    _slate()
+    return 0 if ok else 1
+
+
+def forward_up():
+    """Un "contenedor": otra red con un servicio publicado por DNAT, como hace Docker."""
+    sh("""ip netns add c1
+ip link add veth0 type veth peer name veth1
+ip link set veth1 netns c1
+ip addr add 10.99.0.1/24 dev veth0
+ip link set veth0 up
+ip netns exec c1 ip addr add 10.99.0.2/24 dev veth1
+ip netns exec c1 ip link set veth1 up
+ip netns exec c1 ip link set lo up
+ip netns exec c1 ip route add default via 10.99.0.1
+sysctl -q net.ipv4.ip_forward=1
+nft add table ip natlab
+nft 'add chain ip natlab pre { type nat hook prerouting priority -100; }'
+nft add rule ip natlab pre tcp dport 8088 dnat to 10.99.0.2:8088
+nohup ip netns exec c1 nc -k -l 8088 >/dev/null 2>&1 &
+""")
+    time.sleep(1)
+    return 0
+
+
+def forward_block(ip):
+    from arx.modules import response
+    _slate()
+    status, revert = response._execute_tier1(
+        {"kind": "auth_bruteforce", "sev": "high", "detail": f"lab forward {ip}", "target": {"ip": ip}}, {})
+    print(f"  {status}")
+    print("  " + sh(["nft", "list", "chain", "inet", "arx", "forward"]).stdout.replace("\n", "\n  "))
+    return 0 if revert else 1
 
 
 def sandbox_scan():
@@ -454,6 +618,18 @@ def main():
         return hostile()
     if mode == "identity":
         return identity()
+    if mode == "identity-llm":
+        return identity_llm(sys.argv[2])
+    if mode == "identity-forged":
+        return identity_forged()
+    if mode == "identity-unlock":
+        return identity_unlock()
+    if mode == "uid0":
+        return uid0()
+    if mode == "forward-up":
+        return forward_up()
+    if mode == "forward-block":
+        return forward_block(sys.argv[2])
     if mode == "levels":
         return levels()
     prep()

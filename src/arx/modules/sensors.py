@@ -70,12 +70,12 @@ def _tail_new(path: str, name: str) -> tuple[list[str], bool]:
     tamaño menor: alguien vació el log — anti-forense clásico, ver lab L9).
     El primer barrido arranca al final y no re-emite la historia.
     """
+    cursors = config.read_json(_cursor_path())
+    cur = cursors.get(name)
     try:
         st = os.stat(path)
     except OSError:
         return [], False
-    cursors = config.read_json(_cursor_path())
-    cur = cursors.get(name)
     if cur is None:  # primera vez: arrancar al final, no re-emitir la historia
         cursors[name] = {"ino": st.st_ino, "off": st.st_size}
         config.write_json(_cursor_path(), cursors)
@@ -177,6 +177,9 @@ def collect_events() -> list[dict]:
 AUTH_LOGS = ["/var/log/auth.log", "/var/log/secure"]  # Debian/Ubuntu · RHEL/Fedora
 AUTH_FAIL_RE = re.compile(
     r"Failed password for (?:invalid user )?(\S+) from ([0-9a-fA-F.:]+)")
+# `who` solo ve sesiones con terminal: un `ssh -T`, un `scp` o un túnel no aparecen en él.
+AUTH_OK_RE = re.compile(
+    r"Accepted [\w/@.-]+ for (\S+) from ([0-9a-fA-F.:]+)")
 AUTH_WINDOW_S = 600     # 10 min de memoria
 AUTH_THRESHOLD = 6      # fallos desde una misma IP dentro de la ventana
 
@@ -193,6 +196,97 @@ def _prune(win: dict, now: float, ttl: int) -> dict:
     return {k: v for k, v in win.items() if now - v.get("t", 0) <= ttl}
 
 
+def login_finding(item: str) -> dict:
+    """Un acceso `cuenta@origen` que la base no conoce (mismo hallazgo venga de donde venga)."""
+    return {"sev": "high", "kind": "login_users", "detail": f"nuevo en login_users: {item}",
+            "why": "acceso de una cuenta u origen que la línea base no conoce",
+            "target": {"user": item}, "set": "login_users", "item": item}
+
+
+def accepted_logins(path: str | None = None, limit: int = 16 * 1024 * 1024) -> set[str]:
+    """`cuenta@origen` de los accesos aceptados en auth.log. Lo usa el aprendizaje: si solo
+    aprendiera de `who`, cada `ssh -T`, `scp` o Ansible legítimo saldría como acceso nuevo."""
+    path = path or next((p for p in AUTH_LOGS if os.path.exists(p)), None)
+    text = ""
+    if path:
+        try:
+            with open(path, "rb") as f:
+                f.seek(max(0, os.fstat(f.fileno()).st_size - limit))
+                text = f.read(limit).decode("utf-8", "replace")
+        except OSError:
+            pass
+    elif shutil.which("journalctl"):  # sin auth.log (Debian 12, instalación mínima)
+        text = recon._run(["journalctl", "--no-pager", "-q", "-o", "cat", "--since", "-30d",
+                           "_COMM=sshd", "_COMM=sshd-session"], timeout=30) or ""
+    return {f"{m.group(1)}@{m.group(2)}" for m in AUTH_OK_RE.finditer(text)}
+
+
+def detect_uid0_accounts(known=(), accounts: list | None = None) -> list[dict]:
+    """Toda cuenta con uid 0 distinta de root es root con otro nombre: una puerta trasera
+    clásica. No se aprende nunca sola: si ya estaba al instalar, también se avisa."""
+    if accounts is None:
+        import pwd
+
+        accounts = [(p.pw_name, p.pw_uid) for p in pwd.getpwall()]
+    return [{"sev": "crit", "kind": "uid0_account",
+             "detail": f"cuenta con uid 0 distinta de root: {name}",
+             "why": "tiene todos los poderes de root con otro nombre; la instala quien quiere "
+                    "volver a entrar sin que se note. Si es legítima, acéptala",
+             "target": {"user": name}, "set": "uid0_accounts", "item": name}
+            for name, uid in accounts if uid == 0 and name != "root" and name not in known]
+
+
+def _log_vanished(path: str | None) -> dict | None:
+    """El log que se venía leyendo ya no está. Un rotado crea otro al instante; que no haya
+    ninguno es que lo borraron. Se avisa una vez: el cursor se olvida para no repetirlo."""
+    if path is not None:
+        return None
+    cursors = config.read_json(_cursor_path())
+    if "authlog" not in cursors:
+        return None
+    del cursors["authlog"]
+    config.write_json(_cursor_path(), cursors)
+    return {"sev": "high", "kind": "log_tamper", "detail": "el log de autenticación desapareció",
+            "why": "borrar el log de autenticación es anti-forense: alguien borra huellas"}
+
+
+def _journal_sshd_lines() -> list[str] | None:
+    """Líneas nuevas de sshd según journald, o None si aquí no se puede.
+
+    Mejor que el fichero: `_COMM` lo pone el kernel, así que un `logger` de cualquier usuario no
+    las falsifica, y en Debian 12 o una instalación mínima no existe auth.log.
+
+    El cursor inicial se toma con el MISMO filtro: journalctl avanza dos pasos desde el cursor, y
+    si este no casa con el filtro se come la primera línea que sí casa (era justo el `Accepted`).
+    """
+    if not (shutil.which("journalctl") and os.path.exists("/run/systemd/journal/socket")):
+        return None
+    base = ["journalctl", "--no-pager", "-q", "-o", "cat"]
+    match = ["_COMM=sshd", "_COMM=sshd-session"]
+    cursor = config.state_dir() / "journal-sshd.cursor"
+    fresh = config.state_dir() / "journal-sshd.fresh"  # sshd aún no había escrito nada
+    try:
+        if not cursor.exists() and not fresh.exists():  # arrancar al final: sin re-emitir la historia
+            r = subprocess.run([*base, "-n", "1", "--show-cursor", *match],
+                               capture_output=True, text=True, errors="replace", timeout=15)
+            if r.returncode != 0 and (r.stderr or "").strip():
+                return None
+            m = re.search(r"^-- cursor: (.+)$", r.stdout or "", re.M)
+            fd = os.open(cursor if m else fresh, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
+                f.write(m.group(1) if m else "")
+            return []
+        r = subprocess.run([*base, f"--cursor-file={cursor}", *match],
+                           capture_output=True, text=True, errors="replace", timeout=15)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0 and (r.stderr or "").strip():
+        cursor.unlink(missing_ok=True)  # cursor inválido, journal rotado o systemd < 242
+        fresh.unlink(missing_ok=True)
+        return None
+    return (r.stdout or "").splitlines()
+
+
 def read_auth_log(now: float | None = None) -> list[dict]:
     """Ráfagas de fallos de autenticación (sshd) y truncado del log de autenticación.
 
@@ -201,11 +295,15 @@ def read_auth_log(now: float | None = None) -> list[dict]:
     bloquea la IP; la rotación de credenciales es Tier 2).
     """
     path = next((p for p in AUTH_LOGS if os.path.exists(p)), None)
-    if path is None:
-        return []
+    lines, tampered = _tail_new(path, "authlog") if path else ([], False)
+    vanished = _log_vanished(path)
+    journal = _journal_sshd_lines()
+    if journal is not None:
+        lines = journal  # el fichero sigue vigilándose solo para detectar que lo vacían
+    elif path is None:
+        return [vanished] if vanished else []
     now = now if now is not None else time.time()
-    lines, tampered = _tail_new(path, "authlog")
-    events: list[dict] = []
+    events: list[dict] = [vanished] if vanished else []
     if tampered:
         events.append({
             "sev": "high", "kind": "log_tamper",
@@ -214,6 +312,10 @@ def read_auth_log(now: float | None = None) -> list[dict]:
         })
     win = _prune(config.read_json(_window_path("auth"), {}), now, AUTH_WINDOW_S)
     for line in lines:
+        ok = AUTH_OK_RE.search(line)
+        if ok:
+            events.append(login_finding(f"{ok.group(1)}@{ok.group(2)}"))
+            continue
         m = AUTH_FAIL_RE.search(line)
         if not m:
             continue
@@ -354,8 +456,7 @@ def detect_reverse_shell(owners: list[dict] | None = None,
                 listen_ports.add(int(str(p.get("local", "")).rsplit(":", 1)[-1]))
             except (ValueError, IndexError):
                 continue
-    seen: set[tuple] = set()
-    events: list[dict] = []
+    channels: dict[tuple, list] = {}
     for c in owners:
         exe = c.get("exe")
         ip = c.get("remote_ip", "")
@@ -365,20 +466,19 @@ def detect_reverse_shell(owners: list[dict] | None = None,
             continue  # conexión ENTRANTE a un listener: no es un reverse shell saliente
         if exe.rsplit("/", 1)[-1] not in SHELL_EXES:
             continue
-        key = (exe, ip, c.get("remote_port"))
-        if key in seen:
-            continue
-        seen.add(key)
-        pid = c.get("pid")
+        # un canal, todos sus dueños: un hijo que hereda el socket también debe suspenderse
+        channels.setdefault((exe, ip, c.get("remote_port")), []).append(c.get("pid"))
+    events: list[dict] = []
+    for (exe, ip, port), pids in channels.items():
+        pids = sorted({p for p in pids if isinstance(p, int)})
         events.append({
             "sev": "crit", "kind": "reverse_shell",
-            "detail": f"shell con conexión saliente: {exe} → {ip}:{c.get('remote_port')}"
-                      f" (pid {pid})",
+            "detail": f"shell con conexión saliente: {exe} → {ip}:{port}"
+                      f" (pid {', '.join(map(str, pids)) or '?'})",
             "why": "un shell que posee un socket de red saliente es la firma del C2 "
                    "de un reverse shell: nadie legítimo lo hace",
-            "target": {"ip": ip, "port": c.get("remote_port"), "exe": exe,
-                       "pids": [pid] if isinstance(pid, int) else []},
+            "target": {"ip": ip, "port": port, "exe": exe, "pids": pids},
             # la huella no incluye el pid (cambia entre barridos); el canal C2 sí es estable
-            "fp_key": f"reverse_shell|{exe}|{ip}:{c.get('remote_port')}",
+            "fp_key": f"reverse_shell|{exe}|{ip}:{port}",
         })
     return events

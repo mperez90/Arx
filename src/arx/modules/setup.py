@@ -6,7 +6,8 @@ Configura, en orden:
   3) alcance y fuera-de-límites,
   4) ventana de baseline y presupuesto del motor LLM,
   5) licencia (core/pro/business),
-  6) alertas salientes (Telegram / webhook).
+  6) alertas salientes (Telegram / webhook),
+  7) respuesta automática (qué hacer con un escaneo; si el modelo puede bloquear cuentas).
 
 Escribe config.json + secrets.json (0600) en el dir de Arx. `arx setup --show`
 muestra la configuración actual con los secretos redactados.
@@ -53,6 +54,9 @@ def show() -> int:
     tg = "sí" if n.get("telegram_chat_id") and config.load_secrets().get("telegram_bot_token") else "no"
     print(f"  alertas        telegram {tg} · webhook {'sí' if n.get('webhook_url') else 'no'} "
           f"· desde sev {n.get('min_sev', 'high')}")
+    print(f"  ante escaneo   {cfg.get('ip_response', 'block')}")
+    print(f"  modelo bloquea {'no' if cfg.get('llm_identity_actions') is False else 'sí, con --enforce'}"
+          f" · desde {cfg.get('llm_lock_min_confidence', 70)}% de confianza")
     print(f"  licencia       {cfg.get('license_tier', 'core')}\n")
     return 0
 
@@ -91,7 +95,7 @@ def run(show_only: bool = False) -> int:
 
     print("\n3) Alcance")
     scope = _ask("   Qué defiende Arx", "todo el host")
-    oob = _ask("   Fuera de límites — puertos, rutas o procesos que NUNCA debe tocar, "
+    oob = _ask("   Fuera de límites — puertos, rutas, procesos o cuentas que NUNCA debe tocar, "
                "separados por coma (el puerto SSH ya está protegido)", cfg.get("out_of_bounds", "(ninguno)"))
 
     print("\n4) Aprendizaje y motor")
@@ -136,8 +140,20 @@ def run(show_only: bool = False) -> int:
     notify_cfg["webhook_url"] = _ask("   URL de webhook (Slack/Discord/n8n…)", notify_cfg.get("webhook_url"))
     notify_cfg["min_sev"] = _ask("   Avisar desde severidad (crit/high/med)", notify_cfg.get("min_sev", "high"))
 
+    print("\n7) Respuesta automática  (solo actúa con --enforce)")
+    ip_response = _ask("   Ante un escaneo: block (cortar la IP) o tarpit (estrangularla: útil si la IP "
+                       "puede ser compartida)", cfg.get("ip_response", "block")).lower()
+    llm_acts = True
+    if providers:
+        print("   Si el modelo confirma como amenaza un acceso desconocido, Arx puede bloquear esa cuenta "
+              "y\n   cerrar sus sesiones sin esperarte, y te avisa con todo el contexto. Nunca toca root,\n"
+              "   cuentas de sistema ni la última cuenta de administración.")
+        llm_acts = _ask("   ¿Permitirlo? (s/n)", "n" if cfg.get("llm_identity_actions") is False else "s").lower() != "n"
+
     cfg.update(
         {
+            "ip_response": ip_response if ip_response in ("block", "tarpit") else "block",
+            "llm_identity_actions": llm_acts,
             "providers": providers,
             "fallback_order": order,
             "auth_word": auth,

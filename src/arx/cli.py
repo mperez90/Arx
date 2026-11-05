@@ -92,6 +92,8 @@ def cmd_accept(args: argparse.Namespace) -> int:
         return 1
     response.forget(args.fp)
     response.record({"kind": "accepted", "detail": e.get("detail")})
+    if str(e["item"]).partition("@")[0] in {a["user"] for a in response.locked_accounts()}:
+        print("  ⚠ Esa cuenta sigue bloqueada: aceptar no la desbloquea. Usa:  arx unlock")
     print(f"✓ Aceptado como normal: {e['item']}  (reinicia el servicio para que guard lo recargue)")
     return 0
 
@@ -109,6 +111,32 @@ def cmd_notify(args: argparse.Namespace) -> int:
     return 0 if all(r == "ok" for r in res.values()) else 1
 
 
+def _status_data() -> dict:
+    """Lo mismo que `arx status`, para quien quiera construir algo encima (sin UI propia)."""
+    import subprocess
+
+    from arx import config, notify
+    from arx import license as lic
+    from arx.modules import baseline, canaries, response, service
+
+    cfg = config.load_config()
+    base = baseline.load()
+    tier, why = lic.effective_tier()
+    svc = None
+    if service._systemd_available():
+        svc = subprocess.run(["systemctl", "is-active", "arx"], capture_output=True, text=True).stdout.strip()
+    return {"version": __version__, "configured": bool(cfg), "license": {"tier": tier, "why": why},
+            "baseline": {"sealed": bool(base and base["meta"].get("sealed")),
+                         "samples": base["meta"].get("samples", 0) if base else 0},
+            "service": svc, "alerts": notify.channels(cfg),
+            "canaries": {"active": len(canaries._load().get("canaries", [])), "fired": len(canaries.check())},
+            "blocks": len(response._load_blocks()), "breaker_tripped": response.breaker_tripped(),
+            "findings": len(response.load_findings()),
+            "pending": [{"id": p["id"], "sev": p.get("sev"), "detail": p.get("detail")}
+                        for p in response.list_pending()],
+            "locked_accounts": response.locked_accounts(), "quarantine": len(response.list_quarantine())}
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     import json
     import subprocess
@@ -117,6 +145,9 @@ def cmd_status(args: argparse.Namespace) -> int:
     from arx import license as lic
     from arx.modules import baseline, canaries, response, service
 
+    if getattr(args, "json", False):
+        print(json.dumps(_status_data(), ensure_ascii=False, indent=1))
+        return 0
     cfg = config.load_config()
     print("\n▸ Arx — estado")
     print(f"  configurado    {'sí' if cfg else 'no  (arx setup)'}")
@@ -146,6 +177,9 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(f"  hallazgos      {len(response.load_findings())} conocidos  ·  aceptar cambios legítimos: arx accept")
     pend = response.list_pending()
     print(f"  Tier 2 pend.   {len(pend)}" + ("   ⚠ usa: arx authorize" if pend else ""))
+    locked = response.locked_accounts()
+    if locked:
+        print(f"  cuentas bloq.  {', '.join(a['user'] for a in locked)}   ⚠ decide tú: arx unlock")
     inc = config.state_dir() / "incidents.jsonl"
     try:
         lines = inc.read_text().splitlines()[-5:]
@@ -197,6 +231,81 @@ def cmd_authorize(args: argparse.Namespace) -> int:
     print(f"  Remediación: {item['remediation']}")
     print(f"  Ejecutado:   {item.get('executed', '—')}")
     return 0
+
+
+def cmd_unlock(args: argparse.Namespace) -> int:
+    import getpass
+
+    from arx import config
+    from arx.modules import response
+
+    locked = response.locked_accounts()
+    if args.user is None:
+        if not locked:
+            print("No hay cuentas bloqueadas por Arx.")
+            return 0
+        print("Cuentas bloqueadas por Arx (no se desbloquean solas):")
+        for a in locked:
+            print(f"  {a['user']}  desde {str(a['since'])[:16]} UTC  ·  {a['detail']}")
+        print("\nDesbloquea una con:  arx unlock <cuenta>")
+        return 0
+    if not any(a["user"] == args.user for a in locked):
+        print(f"Arx no tiene bloqueada la cuenta '{args.user}'.")
+        return 1
+    cfg = config.load_config()
+    if not cfg.get("auth_word"):
+        print("No hay palabra de autorización configurada. Ejecuta:  arx setup")
+        return 1
+    word = getpass.getpass("Palabra de autorización: ").strip()
+    if not config.verify_word(word, cfg.get("auth_word", {})):
+        print("Palabra incorrecta. La cuenta sigue bloqueada.")
+        return 1
+    done = response.unlock_account(args.user)
+    if done and done.startswith("no se pudo"):
+        print(f"⚠ {done}. La cuenta sigue bloqueada.")
+        return 1
+    print(f"✓ Cuenta '{args.user}' desbloqueada: {done}")
+    print("  Si es un acceso legítimo, para que no vuelva a avisar:  arx accept")
+    return 0
+
+
+def cmd_restore(args: argparse.Namespace) -> int:
+    import getpass
+
+    from arx import config
+    from arx.modules import response
+    from arx.redact import printable
+
+    items = response.list_quarantine()
+    if args.qid is None:
+        if not items:
+            print("La cuarentena está vacía.")
+            return 0
+        print("Ficheros en cuarentena (evidencia preservada, 0600, solo root):")
+        for q in items:
+            print(f"  {printable(q['id'])}\n      de {printable(q['origin'])}  ·  {str(q['at'])[:16]} UTC"
+                  f"  ·  sha256 {str(q['sha256'])[:16]}…")
+        print("\nDevuelve uno a su sitio con:  arx restore <id>")
+        return 0
+    if not any(q["id"] == args.qid for q in items):
+        print(f"No hay nada en cuarentena con id '{printable(args.qid)}'.")
+        return 1
+    cfg = config.load_config()
+    if not cfg.get("auth_word"):
+        print("No hay palabra de autorización configurada. Ejecuta:  arx setup")
+        return 1
+    word = getpass.getpass("Palabra de autorización: ").strip()
+    if not config.verify_word(word, cfg.get("auth_word", {})):
+        print("Palabra incorrecta. Sigue en cuarentena.")
+        return 1
+    done = response.restore_quarantined(args.qid)
+    print(("✓ " if done and done.startswith("restaurado") else "⚠ ") + str(done))
+    return 0 if done and done.startswith("restaurado") else 1
+
+
+def cmd_metrics(args: argparse.Namespace) -> int:
+    from arx.modules import metrics
+    return metrics.run(days=args.days, as_json=args.json)
 
 
 def cmd_fleet(args: argparse.Namespace) -> int:
@@ -300,9 +409,17 @@ def main(argv: list[str] | None = None) -> int:
     p_for = sub.add_parser("forensics", help="informe forense post-incidente (firmado)")
     p_for.add_argument("--since", help="solo incidentes desde esta marca ISO (UTC)")
     p_for.add_argument("--verify", help="verifica el sellado de un informe guardado")
-    sub.add_parser("status", help="estado general de Arx (un vistazo)")
+    p_st = sub.add_parser("status", help="estado general de Arx (un vistazo)")
+    p_st.add_argument("--json", action="store_true", help="en JSON, para scripts")
     p_auth = sub.add_parser("authorize", help="ver/aprobar acciones Tier 2 pendientes")
     p_auth.add_argument("pending_id", nargs="?", help="id a autorizar (sin id: lista los pendientes)")
+    p_unl = sub.add_parser("unlock", help="ver/desbloquear cuentas bloqueadas por Arx")
+    p_unl.add_argument("user", nargs="?", help="cuenta a desbloquear (sin cuenta: lista las bloqueadas)")
+    p_res = sub.add_parser("restore", help="ver/devolver a su sitio ficheros en cuarentena")
+    p_res.add_argument("qid", nargs="?", help="id del fichero (sin id: lista la cuarentena)")
+    p_met = sub.add_parser("metrics", help="cuánto ruido hace Arx en este host (falsos positivos)")
+    p_met.add_argument("--days", type=int, default=7, help="días a contar (por defecto 7)")
+    p_met.add_argument("--json", action="store_true", help="solo cifras, sin rutas ni nombres: se puede compartir")
     p_can = sub.add_parser("canaries", help="señuelos / honeytokens")
     csub = p_can.add_subparsers(dest="caction", required=True)
     p_cp = csub.add_parser("plant", help="plantar señuelos (por defecto: homes + /root)")
@@ -347,7 +464,8 @@ def main(argv: list[str] | None = None) -> int:
         _arsenal_cli.register(sub)
     args = p.parse_args(argv)
     handlers = {"setup": cmd_setup, "recon": cmd_recon, "learn": cmd_learn,
-                "guard": cmd_guard, "status": cmd_status, "authorize": cmd_authorize,
+                "guard": cmd_guard, "status": cmd_status, "authorize": cmd_authorize, "unlock": cmd_unlock,
+                "restore": cmd_restore, "metrics": cmd_metrics,
                 "canaries": cmd_canaries, "scan": cmd_scan, "forensics": cmd_forensics,
                 "service": cmd_service, "fleet": cmd_fleet, "license": cmd_license,
                 "accept": cmd_accept, "notify": cmd_notify}

@@ -33,7 +33,7 @@ from arx.redact import printable
 
 # Campos estables que entran en la cronología (orden canónico lo da _canonical).
 _TIMELINE_FIELDS = ("at", "kind", "sev", "detail", "tier", "status", "remediation",
-                    "result", "reverted", "revert")
+                    "result", "reverted", "revert", "decided_by", "verdict", "closed", "survivors")
 _SEV_RANK = {"crit": 0, "high": 1, "med": 2, "low": 3, "info": 4}
 
 
@@ -114,7 +114,9 @@ def _summary(timeline: list[dict], blocks: list, quarantine: list) -> dict:
     worst = min((s for s in by_sev), key=lambda s: _SEV_RANK.get(s, 9), default=None)
     # una acción es lo que se EJECUTÓ: un hallazgo Tier 1 en modo observar o un Tier 2
     # pendiente no han tocado nada, y un informe forense no puede decir lo contrario
-    acciones = [e for e in timeline if e.get("revert") or e.get("kind") == "tier2_executed"]
+    # lo decidido por el modelo no pasa por Tier 2: se cuenta aparte, sin duplicar lo del humano
+    acciones = [e for e in timeline if e.get("revert") or e.get("kind") == "tier2_executed"
+                or (e.get("kind") == "identity_contained" and e.get("verdict"))]
     return {
         "incidentes": len(timeline),
         "por_severidad": by_sev,
@@ -130,7 +132,7 @@ def _summary(timeline: list[dict], blocks: list, quarantine: list) -> dict:
 # ── informe + sellado ──────────────────────────────────────────────────────────
 def build_report(since: str | None = None) -> dict:
     timeline = _incidents(since)
-    blocks = [{"detalle": b.get("detail"), "expira": b.get("expires_at")}
+    blocks = [{"detalle": b.get("detail"), "expira": response._until(b)}
               for b in response._load_blocks()]
     pending = [{"id": p.get("id"), "detalle": p.get("detail"),
                 "remediacion": p.get("remediation")} for p in response.list_pending()]
@@ -213,7 +215,7 @@ def render(report: dict) -> None:
     if report["contencion_activa"]:
         print("\n▸ Contención aún activa")
         for b in report["contencion_activa"]:
-            print(f"  {printable(b['detalle'])}  (expira {b.get('expira', '?')[11:16]} UTC)")
+            print(f"  {printable(b['detalle'])}  ({b.get('expira', '?')})")
     ok, msg = verify(report)
     firma = report["firma"]
     print(f"\n▸ Sellado  cadena={firma['chain'][:16]}…  key_id={firma['key_id']}  → {msg}")

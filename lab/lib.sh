@@ -20,7 +20,7 @@ lab_up() {
     -v "$PWD":/src:ro ubuntu:22.04 bash -c '
       export DEBIAN_FRONTEND=noninteractive
       apt-get update -qq >/dev/null 2>&1
-      apt-get install -y -qq python3 nftables netcat-openbsd procps \
+      apt-get install -y -qq python3 nftables netcat-openbsd procps iproute2 \
         openssh-server rsyslog >/dev/null 2>&1
       ssh-keygen -A >/dev/null 2>&1
       mkdir -p /run/sshd /work/labcfg /work/labstate

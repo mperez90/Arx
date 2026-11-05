@@ -77,8 +77,52 @@ docker exec "$VIC" python3 /src/lab/driver.py release
 step "ficheros-trampa: el bucle de guardia no debe colgarse, morir ni soltar al dropper"
 docker exec "$VIC" python3 /src/lab/driver.py hostile || FAILED=1
 
-step "identidad: el bloqueo de cuenta detiene de verdad la llave SSH y se restaura"
+step "identidad: el bloqueo cierra sesiones y accesos, y solo una persona lo levanta"
 docker exec "$VIC" python3 /src/lab/driver.py identity || FAILED=1
+
+step "identidad con el modelo: un acceso real sin terminal, confirmado como amenaza"
+docker exec -d "$ATT" sshpass -p clave-bob ssh -o StrictHostKeyChecking=no bob@victim "sleep 900"
+sleep 3
+docker exec "$VIC" python3 /src/lab/driver.py identity-llm "$ATTACKER_IP" || FAILED=1
+if docker exec "$ATT" pgrep -f "ssh.*bob@victim" >/dev/null 2>&1; then
+  echo "[FAIL] el atacante conserva su sesión tras el bloqueo"; FAILED=1
+else
+  echo "[PASS] la sesión del atacante está cerrada, medido desde el atacante"
+fi
+# El bloqueo de la IP expira (una IP cambia de manos); el de la cuenta no.
+docker exec "$VIC" python3 /src/lab/driver.py release
+if docker exec "$ATT" sshpass -p clave-bob ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 bob@victim true 2>/dev/null; then
+  echo "[FAIL] sin bloqueo de IP, la contraseña robada vuelve a entrar"; FAILED=1
+else
+  echo "[PASS] expirada la IP, la contraseña robada sigue sin entrar"
+fi
+docker exec "$VIC" python3 /src/lab/driver.py identity-unlock || FAILED=1
+if docker exec "$ATT" sshpass -p clave-bob ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 bob@victim true 2>/dev/null; then
+  echo "[PASS] tras arx unlock la cuenta vuelve a entrar"
+else
+  echo "[FAIL] tras arx unlock la cuenta no entra"; FAILED=1
+fi
+
+step "línea falsificada: cualquier usuario escribe en auth.log; eso no basta para bloquear"
+docker exec "$VIC" python3 /src/lab/driver.py identity-forged || FAILED=1
+
+step "alias de root: alerta crítica y bloqueo que no afecta a root"
+docker exec "$VIC" python3 /src/lab/driver.py uid0 || FAILED=1
+
+step "contenedores del host: una IP bloqueada tampoco llega a un puerto publicado (FORWARD)"
+docker exec "$VIC" python3 /src/lab/driver.py forward-up
+if docker exec "$ATT" nc -z -w 3 victim 8088 2>/dev/null; then
+  echo "[PASS] sin bloqueo, el atacante llega al servicio publicado"
+else
+  echo "[FAIL] el servicio publicado no responde: la prueba no prueba nada"; FAILED=1
+fi
+docker exec "$VIC" python3 /src/lab/driver.py forward-block "$ATTACKER_IP" || FAILED=1
+if docker exec "$ATT" nc -z -w 3 victim 8088 2>/dev/null; then
+  echo "[FAIL] la IP bloqueada sigue entrando al contenedor"; FAILED=1
+else
+  echo "[PASS] la IP bloqueada ya no llega al contenedor"
+fi
+docker exec "$VIC" python3 /src/lab/driver.py release
 
 step "F6 sandbox estático (Core): ¿este fichero es malicioso? — sin ejecutar nada"
 docker exec "$VIC" python3 /src/lab/driver.py sandbox || FAILED=1
