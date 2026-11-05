@@ -1643,5 +1643,65 @@ class SandboxTests(unittest.TestCase):
         self.assertIs(self.s.enrich_finding(other), other)     # no es ejecutable
 
 
+class ForensicsTests(unittest.TestCase):
+    """F16 (Core) — informe forense sellado (cadena de hash + HMAC), tamper-evident."""
+
+    def setUp(self):
+        _isolate()
+        from arx.modules import forensics, response
+        self.f = forensics
+        self.r = response
+
+    def _seed(self):
+        self.r.record({"kind": "incident", "sev": "high", "tier": 1,
+                       "detail": "escaneo desde 203.0.113.7", "status": "bloqueada"})
+        self.r.record({"kind": "incident", "sev": "crit", "tier": 2,
+                       "detail": "cambió cron desde el sellado", "status": "PENDIENTE"})
+
+    def test_report_has_timeline_and_double_signature(self):
+        self._seed()
+        rep = self.f.build_report()
+        self.assertEqual(len(rep["cronologia"]), 2)
+        self.assertEqual(rep["resumen"]["severidad_maxima"], "crit")
+        firma = rep["firma"]
+        self.assertTrue(firma["chain"] and firma["hmac"] and firma["key_id"])
+        self.assertIn("chain", firma["algo"])
+
+    def test_verify_passes_untampered(self):
+        self._seed()
+        ok, msg = self.f.verify(self.f.build_report())
+        self.assertTrue(ok, msg)
+
+    def test_tamper_in_timeline_breaks_chain(self):
+        self._seed()
+        rep = self.f.build_report()
+        rep["cronologia"][0]["detail"] = "nada que ver aquí"  # borrar huellas
+        ok, msg = self.f.verify(rep)
+        self.assertFalse(ok)
+        self.assertIn("cadena", msg)
+
+    def test_tamper_outside_timeline_breaks_hmac(self):
+        self._seed()
+        rep = self.f.build_report()
+        rep["resumen"]["incidentes"] = 0  # maquillar el resumen deja la cadena intacta…
+        ok, msg = self.f.verify(rep)
+        self.assertFalse(ok)              # …pero rompe el HMAC
+        self.assertIn("HMAC", msg)
+
+    def test_wrong_key_id_is_rejected(self):
+        self._seed()
+        rep = self.f.build_report()
+        rep["firma"]["key_id"] = "deadbeefcafe"
+        ok, msg = self.f.verify(rep)
+        self.assertFalse(ok)
+        self.assertIn("otra clave", msg)
+
+    def test_since_filters_and_empty_is_signed(self):
+        rep = self.f.build_report(since="2999-01-01T00:00:00+00:00")  # futuro → vacío
+        self.assertEqual(rep["cronologia"], [])
+        ok, _ = self.f.verify(rep)           # un informe vacío también va sellado y verifica
+        self.assertTrue(ok)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -68,6 +68,9 @@ docker exec "$VIC" python3 /src/lab/driver.py net-tarpit "$ATTACKER_IP" || FAILE
 step "F6 sandbox estático (Core): ¿este fichero es malicioso? — sin ejecutar nada"
 docker exec "$VIC" python3 /src/lab/driver.py sandbox || FAILED=1
 
+step "F16 informe forense (Core): cronología sellada (cadena de hash + HMAC)"
+docker exec "$VIC" python3 /src/lab/driver.py forensics || FAILED=1
+
 echo
 if [ "$FAILED" = 0 ]; then
   echo "══ MINI-LAB COMPLETO: todos los niveles ejecutables superados ══"

@@ -10,6 +10,7 @@ Modos (los orquesta lab/docker-lab.sh con un contenedor atacante separado):
   net-revsh-verify <ip>  L6: el canal sigue muerto sin suspensión y la reversión lo revive
   net-tarpit <ip>   Tarpit (Core): estrangula la IP del escaneo en vez de bloquearla
   sandbox           F6 estático: distingue un fichero malicioso de uno benigno (sin ejecutar)
+  forensics         F16: informe forense sellado de los incidentes + detección de manipulación
   levels            L4, L5, L7, L8, L9 en la víctima + scoreboard
   all               prep + levels (modo clásico de contenedor único)
 
@@ -252,6 +253,26 @@ def sandbox_scan():
     return 0 if ok else 1
 
 
+def forensics_report():
+    """F16: tras los ataques del lab, Arx arma un informe forense SELLADO (cadena de hash
+    + HMAC) sobre los incidentes REALES acumulados, lo verifica, y una manipulación
+    posterior de la cronología rompe el sellado."""
+    from arx.modules import forensics
+    rep = forensics.build_report()
+    n = len(rep["cronologia"])
+    ok_intact, _ = forensics.verify(rep)
+    tampered = json.loads(json.dumps(rep))
+    broke = True
+    if tampered["cronologia"]:
+        tampered["cronologia"][0]["detail"] = "borrado por el intruso"
+        valid, _ = forensics.verify(tampered)
+        broke = not valid
+    ok = n > 0 and ok_intact and broke
+    print(f"[{'PASS' if ok else 'FAIL'}] F16 forense: {n} eventos en la cronología · "
+          f"sellado válido={ok_intact} · manipulación detectada={broke}")
+    return 0 if ok else 1
+
+
 def levels():
     canary_path = None
     from arx.modules import canaries
@@ -348,6 +369,8 @@ def main():
         return net_tarpit(sys.argv[2])
     if mode == "sandbox":
         return sandbox_scan()
+    if mode == "forensics":
+        return forensics_report()
     if mode == "levels":
         return levels()
     prep()
