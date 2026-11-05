@@ -19,7 +19,7 @@ secrets/
 # docs/: solo los de PRODUCTO van en el Core. Coordinación/negocio (Polar, hallazgos,
 # respuestas entre sesiones) queda FUERA — allowlist explícita.
 docs/*
-!docs/arquitectura.md
+!docs/architecture.md
 !docs/tiers.md
 !docs/assets/
 

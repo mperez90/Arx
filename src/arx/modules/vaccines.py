@@ -30,6 +30,7 @@ import urllib.request
 from datetime import datetime, timezone
 
 from arx import __version__, config, ed25519
+from arx.i18n import tr
 from arx.modules import recon, response, sandbox, sensors
 from arx.redact import printable
 
@@ -106,13 +107,13 @@ def _unsafe_regex(pattern: str) -> str | None:
     """Por qué esta regex podría colgar a Arx. Estas reglas corren en el bucle de guardia sobre
     ficheros que controla el atacante: solo cuantificadores acotados y nunca sobre un grupo."""
     if len(pattern) > 500:
-        return "demasiado larga"
+        return tr("too long")
     i, in_class, after_group = 0, False, False
     while i < len(pattern):
         c = pattern[i]
         if c == "\\":
             if pattern[i + 1:i + 2].isdigit():
-                return "referencia atrás"
+                return tr("backreference")
             i, after_group = i + 2, False
             continue
         if in_class:
@@ -124,28 +125,28 @@ def _unsafe_regex(pattern: str) -> str | None:
             i += 2 if pattern[i + 1:i + 2] in ("]", "^") else 1
             continue
         if c in "*+":
-            return "cuantificador sin límite"
+            return tr("unbounded quantifier")
         if c == "(" and pattern[i + 1:i + 2] == "?" and pattern[i + 2:i + 3] != ":":
-            return "construcción no permitida"
+            return tr("construct not allowed")
         if c == "{" and (m := _QUANT_RE.match(pattern, i)):
             if m.group(2) and not m.group(3):
-                return "cuantificador sin límite"
+                return tr("unbounded quantifier")
             if int(m.group(3) or m.group(1)) > 1024:
-                return "cuantificador demasiado grande"
+                return tr("quantifier too large")
             if after_group:
-                return "cuantificador sobre un grupo"
+                return tr("quantifier over a group")
             i, after_group = m.end(), False
             continue
         if c == "?" and after_group:
-            return "cuantificador sobre un grupo"
+            return tr("quantifier over a group")
         after_group = c == ")"
         i += 1
     if in_class:
-        return "clase sin cerrar"
+        return tr("unclosed class")
     try:
         re.compile(pattern)
     except re.error as e:
-        return f"no compila: {e}"
+        return tr("does not compile: {e}", e=e)
     return None
 
 
@@ -181,64 +182,66 @@ def _already_detected(sample: str) -> bool:
 def validate(v: dict, samples: list | None = None) -> tuple[str, str]:
     """(válida|insuficiente|hostil, razón). Nada de lo que dice la vacuna se ejecuta ni se obedece."""
     if not isinstance(v, dict) or not _ID_RE.fullmatch(str(v.get("id", ""))):
-        return "hostil", "sin identificador válido"
+        return "hostile", tr("no valid identifier")
     if type(v.get("version")) is not int or v["version"] < 1:
-        return "hostil", "sin versión válida"
+        return "hostile", tr("no valid version")
     if not isinstance(v.get("description"), str) or len(v["description"]) > 2000:
-        return "hostil", "descripción ausente o desmesurada"
+        return "hostile", tr("description missing or oversized")
     iocs = v.get("iocs") or {}
     rules = v.get("rules") or []
     if not isinstance(iocs, dict) or not isinstance(rules, list):
-        return "hostil", "estructura inesperada"
+        return "hostile", tr("unexpected structure")
     ips, hashes = iocs.get("ips") or [], iocs.get("sha256") or []
     if not isinstance(ips, list) or not isinstance(hashes, list):
-        return "hostil", "estructura inesperada"
+        return "hostile", tr("unexpected structure")
     if len(ips) > MAX_IPS or len(hashes) > MAX_HASHES or len(rules) > MAX_RULES:
-        return "hostil", "más indicadores de los que admite una vacuna"
+        return "hostile", tr("more indicators than a vaccine allows")
     if not (ips or hashes or rules):
-        return "insuficiente", "no aporta ningún indicador ni regla"
+        return "insufficient", tr("provides no indicator or rule")
     for ip in ips:
         try:
             net = ipaddress.ip_network(str(ip), strict=False)
         except ValueError:
-            return "hostil", f"IP inválida: {printable(ip)}"
+            return "hostile", tr("invalid IP: {ip}", ip=printable(ip))
         if not net.is_global:
-            return "hostil", f"apunta a una red que no es pública: {net}"
+            return "hostile", tr("points to a non-public network: {net}", net=net)
         if net.prefixlen < (16 if net.version == 4 else 32):
-            return "hostil", f"red demasiado amplia: {net}"
+            return "hostile", tr("network too broad: {net}", net=net)
     if not all(isinstance(h, str) and _SHA_RE.fullmatch(h) for h in hashes):
-        return "hostil", "sha256 inválido"
+        return "hostile", tr("invalid sha256")
     seen_new = False
     for rule in rules:
         if not (isinstance(rule, dict) and _ID_RE.fullmatch(str(rule.get("id", "")))
-                and rule.get("verdict") in ("sospechoso", "malicioso") and isinstance(rule.get("regex"), str)):
-            return "hostil", "regla mal formada"
+                and rule.get("verdict") in ("suspicious", "malicious") and isinstance(rule.get("regex"), str)):
+            return "hostile", tr("malformed rule")
         problem = _unsafe_regex(rule["regex"])
         if problem:
-            return "hostil", f"regla {rule['id']}: {problem}"
+            return "hostile", tr("rule {id}: {problem}", id=rule['id'], problem=problem)
         good, bad = rule.get("must_match"), rule.get("must_not_match")
         if not (isinstance(good, list) and good and isinstance(bad, list) and bad
                 and all(isinstance(s, str) and len(s) <= MAX_SAMPLE for s in good + bad)):
-            return "insuficiente", f"regla {rule['id']}: sin prueba (faltan muestras y negativos)"
+            return "insufficient", tr("rule {id}: no proof (samples and negatives are missing)",
+                                      id=rule['id'])
         pattern = re.compile(rule["regex"])
         if not all(pattern.search(s) for s in good):
-            return "insuficiente", f"regla {rule['id']}: no detecta sus propias muestras"
+            return "insufficient", tr("rule {id}: does not detect its own samples", id=rule['id'])
         if any(pattern.search(s) for s in bad):
-            return "insuficiente", f"regla {rule['id']}: dispara con sus negativos"
+            return "insufficient", tr("rule {id}: fires on its negatives", id=rule['id'])
         seen_new = seen_new or not all(_already_detected(s) for s in good)
     if rules and not seen_new and not (ips or hashes):
-        return "insuficiente", "no aporta nada: lo que prueba ya se detectaba sin ella"
+        return "insufficient", tr("adds nothing: what it proves was already detected without it")
     if samples is None and (rules or hashes):
         samples = _host_samples()
     known = {sha for _, _, sha in samples or []}
     if known.intersection(hashes):
-        return "hostil", "marca como malicioso un binario de este host"
+        return "hostile", tr("flags a binary on this host as malicious")
     for rule in rules:
         pattern = re.compile(rule["regex"])
         for path, data, _ in samples or []:
             if pattern.search(data.decode("latin-1")):
-                return "insuficiente", f"regla {rule['id']}: casa con {printable(path)} de este host"
-    return "válida", "superó la validación local"
+                return "insufficient", tr("rule {id}: matches {path} on this host",
+                                          id=rule['id'], path=printable(path))
+    return "valid", tr("passed local validation")
 
 
 def _host_bucket(vid: str) -> int:
@@ -256,7 +259,7 @@ def _fetch(url: str, timeout: int = 15) -> bytes:
     with urllib.request.urlopen(req, timeout=timeout) as r:  # noqa: S310 (la firma es lo que manda)
         data = r.read(MAX_FEED_BYTES + 1)
     if len(data) > MAX_FEED_BYTES:
-        raise ValueError("paquete de vacunas demasiado grande")
+        raise ValueError(tr("vaccine package too large"))
     return data
 
 
@@ -266,9 +269,10 @@ def update(fetch=_fetch, pubkey: str | None = None, cfg: dict | None = None, now
     now = now or _now()
     key = ASL_PUBKEY if pubkey is None else pubkey
     if cfg.get("vaccines_enabled") is False:
-        return {"ok": False, "reason": "desactivadas en la configuración (vaccines_enabled)"}
+        return {"ok": False, "reason": tr("disabled in the configuration (vaccines_enabled)")}
     if not key:
-        return {"ok": False, "reason": "el canal aún no está abierto: falta la clave de ASL"}
+        return {"ok": False, "unavailable": True,
+                "reason": tr("the channel is not open yet: the ASL key is missing")}
     with config.locked("vaccines"):
         st = _load()
         st["last_check"] = _iso(now)
@@ -276,28 +280,33 @@ def update(fetch=_fetch, pubkey: str | None = None, cfg: dict | None = None, now
     try:
         raw = fetch(cfg.get("vaccine_feed_url") or FEED_URL)
     except (urllib.error.URLError, OSError, ValueError, TimeoutError) as e:
-        return {"ok": False, "reason": f"sin canal ahora mismo ({type(e).__name__}); la defensa sigue igual"}
+        return {"ok": False, "unavailable": True, "reason": tr("no channel right now ({name}); defense carries on the "
+                                          "same", name=type(e).__name__)}
     feed = open_feed(raw, key)
     if feed is None:
         response.record({"kind": "vaccine_rejected", "sev": "high",
-                         "detail": "paquete de vacunas con firma no válida: descartado sin abrir"})
-        return {"ok": False, "reason": "firma no válida: descartado sin abrir"}
+                         "detail": tr("vaccine package with an invalid signature: discarded "
+                                      "unopened")})
+        return {"ok": False, "reason": tr("invalid signature: discarded unopened")}
     with config.locked("vaccines"):
         st = _load()
         serial = feed.get("serial")
         if type(serial) is not int:
-            return {"ok": False, "reason": "paquete sin serial válido"}
+            return {"ok": False, "reason": tr("package without a valid serial")}
         if serial < st.get("serial", 0):
             response.record({"kind": "vaccine_rejected", "sev": "high",
-                             "detail": f"paquete antiguo (serial {serial} < {st.get('serial')}): posible repetición"})
-            return {"ok": False, "reason": "paquete más antiguo que el aplicado: posible ataque de repetición"}
+                             "detail": tr("old package (serial {serial} < {serial2}): possible "
+                                          "replay", serial=serial, serial2=st.get('serial'))})
+            return {"ok": False, "reason": tr("package older than the one applied: possible replay "
+                                              "attack")}
         applied, disabled = st.setdefault("applied", {}), st.setdefault("disabled", {})
         rejected = st.setdefault("rejected", {})
         out = {"ok": True, "serial": serial, "applied": [], "rejected": [], "revoked": [], "waiting": []}
         for vid in feed.get("revoked") or []:
             if isinstance(vid, str) and applied.pop(vid, None) is not None:
                 out["revoked"].append(vid)
-                response.record({"kind": "vaccine_revoked", "detail": f"vacuna {printable(vid)} retirada por ASL"})
+                response.record({"kind": "vaccine_revoked", "detail": tr("vaccine {vid} withdrawn by ASL",
+                                                                         vid=printable(vid))})
         samples = None
         vaccines = feed.get("vaccines") if isinstance(feed.get("vaccines"), list) else []
         for v in vaccines:
@@ -315,18 +324,21 @@ def update(fetch=_fetch, pubkey: str | None = None, cfg: dict | None = None, now
             if samples is None:
                 samples = _host_samples()
             status, why = validate(v, samples)
-            if status != "válida":
+            if status != "valid":
                 rejected[printable(vid) or "?"] = {"status": status, "reason": why, "at": _iso(now)}
                 out["rejected"].append({"id": printable(vid), "status": status, "reason": why})
-                response.record({"kind": "vaccine_rejected", "sev": "high" if status == "hostil" else "low",
-                                 "detail": f"vacuna {printable(vid)} {status} en este host", "result": why})
+                response.record({"kind": "vaccine_rejected", "sev": "high" if status == "hostile" else "low",
+                                 "detail": tr("vaccine {vid} {status} on this host",
+                                              vid=printable(vid), status=status), "result": why})
                 continue
             applied[vid] = {"version": v["version"], "description": v["description"], "attack": v.get("attack") or [],
                             "iocs": v.get("iocs") or {}, "rules": v.get("rules") or [], "expires": v.get("expires"),
                             "applied_at": _iso(now)}
             rejected.pop(vid, None)
             out["applied"].append(vid)
-            response.record({"kind": "vaccine_applied", "detail": f"vacuna {vid} v{v['version']} validada y aplicada"})
+            response.record({"kind": "vaccine_applied", "detail": tr("vaccine {vid} v{version} validated "
+                                                                     "and applied",
+                                                                     vid=vid, version=v['version'])})
         st["serial"], st["issued"] = serial, feed.get("issued")
         _save(st)
     _reset_index()
@@ -338,7 +350,8 @@ def update_safely() -> None:
     try:
         update()
     except Exception as e:
-        response.record({"kind": "vaccine_error", "detail": f"actualización de vacunas fallida ({type(e).__name__})"})
+        response.record({"kind": "vaccine_error", "detail": tr("vaccine update failed ({name})",
+                                                               name=type(e).__name__)})
 
 
 def due(now: datetime | None = None) -> bool:
@@ -400,12 +413,12 @@ def static_hits(text: str, sha256: str) -> list[dict]:
     hits = []
     if sha256 in active["sha"]:
         vid = active["sha"][sha256]
-        hits.append({"rule": f"vacuna-{vid}", "sev": "malicioso", "vaccine": vid,
-                     "why": f"su sha256 es el de una muestra conocida (vacuna {vid})"})
+        hits.append({"rule": f"vaccine-{vid}", "sev": "malicious", "vaccine": vid,
+                     "why": tr("its sha256 is that of a known sample (vaccine {vid})", vid=vid)})
     for pattern, rule, vid in active["rules"]:
         if pattern.search(text):
-            hits.append({"rule": f"vacuna-{vid}-{rule['id']}", "sev": rule["verdict"], "vaccine": vid,
-                         "why": f"regla de la vacuna {vid}: {printable(rule['id'])}"})
+            hits.append({"rule": f"vaccine-{vid}-{rule['id']}", "sev": rule["verdict"], "vaccine": vid,
+                         "why": tr("rule of vaccine {vid}: {v}", vid=vid, v=printable(rule['id']))})
     return hits
 
 
@@ -421,8 +434,9 @@ def findings(known=()) -> list[dict]:
     for ip in sorted(i for i in seen if i and i not in own and i not in known):
         vid = _vaccine_for_ip(ip, active)
         if vid:
-            out.append({"sev": "high", "kind": "intel_ip", "detail": f"IP señalada por la vacuna {vid}: {ip}",
-                        "why": "otro Arx la vio atacar y ASL lo revisó", "target": {"ip": ip},
+            out.append({"sev": "high", "kind": "intel_ip", "detail": tr("IP flagged by vaccine {vid}: {ip}",
+                                                                        vid=vid, ip=ip),
+                        "why": tr("another Arx saw it attack and ASL reviewed it"), "target": {"ip": ip},
                         "set": "intel_allow", "item": ip, "vaccine": vid, "fp_key": f"intel_ip|{ip}"})
     return out
 
@@ -439,13 +453,15 @@ def note_false_positive(vid: str | None) -> bool:
         applied[vid]["false_positives"] = applied[vid].get("false_positives", 0) + 1
         gone = applied[vid]["false_positives"] >= FP_ROLLBACK
         if gone:
-            st.setdefault("disabled", {})[vid] = {"at": _iso(_now()), "reason": f"desmentida {FP_ROLLBACK} veces"}
+            st.setdefault("disabled", {})[vid] = {"at": _iso(_now()), "reason": tr("refuted {FP_ROLLBACK} times",
+                                                                                   FP_ROLLBACK=FP_ROLLBACK)}
             del applied[vid]
         _save(st)
     _reset_index()
     if gone:
         response.record({"kind": "vaccine_rolled_back", "sev": "high",
-                         "detail": f"vacuna {vid} retirada: el operador la desmintió {FP_ROLLBACK} veces"})
+                         "detail": tr("vaccine {vid} removed: the operator refuted it "
+                                      "{FP_ROLLBACK} times", vid=vid, FP_ROLLBACK=FP_ROLLBACK)})
     return gone
 
 
@@ -455,10 +471,11 @@ def remove(vid: str) -> bool:
         if vid not in (st.get("applied") or {}):
             return False
         del st["applied"][vid]
-        st.setdefault("disabled", {})[vid] = {"at": _iso(_now()), "reason": "retirada por el operador"}
+        st.setdefault("disabled", {})[vid] = {"at": _iso(_now()), "reason": tr("removed by the operator")}
         _save(st)
     _reset_index()
-    response.record({"kind": "vaccine_removed", "detail": f"vacuna {vid} retirada por el operador"})
+    response.record({"kind": "vaccine_removed", "detail": tr("vaccine {vid} removed by the operator",
+                                                             vid=vid)})
     return True
 
 
@@ -467,35 +484,42 @@ def run(action: str = "list", vid: str | None = None) -> int:
     if action == "update":
         r = update()
         if not r.get("ok"):
-            print(f"Sin cambios: {r.get('reason')}")
-            return 0 if "falta la clave" in str(r.get("reason")) or "sin canal" in str(r.get("reason")) else 1
-        print(f"✓ Paquete {r['serial']}: {len(r['applied'])} aplicadas · {len(r['rejected'])} rechazadas · "
-              f"{len(r['revoked'])} retiradas · {len(r['waiting'])} en espera")
+            print(tr("No changes: {reason}", reason=r.get('reason')))
+            # sin canal no es un fallo: la defensa local no depende de él
+            return 0 if r.get("unavailable") else 1
+        print(tr("✓ Package {serial}: {n} applied · {n2} rejected · {n3} removed · {n4} waiting",
+                 serial=r['serial'], n=len(r['applied']), n2=len(r['rejected']), n3=len(r['revoked']),
+                 n4=len(r['waiting'])))
         for x in r["rejected"]:
             print(f"  ✗ {x['id']}: {x['status']} — {x['reason']}")
         return 0
     if action == "remove":
         if remove(str(vid)):
-            print(f"✓ Vacuna {vid} retirada. No volverá a aplicarse sola.")
+            print(tr("✓ Vaccine {vid} removed. It will not apply again on its own.", vid=vid))
             return 0
-        print(f"No hay ninguna vacuna aplicada con id '{printable(vid)}'.")
+        print(tr("No applied vaccine with id '{vid}'.", vid=printable(vid)))
         return 1
     st = _load()
     applied = st.get("applied") or {}
-    print("\n▸ Arx — vacunas")
+    print(tr("\n▸ Arx: vaccines"))
     if not ASL_PUBKEY and not applied:
-        print("  El canal aún no está abierto: falta la clave pública de ASL. La defensa local no depende de él.\n")
+        print(tr("  The channel is not open yet: the ASL public key is missing. Local defense does "
+                 "not depend on it.\n"))
         return 0
-    print(f"  paquete        {st.get('serial', '—')}  ·  emitido {str(st.get('issued') or '—')[:16]}"
-          f"  ·  última comprobación {str(st.get('last_check') or '—')[:16]}")
-    print(f"  aplicadas      {len(applied)}")
+    print(tr("  package        {serial}  ·  issued {v}  ·  last check {v2}",
+             serial=st.get('serial', '—'), v=str(st.get('issued') or '—')[:16],
+             v2=str(st.get('last_check') or '—')[:16]))
+    print(tr("  applied        {n}", n=len(applied)))
     for k, v in applied.items():
         iocs = v.get("iocs") or {}
-        print(f"    {k} v{v.get('version')}: {len(iocs.get('ips') or [])} IPs · {len(iocs.get('sha256') or [])} hashes · "
-              f"{len(v.get('rules') or [])} reglas · {printable(v.get('description', ''))[:60]}")
+        print(tr("    {k} v{version}: {n} IPs · {n2} hashes · {n3} rules · {v}",
+                 k=k, version=v.get('version'), n=len(iocs.get('ips') or []),
+                 n2=len(iocs.get('sha256') or []), n3=len(v.get('rules') or []),
+                 v=printable(v.get('description', ''))[:60]))
     for k, v in (st.get("rejected") or {}).items():
-        print(f"  rechazada      {k}: {v.get('status')} — {v.get('reason')}")
+        print(tr("  rejected       {k}: {status}: {reason}",
+                 k=k, status=v.get('status'), reason=v.get('reason')))
     for k, v in (st.get("disabled") or {}).items():
-        print(f"  retirada       {k}: {v.get('reason')}")
+        print(tr("  removed        {k}: {reason}", k=k, reason=v.get('reason')))
     print()
     return 0

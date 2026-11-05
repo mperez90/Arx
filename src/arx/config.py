@@ -20,6 +20,8 @@ import os
 import secrets
 from pathlib import Path
 
+from arx.i18n import tr
+
 try:
     import fcntl
 except ImportError:  # no-POSIX: sin bloqueo entre procesos (Arx apunta a Linux/macOS)
@@ -39,8 +41,8 @@ def _first_writable(candidates: list[Path], private: bool) -> Path:
         except OSError:
             continue
     # Nunca caer al directorio actual: ahí acabarían secretos en sitios imprevisibles.
-    raise SystemExit("Arx no encuentra un directorio escribible para su estado "
-                     f"({', '.join(map(str, candidates))}). Usa ARX_CONFIG_DIR / ARX_STATE_DIR.")
+    raise SystemExit(tr("Arx cannot find a writable directory for its state ({v}). Use "
+                        "ARX_CONFIG_DIR / ARX_STATE_DIR.", v=', '.join(map(str, candidates))))
 
 
 def config_dir() -> Path:

@@ -3,10 +3,10 @@
 Tras repeler un ataque, Arx arma un informe DETALLADO de lo que pasó, reuniendo lo que ya
 registró (nada se inventa) y sellándolo para detectar cambios posteriores:
 
-  · cronología de incidentes (incidents.jsonl): qué detectó, cuándo, qué hizo y su nivel;
+  · cronología de incidents (incidents.jsonl): qué detectó, cuándo, qué hizo y su nivel;
   · contención activa (bloqueos Tier 1) y acciones Tier 2 pendientes;
   · evidencia preservada en cuarentena (vault): ficheros hostiles movidos, con su hash;
-  · contexto del host (último recon) y un resumen ejecutivo.
+  · contexto del host (último recon) y un summary ejecutivo.
 
 Sellado (stdlib puro, sin dependencias):
   · CADENA DE HASH sobre la cronología: detecta una corrupción o un cambio torpe. Sola no
@@ -30,6 +30,7 @@ import secrets
 from datetime import datetime, timezone
 
 from arx import config
+from arx.i18n import tr
 from arx.modules import fleet, recon, response
 from arx.redact import printable
 
@@ -97,7 +98,7 @@ def _quarantined() -> list[dict]:
     out = []
     for meta in manifest.values():
         if meta.get("quarantined_from"):
-            out.append({"origen": meta["quarantined_from"], "sha256": meta.get("sha256"),
+            out.append({"origin": meta["quarantined_from"], "sha256": meta.get("sha256"),
                         "at": meta.get("at")})
     return sorted(out, key=lambda x: str(x.get("at")))
 
@@ -123,14 +124,14 @@ def _summary(timeline: list[dict], blocks: list, quarantine: list) -> dict:
     acciones = [e for e in timeline if e.get("revert") or e.get("kind") == "tier2_executed"
                 or (e.get("kind") == "identity_contained" and e.get("verdict"))]
     return {
-        "incidentes": len(timeline),
-        "por_severidad": by_sev,
-        "severidad_maxima": worst,
-        "acciones_tomadas": len(acciones),
-        "contencion_activa": len(blocks),
-        "evidencia_en_cuarentena": len(quarantine),
-        "ventana": {"desde": timeline[0]["at"] if timeline else None,
-                    "hasta": timeline[-1]["at"] if timeline else None},
+        "incidents": len(timeline),
+        "by_severity": by_sev,
+        "max_severity": worst,
+        "actions_taken": len(acciones),
+        "active_containment": len(blocks),
+        "quarantined_evidence": len(quarantine),
+        "window": {"since": timeline[0]["at"] if timeline else None,
+                    "until": timeline[-1]["at"] if timeline else None},
     }
 
 
@@ -165,93 +166,102 @@ def print_indicators(since: str | None = None) -> int:
 # ── informe + sellado ──────────────────────────────────────────────────────────
 def build_report(since: str | None = None) -> dict:
     timeline = _incidents(since)
-    blocks = [{"detalle": b.get("detail"), "expira": response._until(b)}
+    blocks = [{"detail": b.get("detail"), "expires": response._until(b)}
               for b in response._load_blocks()]
-    pending = [{"id": p.get("id"), "detalle": p.get("detail"),
-                "remediacion": p.get("remediation")} for p in response.list_pending()]
+    pending = [{"id": p.get("id"), "detail": p.get("detail"),
+                "remediation": p.get("remediation")} for p in response.list_pending()]
     quarantine = _quarantined()
     report = {
-        "meta": {"arx_forensics": 1, "id": secrets.token_hex(6), "generado": _now(),
-                 "desde": since},
+        "meta": {"arx_forensics": 2, "id": secrets.token_hex(6), "generated": _now(),
+                 "since": since},
         "host": _host(),
-        "cronologia": timeline,
-        "contencion_activa": blocks,
-        "pendientes_tier2": pending,
-        "evidencia_en_cuarentena": quarantine,
-        "resumen": _summary(timeline, blocks, quarantine),
+        "timeline": timeline,
+        "active_containment": blocks,
+        "pending_tier2": pending,
+        "quarantined_evidence": quarantine,
+        "summary": _summary(timeline, blocks, quarantine),
     }
     report = fleet._scrub_deep(report)  # un informe se comparte: sin secretos conocidos
-    timeline = report["cronologia"]
+    timeline = report["timeline"]
     # sellado doble: cadena de hash de la cronología + HMAC del informe entero
     chain = _chain(timeline)
     key, key_id = _hmac_key()
     body = {k: v for k, v in report.items()} | {"chain": chain}
     mac = hmac.new(key, _canonical(body), hashlib.sha256).hexdigest()
-    report["firma"] = {"algo": "sha256-chain + hmac-sha256", "key_id": key_id,
+    report["seal"] = {"algo": "sha256-chain + hmac-sha256", "key_id": key_id,
                        "chain": chain, "hmac": mac}
     return report
 
 
 def verify(report: dict) -> tuple[bool, str]:
-    """Recomputa cadena y HMAC: detecta cualquier alteración posterior del informe."""
-    firma, timeline = report.get("firma"), report.get("cronologia", [])
-    if not (isinstance(firma, dict) and isinstance(timeline, list)
-            and isinstance(firma.get("hmac"), str)):
-        return False, "informe mal formado: falta el sello o no tiene la estructura esperada"
-    if _chain(timeline) != firma.get("chain"):
-        return False, "la cadena de hash no cuadra: la cronología fue alterada"
+    """Recomputa cadena y HMAC: detecta cualquier alteración posterior del informe.
+
+    Los informes de versiones anteriores llevan las claves en español y siguen verificándose. Se
+    elige una sola forma: añadirle a un informe nuevo una clave vieja también rompe el HMAC."""
+    seal_key, timeline_key = ("seal", "timeline") if "seal" in report else ("firma", "cronologia")
+    seal, timeline = report.get(seal_key), report.get(timeline_key, [])
+    if not (isinstance(seal, dict) and isinstance(timeline, list)
+            and isinstance(seal.get("hmac"), str)):
+        return False, tr("malformed report: the seal is missing or it lacks the expected structure")
+    if _chain(timeline) != seal.get("chain"):
+        return False, tr("the hash chain does not match: the timeline was altered")
     local = _hmac_key(create=False)  # verificar no debe crear una clave como efecto lateral
     if local is None:
-        return False, "este host no tiene la clave de sellado: no se puede verificar aquí"
+        return False, tr("this host does not have the sealing key: it cannot be verified here")
     key, key_id = local
-    if firma.get("key_id") != key_id:
-        return False, "firmado con otra clave (otro host o clave rotada)"
-    body = {k: v for k, v in report.items() if k != "firma"} | {"chain": firma["chain"]}
+    if seal.get("key_id") != key_id:
+        return False, tr("signed with another key (another host or a rotated key)")
+    body = {k: v for k, v in report.items() if k != seal_key} | {"chain": seal["chain"]}
     expect = hmac.new(key, _canonical(body), hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(expect.encode(), firma["hmac"].encode("utf-8", "replace")):
-        return False, "el HMAC no cuadra: el informe fue alterado o re-firmado sin la clave"
-    return True, "cadena íntegra y HMAC válido"
+    if not hmac.compare_digest(expect.encode(), seal["hmac"].encode("utf-8", "replace")):
+        return False, tr("the HMAC does not match: the report was altered or re-signed without the key")
+    return True, tr("chain intact and HMAC valid")
 
 
 def save_report(report: dict) -> "object":
     d = config.state_dir() / "forensics"
     d.mkdir(parents=True, exist_ok=True)
-    dest = d / f"forense-{report['meta']['id']}.json"
+    dest = d / f"forensic-{report['meta']['id']}.json"
     config.write_json(dest, report)
     return dest
 
 
 # ── salida de consola ──────────────────────────────────────────────────────────
 def render(report: dict) -> None:
-    r = report["resumen"]
-    print(f"\n══ Informe forense {report['meta']['id']} · {report['meta']['generado']} ══")
+    r = report["summary"]
+    print(tr("\n══ Forensic report {id} · {generated} ══",
+             id=report['meta']['id'], generated=report['meta']['generated']))
     host = report.get("host") or {}
     if host.get("host"):
         print(f"Host: {host.get('host')} · {host.get('distro') or ''}")
-    print(f"Incidentes: {r['incidentes']} · severidad máx: {r['severidad_maxima'] or '—'} · "
-          f"acciones: {r['acciones_tomadas']} · cuarentena: {r['evidencia_en_cuarentena']}")
-    if r["ventana"]["desde"]:
-        print(f"Ventana: {r['ventana']['desde']} → {r['ventana']['hasta']}")
-    print("\n▸ Cronología")
-    for e in report["cronologia"]:
+    print(tr("Incidents: {incidents} · max severity: {v} · actions: {actions_taken} · "
+             "quarantine: {quarantined_evidence}",
+             incidents=r['incidents'], v=r['max_severity'] or '—', actions_taken=r['actions_taken'],
+             quarantined_evidence=r['quarantined_evidence']))
+    if r["window"]["since"]:
+        print(tr("Window: {since} → {until}",
+                 since=r['window']['since'], until=r['window']['until']))
+    print(tr("\n▸ Timeline"))
+    for e in report["timeline"]:
         tier = f"T{e['tier']}" if e.get("tier") is not None else "  "
         print(f"  {e.get('at', '?')[11:19]} [{e.get('sev', '?'):>4}] {tier} "
               f"{printable(e.get('detail', ''))[:80]}")
         if e.get("status"):
             print(f"              → {printable(e['status'])[:88]}")
-    if not report["cronologia"]:
-        print("  (sin incidentes registrados en la ventana)")
-    if report["evidencia_en_cuarentena"]:
-        print("\n▸ Evidencia preservada (cuarentena)")
-        for q in report["evidencia_en_cuarentena"]:
-            print(f"  {printable(q['origen'])}  sha256={str(q['sha256'])[:16]}…")
-    if report["contencion_activa"]:
-        print("\n▸ Contención aún activa")
-        for b in report["contencion_activa"]:
-            print(f"  {printable(b['detalle'])}  ({b.get('expira', '?')})")
+    if not report["timeline"]:
+        print(tr("  (no incidents recorded in the window)"))
+    if report["quarantined_evidence"]:
+        print(tr("\n▸ Preserved evidence (quarantine)"))
+        for q in report["quarantined_evidence"]:
+            print(f"  {printable(q['origin'])}  sha256={str(q['sha256'])[:16]}…")
+    if report["active_containment"]:
+        print(tr("\n▸ Containment still active"))
+        for b in report["active_containment"]:
+            print(f"  {printable(b['detail'])}  ({b.get('expires', '?')})")
     ok, msg = verify(report)
-    firma = report["firma"]
-    print(f"\n▸ Sellado  cadena={firma['chain'][:16]}…  key_id={firma['key_id']}  → {msg}")
+    seal = report["seal"]
+    print(tr("\n▸ Seal  chain={v}…  key_id={key_id}  → {msg}",
+             v=seal['chain'][:16], key_id=seal['key_id'], msg=msg))
     print()
 
 
@@ -259,7 +269,7 @@ def run(verify_path: str | None = None, since: str | None = None) -> int:
     if verify_path:
         report = config.read_json(verify_path, None)
         if not isinstance(report, dict):
-            print(f"No pude leer un informe en {verify_path}")
+            print(tr("Could not read a report at {verify_path}", verify_path=verify_path))
             return 1
         ok, msg = verify(report)
         print(("✓ " if ok else "✗ ") + msg)
@@ -267,5 +277,6 @@ def run(verify_path: str | None = None, since: str | None = None) -> int:
     report = build_report(since=since)
     render(report)
     dest = save_report(report)
-    print(f"▸ Informe guardado en: {dest}  (verifícalo con: arx forensics --verify {dest})\n")
+    print(tr("▸ Report saved to: {dest}  (verify it with: arx forensics --verify {dest})\n",
+             dest=dest))
     return 0

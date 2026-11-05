@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 
 from arx import __version__, config, redact
 from arx import license as lic
+from arx.i18n import tr
 
 
 def _path():
@@ -69,7 +70,7 @@ def status_summary() -> dict:
 
 def enroll(console_url: str, token: str, post=_post) -> dict:
     if not enabled():
-        return {"ok": False, "reason": "la flota requiere licencia Business"}
+        return {"ok": False, "reason": tr("the fleet requires a Business license")}
     console_url = console_url.rstrip("/")
     try:
         resp = post(
@@ -78,10 +79,10 @@ def enroll(console_url: str, token: str, post=_post) -> dict:
             {"hostname": socket.gethostname()},
         )
     except (urllib.error.URLError, TimeoutError, OSError) as e:
-        return {"ok": False, "reason": f"no se pudo contactar la consola: {e}"}
+        return {"ok": False, "reason": tr("could not reach the console: {e}", e=e)}
     agent_id = resp.get("agent_id")
     if not agent_id:
-        return {"ok": False, "reason": "la consola no devolvió agent_id"}
+        return {"ok": False, "reason": tr("the console did not return an agent_id")}
     st = _load()
     st.update({"console_url": console_url, "agent_id": agent_id, "agent_token": resp.get("agent_token", "")})
     _save(st)
@@ -91,7 +92,7 @@ def enroll(console_url: str, token: str, post=_post) -> dict:
 def heartbeat(status: dict, post=_post) -> dict:
     st = _load()
     if not (enabled() and st.get("agent_id")):
-        return {"ok": False, "reason": "no enrolado o sin Business"}
+        return {"ok": False, "reason": tr("not enrolled or no Business license")}
     try:
         post(f"{st['console_url']}/v1/agents/{st['agent_id']}/heartbeat", _auth(st), status)
     except (urllib.error.URLError, TimeoutError, OSError) as e:
@@ -113,7 +114,7 @@ def _scrub_deep(v):
 def report(incidents: list[dict], post=_post) -> dict:
     st = _load()
     if not (enabled() and st.get("agent_id")):
-        return {"ok": False, "reason": "no enrolado o sin Business"}
+        return {"ok": False, "reason": tr("not enrolled or no Business license")}
     # redactar SIEMPRE antes de que nada salga del host
     safe = [_scrub_deep(i) for i in incidents]
     try:
@@ -127,7 +128,7 @@ def sync(post=_post) -> dict:
     """Heartbeat + últimos incidentes → consola. Para cron o el bucle de guard (Business)."""
     st = _load()
     if not (enabled() and st.get("agent_id")):
-        return {"ok": False, "reason": "no enrolado o sin Business"}
+        return {"ok": False, "reason": tr("not enrolled or no Business license")}
     heartbeat(status_summary(), post=post)
     events = []
     try:

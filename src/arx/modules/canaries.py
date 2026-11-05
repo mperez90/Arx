@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from arx import config
+from arx.i18n import tr
 from arx.modules import recon
 
 DECOY_NAMES = [".aws_credentials", "id_rsa_backup", "db_dump.sql", ".env.prod", "wallet.dat"]
@@ -110,8 +111,10 @@ def plant(locations: list[str]) -> list[dict]:
     return planted
 
 
-def _finding(sev: str, detail: str, why: str, path: str) -> dict:
-    return {"sev": sev, "kind": "canary", "detail": detail, "why": why, "target": {"path": path}}
+def _finding(sev: str, detail: str, why: str, path: str, seed: str) -> dict:
+    """`seed`: semilla histórica de la huella; no es texto y no cambia con el idioma."""
+    return {"sev": sev, "kind": "canary", "detail": detail, "why": why, "target": {"path": path},
+            "fp_key": f"canary|{seed}"}
 
 
 def check() -> list[dict]:
@@ -123,33 +126,39 @@ def check() -> list[dict]:
         try:
             cur = _stat_record(p)
         except FileNotFoundError:
-            findings.append(_finding("high", f"señuelo DESAPARECIDO: {c['path']}",
-                                     "un honeytoken borrado indica manipulación o barrido de un intruso",
-                                     c["path"]))
+            findings.append(_finding("high", tr("canary GONE: {path}", path=c['path']),
+                                     tr("a deleted honeytoken points to tampering or an intruder's "
+                                        "cleanup"),
+                                     c["path"], f"señuelo DESAPARECIDO: {c['path']}"))
             continue
         except OSError:
             continue
         if "size" not in c:  # señuelo plantado por una versión antigua: solo hash de contenido
             try:
                 if hashlib.sha256(p.read_bytes()).hexdigest() != c["sha256"]:
-                    findings.append(_finding("high", f"señuelo MODIFICADO: {c['path']}",
-                                             "nadie legítimo edita un honeytoken → acceso de atacante",
-                                             c["path"]))
+                    findings.append(_finding("high", tr("canary MODIFIED: {path}", path=c['path']),
+                                             tr("nobody legitimate edits a honeytoken → attacker "
+                                                "access"),
+                                             c["path"], f"señuelo MODIFICADO: {c['path']}"))
             except OSError:
                 pass
             continue
         if cur["inode"] != c["inode"]:
-            findings.append(_finding("med", f"señuelo RECREADO: {c['path']}",
-                                     "el fichero-cebo fue reemplazado (inode distinto)", c["path"]))
+            findings.append(_finding("med", tr("canary RECREATED: {path}", path=c['path']),
+                                     tr("the bait file was replaced (different inode)"), c["path"],
+                                     f"señuelo RECREADO: {c['path']}"))
         elif cur["size"] != c["size"] or cur["mtime_ns"] != c["mtime_ns"]:
-            findings.append(_finding("high", f"señuelo MODIFICADO: {c['path']}",
-                                     "nadie legítimo edita un honeytoken → acceso de atacante", c["path"]))
+            findings.append(_finding("high", tr("canary MODIFIED: {path}", path=c['path']),
+                                     tr("nobody legitimate edits a honeytoken → attacker access"), c["path"],
+                                     f"señuelo MODIFICADO: {c['path']}"))
         elif cur["atime_ns"] > c["atime_ns"]:
             when = datetime.fromtimestamp(cur["atime_ns"] / 1e9, timezone.utc).strftime("%Y-%m-%d %H:%M")
-            findings.append(_finding("high", f"señuelo LEÍDO: {c['path']} ({when} UTC)",
-                                     "alguien abrió un honeytoken (posible búsqueda de credenciales). "
-                                     "Ojo: un backup que lea el disco entero también lo dispara.",
-                                     c["path"]))
+            findings.append(_finding("high", tr("canary READ: {path} ({when} UTC)",
+                                                path=c['path'], when=when),
+                                     tr("someone opened a honeytoken (possible credential "
+                                        "hunting). Note: a backup that reads the whole disk "
+                                        "triggers it too."),
+                                     c["path"], f"señuelo LEÍDO: {c['path']} ({when} UTC)"))
             c["atime_ns"] = cur["atime_ns"]  # la próxima lectura será un hallazgo distinto
             dirty = True
     if dirty:
@@ -161,23 +170,23 @@ def run(action: str, locations: list[str] | None = None) -> int:
     if action == "plant":
         locs = locations or default_locations()
         if not locs:
-            print("No hay ubicaciones válidas donde plantar. Usa: arx canaries plant --in <DIR>")
+            print(tr("No valid places to plant. Use: arx canaries plant --in <DIR>"))
             return 1
         planted = plant(locs)
-        print(f"✓ {len(planted)} señuelo(s) activo(s):")
+        print(tr("✓ {n} active canary(ies):", n=len(planted)))
         for c in planted:
             print("   ", c["path"])
         return 0
     if action == "list":
         cs = _load().get("canaries", [])
-        print(f"▸ {len(cs)} señuelo(s):")
+        print(tr("▸ {n} canary(ies):", n=len(cs)))
         for c in cs:
-            print(f"   {c['path']}  (plantado {c.get('planted_at', '?')[:10]})")
+            print(tr("   {path}  (planted {v})", path=c['path'], v=c.get('planted_at', '?')[:10]))
         return 0
     if action == "check":
         f = check()
         if not f:
-            print("✓ Todos los señuelos intactos.")
+            print(tr("✓ All canaries intact."))
             return 0
         for x in f:
             print(f"  [{x['sev']}] {x['detail']}")

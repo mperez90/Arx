@@ -82,7 +82,7 @@ docker_dns_restore
 v bash -c 'rm -rf /build && mkdir /build && cp -r /src/src /src/packaging /build/ && cd /build && packaging/build-deb.sh 2>&1 | tail -1 && dpkg -i dist/arx_all.deb >/dev/null'
 check "el paquete instala arx" v arx --version
 # Sin proveedores LLM: claves vacías. Respuestas en el orden del asistente.
-printf '%s\n' "" "" "" "$WORD" "$WORD" "" "" "1" "" "core" "" "" "high" "block" \
+printf '%s\n' "en" "" "" "" "$WORD" "$WORD" "" "" "1" "" "core" "" "" "high" "block" \
   | docker exec -i "$VIC" arx setup >/dev/null 2>&1
 check "arx setup deja la configuración" v test -s /etc/arx/config.json
 # una llave legítima de root: lo que una autorización deberá poder restaurar si la alteran

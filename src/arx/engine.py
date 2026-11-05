@@ -18,6 +18,7 @@ import urllib.error
 import urllib.request
 
 from arx import __version__, config
+from arx.i18n import tr
 
 # Endpoints compatibles con el esquema OpenAI (chat/completions).
 OPENAI_LIKE = {
@@ -51,7 +52,7 @@ def _build(prov: str, key: str, model: str, system: str | None,
         return ANTHROPIC_URL, {"x-api-key": key, "anthropic-version": ANTHROPIC_VERSION}, payload
     base = OPENAI_LIKE.get(prov)
     if not base:
-        raise ProviderError(f"proveedor desconocido: {prov}")
+        raise ProviderError(tr("unknown provider: {prov}", prov=prov))
     msgs = ([{"role": "system", "content": system}] if system else []) + messages
     payload = {"model": model, "messages": msgs}
     # Los modelos de razonamiento gastan tokens pensando: un tope bajo devuelve respuesta vacía.
@@ -63,13 +64,13 @@ def _build(prov: str, key: str, model: str, system: str | None,
 def _parse(prov: str, resp: dict) -> str:
     if prov == "anthropic":
         if resp.get("stop_reason") == "refusal":
-            raise ProviderError("el modelo declinó la petición")
+            raise ProviderError(tr("the model declined the request"))
         # Los modelos actuales pueden abrir con un bloque `thinking`: tomar el primer `text`.
         text = next((b.get("text") for b in resp["content"] if b.get("type") == "text"), None)
     else:
         text = resp["choices"][0]["message"]["content"]
     if not text:
-        raise ProviderError("respuesta vacía")
+        raise ProviderError(tr("empty response"))
     return text
 
 
@@ -89,7 +90,7 @@ class Engine:
             key = config.get_api_key(prov)
             model = self.cfg.get("providers", {}).get(prov)
             if not key or not model:
-                errors.append(f"{prov}: sin clave o modelo")
+                errors.append(tr("{prov}: no key or model", prov=prov))
                 continue
             try:
                 url, headers, payload = _build(prov, key, model, system, messages, self.max_tokens)
@@ -97,4 +98,4 @@ class Engine:
             except (urllib.error.URLError, KeyError, IndexError, ProviderError, TimeoutError, OSError) as e:
                 errors.append(f"{prov}: {e}")
                 continue
-        raise ProviderError("ningún proveedor respondió — " + "; ".join(errors))
+        raise ProviderError(tr("no provider responded: ") + "; ".join(errors))

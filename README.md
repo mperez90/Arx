@@ -6,10 +6,9 @@ actions it can undo. Anything irreversible waits for you.
 
 ![Arx containing a port scan, an SSH brute force and a reverse shell](docs/assets/arx-demo.gif)
 
-<sub>Real output of [`lab/demo.sh`](lab/demo.sh), with long waits shortened. Arx's CLI
-currently speaks Spanish, so the captions explain each step.</sub>
+<sub>Real output of [`lab/demo.sh`](lab/demo.sh), with long waits shortened.</sub>
 
-> **Status:** v0.0.3, early public testing. **Arx Core is free and available now.** The paid
+> **Status:** v0.0.4, early public testing. **Arx Core is free and available now.** The paid
 > tiers open after Core completes its public testing phase, **Pro first, Business last**.
 > Founding pricing (half price, first 500 purchases of each plan) is reserved for that
 > opening: [get notified](https://github.com/mperez90/Arx/discussions/1).
@@ -96,6 +95,8 @@ If you want to hear from it, or decide from your phone, give it your own Telegra
 Acting from the chat takes a one-time code from an authenticator app: your authorization word never
 travels through a chat. It only makes outbound connections and opens no port.
 
+Output is in English; Arx also speaks Spanish. Pick it in `arx setup` or with `ARX_LANG=es`.
+
 ## The doctrine: relentless, but reversible
 
 | Tier | What happens | Authority |
@@ -165,7 +166,7 @@ Read these before you rely on it.
   to the log before the report was generated, and root on the same host can re-sign one.
 - **False-positive rates on real servers haven't been measured.** That's what this testing
   phase is for, and why observe mode comes first.
-- **Linux only, and the CLI is in Spanish for now.** The package targets Debian and Ubuntu.
+- **Linux only.** The package targets Debian and Ubuntu.
 
 ## How it's built
 

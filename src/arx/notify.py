@@ -21,6 +21,7 @@ import urllib.error
 import urllib.request
 
 from arx import __version__, config, redact
+from arx.i18n import tr
 
 SEV_RANK = {"crit": 0, "high": 1, "med": 2, "low": 3, "info": 4}
 _ICON = {"crit": "🔴", "high": "🟠", "med": "🟡", "low": "⚪", "info": "⚪"}
@@ -107,5 +108,5 @@ def format_findings(pairs: list[tuple[dict, dict]], assessment: str | None = Non
         lines.append(f"{_ICON.get(f.get('sev'), '•')} {f.get('detail')}")
         lines.append(f"   → Tier {o.get('tier')}: {o.get('status')}")
     if assessment:
-        lines += ["", "Análisis:", assessment.strip()]
+        lines += ["", tr("Analysis:"), assessment.strip()]
     return "\n".join(lines)

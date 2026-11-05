@@ -5,7 +5,6 @@
 #
 #   bash lab/demo.sh
 #
-# Las rótulos van en inglés (público de la demo); la CLI de Arx hoy responde en español.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 source lab/lib.sh
@@ -40,13 +39,13 @@ docker exec "$VIC" python3 /src/lab/driver.py prep >/dev/null
 sleep 1
 echo "=== ARX DEMO START ==="
 
-title "Arx · three real attacks, two isolated containers. Arx's CLI currently speaks Spanish."
+title "Arx · three real attacks, two isolated containers."
 
 title "1/3  Port scan"
 attacker "nmap -sS -p 9000-9020 victim"
 docker exec "$ATT" nmap -sS -p 9000-9020 --max-retries 1 victim | grep -E "^[0-9]+/tcp +open" | head -3
 sleep "$PAUSE"
-arx_sweep "escaneo desde"
+arx_sweep "scan from"
 attacker "curl --max-time 4 http://victim:9001/"
 if docker exec "$ATT" curl -s --max-time 4 http://victim:9001/ >/dev/null 2>&1; then
   result "reachable"
@@ -61,7 +60,7 @@ docker exec "$ATT" bash -c 'for i in $(seq 8); do
   sshpass -p "wrong-$i" ssh -o StrictHostKeyChecking=no -o PreferredAuthentications=password \
     -o ConnectTimeout=3 root@victim true 2>/dev/null || true
 done'
-arx_sweep "fallos de autenticaci"
+arx_sweep "authentication failures"
 fast_forward
 
 title "3/3  Reverse shell, the classic one-liner"
@@ -74,7 +73,7 @@ sleep 2
 victim "cat /tmp/proof-1"
 docker exec "$VIC" cat /tmp/proof-1
 note "The attacker is running commands as root on the server."
-arx_sweep "conexi.n saliente"
+arx_sweep "outbound connection"
 attacker "(through the shell) id > /tmp/proof-2"
 c2_send "id > /tmp/proof-2"
 sleep 4

@@ -23,6 +23,7 @@ import time
 from pathlib import Path
 
 from arx import config
+from arx.i18n import tr
 from arx.modules import recon
 
 FALCO_LOG = "/var/log/falco/events.json"
@@ -109,7 +110,7 @@ def read_falco_events(path: str = FALCO_LOG) -> list[dict]:
                 "sev": _FALCO_SEV.get(e.get("priority", ""), "med"),
                 "kind": "falco",
                 "detail": f"Falco · {e.get('rule', '?')}: {e.get('output', '')}"[:400],
-                "why": "regla de comportamiento de Falco disparada",
+                "why": tr("Falco behavior rule fired"),
             }
         )
     return events
@@ -159,11 +160,16 @@ def _ausearch_new(key: str) -> list[str]:
 def read_auditd_events() -> list[dict]:
     events = []
     for line in _ausearch_new("arx_ident")[-MAX_EVENTS:]:
-        events.append({"sev": "high", "kind": "auditd", "detail": f"auditd · identidad: {line}"[:400],
-                       "why": "escritura/cambio de atributos en un fichero de identidad o privilegios"})
+        events.append({"sev": "high", "kind": "auditd", "detail": tr("auditd · identity: {line}",
+                                                                     line=line)[:400],
+                       "fp_key": "auditd|" + f"auditd · identidad: {line}"[:400],
+                       "why": tr("write/attribute change on an identity or privilege file")})
     for line in _ausearch_new("arx_canary")[-MAX_EVENTS:]:
-        events.append({"sev": "high", "kind": "canary", "detail": f"señuelo accedido · {line}"[:400],
-                       "why": "nadie legítimo abre un honeytoken: el acceso lo hizo el proceso indicado"})
+        events.append({"sev": "high", "kind": "canary", "detail": tr("canary accessed · {line}",
+                                                                     line=line)[:400],
+                       "fp_key": "canary|" + f"señuelo accedido · {line}"[:400],
+                       "why": tr("nobody legitimate opens a honeytoken: the access came from the "
+                                 "process shown")})
     return events
 
 
@@ -198,9 +204,11 @@ def _prune(win: dict, now: float, ttl: int) -> dict:
 
 def login_finding(item: str) -> dict:
     """Un acceso `cuenta@origen` que la base no conoce (mismo hallazgo venga de donde venga)."""
-    return {"sev": "high", "kind": "login_users", "detail": f"nuevo en login_users: {item}",
-            "why": "acceso de una cuenta u origen que la línea base no conoce",
-            "target": {"user": item}, "set": "login_users", "item": item}
+    return {"sev": "high", "kind": "login_users", "detail": tr("new in login_users: {item}",
+                                                               item=item),
+            "why": tr("access from an account or origin the baseline does not know"),
+            "target": {"user": item}, "set": "login_users", "item": item,
+            "fp_key": f"login_users|nuevo en login_users: {item}"}
 
 
 def accepted_logins(path: str | None = None, limit: int = 16 * 1024 * 1024) -> set[str]:
@@ -229,10 +237,11 @@ def detect_uid0_accounts(known=(), accounts: list | None = None) -> list[dict]:
 
         accounts = [(p.pw_name, p.pw_uid) for p in pwd.getpwall()]
     return [{"sev": "crit", "kind": "uid0_account",
-             "detail": f"cuenta con uid 0 distinta de root: {name}",
-             "why": "tiene todos los poderes de root con otro nombre; la instala quien quiere "
-                    "volver a entrar sin que se note. Si es legítima, acéptala",
-             "target": {"user": name}, "set": "uid0_accounts", "item": name}
+             "detail": tr("account with uid 0 other than root: {name}", name=name),
+             "why": tr("it has all of root's powers under another name; installed by someone who "
+                       "wants to come back unnoticed. If legitimate, accept it"),
+             "target": {"user": name}, "set": "uid0_accounts", "item": name,
+             "fp_key": f"uid0_account|cuenta con uid 0 distinta de root: {name}"}
             for name, uid in accounts if uid == 0 and name != "root" and name not in known]
 
 
@@ -246,8 +255,9 @@ def _log_vanished(path: str | None) -> dict | None:
         return None
     del cursors["authlog"]
     config.write_json(_cursor_path(), cursors)
-    return {"sev": "high", "kind": "log_tamper", "detail": "el log de autenticación desapareció",
-            "why": "borrar el log de autenticación es anti-forense: alguien borra huellas"}
+    return {"sev": "high", "kind": "log_tamper", "detail": tr("the authentication log disappeared"),
+            "fp_key": "log_tamper|el log de autenticación desapareció",
+            "why": tr("deleting the authentication log is anti-forensic: someone is wiping traces")}
 
 
 def _journal_sshd_lines() -> list[str] | None:
@@ -307,8 +317,9 @@ def read_auth_log(now: float | None = None) -> list[dict]:
     if tampered:
         events.append({
             "sev": "high", "kind": "log_tamper",
-            "detail": f"{path} fue truncado (mismo inode, tamaño menor)",
-            "why": "vaciar el log de autenticación es anti-forense: alguien borra huellas",
+            "detail": tr("{path} was truncated (same inode, smaller size)", path=path),
+            "fp_key": f"log_tamper|{path} fue truncado (mismo inode, tamaño menor)",
+            "why": tr("emptying the authentication log is anti-forensic: someone is wiping traces"),
         })
     win = _prune(config.read_json(_window_path("auth"), {}), now, AUTH_WINDOW_S)
     for line in lines:
@@ -330,9 +341,11 @@ def read_auth_log(now: float | None = None) -> list[dict]:
             user = max(e["users"], key=e["users"].get)
             fired.append({
                 "sev": "high", "kind": "auth_bruteforce",
-                "detail": f"{e['fails']} fallos de autenticación desde {ip} "
+                "detail": tr("{fails} authentication failures from {ip} (most tried user: {user})",
+                             fails=e['fails'], ip=ip, user=user),
+                "fp_key": f"auth_bruteforce|{e['fails']} fallos de autenticación desde {ip} "
                           f"(usuario más probado: {user})",
-                "why": "fuerza bruta contra el servicio de acceso remoto",
+                "why": tr("brute force against the remote access service"),
                 "target": {"ip": ip, "user": user},
             })
     config.write_json(_window_path("auth"), win)
@@ -385,8 +398,11 @@ def detect_port_scan(conns: list[dict] | None = None, now: float | None = None,
                 continue
             events.append({
                 "sev": "high", "kind": "port_scan",
-                "detail": f"escaneo desde {ip} (≥{SCAN_THRESHOLD} puertos en 10 min, pista kernel)",
-                "why": "reconocimiento previo a un ataque: nadie legítimo toca tantos puertos",
+                "detail": tr("scan from {ip} (≥{SCAN_THRESHOLD} ports in 10 min, kernel trail)",
+                             ip=ip, SCAN_THRESHOLD=SCAN_THRESHOLD),
+                "fp_key": f"port_scan|escaneo desde {ip} (≥{SCAN_THRESHOLD} puertos en 10 min, pista kernel)",
+                "why": tr("reconnaissance ahead of an attack: nobody legitimate touches this many "
+                          "ports"),
                 "target": {"ip": ip},
             })
         return events
@@ -415,8 +431,11 @@ def detect_port_scan(conns: list[dict] | None = None, now: float | None = None,
             e["fired"] = True
             events.append({
                 "sev": "high", "kind": "port_scan",
-                "detail": f"escaneo desde {ip} (≥{SCAN_THRESHOLD} puertos aceptados en 10 min)",
-                "why": "reconocimiento previo a un ataque: nadie legítimo toca tantos puertos",
+                "detail": tr("scan from {ip} (≥{SCAN_THRESHOLD} accepted ports in 10 min)",
+                             ip=ip, SCAN_THRESHOLD=SCAN_THRESHOLD),
+                "fp_key": f"port_scan|escaneo desde {ip} (≥{SCAN_THRESHOLD} puertos aceptados en 10 min)",
+                "why": tr("reconnaissance ahead of an attack: nobody legitimate touches this many "
+                          "ports"),
                 "target": {"ip": ip},
             })
     config.write_json(_window_path("scan"), win)
@@ -473,10 +492,10 @@ def detect_reverse_shell(owners: list[dict] | None = None,
         pids = sorted({p for p in pids if isinstance(p, int)})
         events.append({
             "sev": "crit", "kind": "reverse_shell",
-            "detail": f"shell con conexión saliente: {exe} → {ip}:{port}"
-                      f" (pid {', '.join(map(str, pids)) or '?'})",
-            "why": "un shell que posee un socket de red saliente es la firma del C2 "
-                   "de un reverse shell: nadie legítimo lo hace",
+            "detail": tr("shell with an outbound connection: {exe} → {ip}:{port} (pid {v})",
+                         exe=exe, ip=ip, port=port, v=', '.join(map(str, pids)) or '?'),
+            "why": tr("a shell owning an outbound network socket is the C2 signature of a reverse "
+                      "shell: nobody legitimate does this"),
             "target": {"ip": ip, "port": port, "exe": exe, "pids": pids},
             # la huella no incluye el pid (cambia entre barridos); el canal C2 sí es estable
             "fp_key": f"reverse_shell|{exe}|{ip}:{port}",

@@ -11,8 +11,9 @@ from __future__ import annotations
 import re
 
 from arx import config
+from arx.i18n import tr
 
-REDACTED = "«redactado»"
+REDACTED = tr("«redacted»")
 
 # Prefijos de llave habituales, como red de seguridad ante secretos no registrados.
 _PREFIX_PATTERNS = [

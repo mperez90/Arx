@@ -45,6 +45,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 from arx import config
+from arx.i18n import tr
 from arx.modules import recon
 from arx.redact import printable
 
@@ -57,37 +58,45 @@ MAX_LLM_LOCKS_PER_HOUR = 2     # freno propio: el modelo puede estar siendo mani
 
 # kind → (tier, acción de remediación, reversible, por qué ese nivel)
 _PLAN: dict[str, tuple[int, str, bool, str]] = {
-    "integrity": (2, "revertir el fichero crítico a copia buena conocida", True,
-                  "alterar credenciales/ficheros del sistema es sensible → requiere tu palabra"),
-    "listen_ports": (1, "bloquear el puerto en firewall (temporal, auto-expira)", True,
-                     "bloquear un puerto es reversible y contiene exposición nueva"),
-    "executables": (1, "suspender el proceso (SIGSTOP) para análisis", True,
-                    "suspender es reversible (SIGCONT); no destruye evidencia"),
-    "processes": (1, "suspender el proceso (SIGSTOP) para análisis", True,
-                  "suspender es reversible (SIGCONT); no destruye evidencia"),
-    "login_users": (2, "bloquear todos los accesos de la cuenta y cerrar sus sesiones (no se desbloquea sola)", False,
-                    "una cuenta nueva conectada puede ser un admin legítimo → requiere tu palabra o "
-                    "que el modelo la confirme como amenaza; una sesión cerrada no se puede "
-                    "recuperar y jamás se toca root ni cuentas de sistema"),
-    "suid_new": (2, "quitarle el bit SUID (chmod u-s); el fichero se queda como evidencia", True,
-                 "un SUID nuevo da root a quien lo ejecute, pero puede venir de un paquete → requiere tu palabra"),
-    "uid0_account": (2, "bloquear esa cuenta (contraseña y llave SSH); no afecta a root", True,
-                     "puede ser legítima → requiere tu palabra; si lo es, acéptala con arx accept"),
-    "canary": (1, "elevar el nivel de alerta y capturar el contexto del acceso al señuelo", True,
-               "un señuelo tocado es señal fuerte de intruso; elevar y capturar es reversible"),
-    "intel_ip": (1, "bloquear la IP en el firewall (temporal, auto-expira)", True,
-                 "viene de una vacuna validada en este host: bloquearla es reversible"),
-    "port_scan": (1, "bloquear la IP de origen en el firewall (temporal, auto-expira)", True,
-                  "cortar el reconocimiento es reversible y no toca nada local"),
-    "auth_bruteforce": (1, "bloquear la IP de origen en el firewall (temporal, auto-expira)", True,
-                        "corta la fuerza bruta sin tocar la cuenta atacada (eso es Tier 2)"),
-    "reverse_shell": (1, "bloquear el canal C2 en nftables y suspender el proceso dueño (auto-expira)", True,
-                      "ambas acciones se deshacen al expirar: ni se destruye evidencia ni se pierde el flujo"),
-    "log_tamper": (0, "registrar y alertar — alguien está borrando huellas", True,
-                   "borrar logs es señal de intruso DENTRO: observar y escalar, no actuar a ciegas"),
-    "gauge": (0, "registrar y vigilar la tendencia", True, "señal débil; observar primero"),
-    "firewall_reset": (0, "registrar y alertar: la contención activa ya se repuso", True,
-                       "puede ser un reinicio legítimo: lo decides tú"),
+    "integrity": (2, tr("revert the critical file to a known good copy"), True,
+                  tr("altering credentials or system files is sensitive → needs your word")),
+    "listen_ports": (1, tr("block the port in the firewall (temporary, auto-expires)"), True,
+                     tr("blocking a port is reversible and contains new exposure")),
+    "executables": (1, tr("suspend the process (SIGSTOP) for analysis"), True,
+                    tr("suspending is reversible (SIGCONT); it does not destroy evidence")),
+    "processes": (1, tr("suspend the process (SIGSTOP) for analysis"), True,
+                  tr("suspending is reversible (SIGCONT); it does not destroy evidence")),
+    "login_users": (2, tr("lock all access for the account and close its sessions (it does not "
+                          "unlock on its own)"), False,
+                    tr("a new connected account may be a legitimate admin → needs your word or the "
+                       "model confirming it as a threat; a closed session cannot be recovered, and "
+                       "root and system accounts are never touched")),
+    "suid_new": (2, tr("remove its SUID bit (chmod u-s); the file stays as evidence"), True,
+                 tr("a new SUID gives root to whoever runs it, but it may come from a package → "
+                    "needs your word")),
+    "uid0_account": (2, tr("lock that account (password and SSH key); root is not affected"), True,
+                     tr("it may be legitimate → needs your word; if it is, accept it with arx "
+                        "accept")),
+    "canary": (1, tr("raise the alert level and capture the context of the canary access"), True,
+               tr("a touched canary is a strong sign of an intruder; raising and capturing is "
+                  "reversible")),
+    "intel_ip": (1, tr("block the IP in the firewall (temporary, auto-expires)"), True,
+                 tr("it comes from a vaccine validated on this host: blocking it is reversible")),
+    "port_scan": (1, tr("block the source IP in the firewall (temporary, auto-expires)"), True,
+                  tr("cutting reconnaissance is reversible and touches nothing local")),
+    "auth_bruteforce": (1, tr("block the source IP in the firewall (temporary, auto-expires)"), True,
+                        tr("stops the brute force without touching the attacked account (that is "
+                           "Tier 2)")),
+    "reverse_shell": (1, tr("block the C2 channel in nftables and suspend the owning process "
+                            "(auto-expires)"), True,
+                      tr("both actions undo themselves on expiry: no evidence destroyed, no flow "
+                         "lost")),
+    "log_tamper": (0, tr("log and alert: someone is wiping traces"), True,
+                   tr("wiping logs is a sign of an intruder INSIDE: observe and escalate, do not "
+                      "act blindly")),
+    "gauge": (0, tr("log and watch the trend"), True, tr("weak signal; observe first")),
+    "firewall_reset": (0, tr("log and alert: active containment was already put back"), True,
+                       tr("it may be a legitimate reboot: your call")),
 }
 
 # Procesos que jamás se suspenden automáticamente (dejarían el host inaccesible o a Arx ciego).
@@ -106,15 +115,16 @@ def classify(finding: dict) -> dict:
     # Desde fuera no se llega a un puerto solo en localhost: bloquearlo no protege nada y rompe
     # lo que lo use (una base de datos local, un panel detrás de un proxy).
     if finding.get("kind") == "listen_ports" and (finding.get("target") or {}).get("exposed") == "local":
-        return {"tier": 0, "action": "registrar y vigilar (puerto solo local)", "reversible": True,
-                "why": "no está expuesto a la red: un bloqueo no contendría nada"}
+        return {"tier": 0, "action": tr("log and watch (local-only port)"), "reversible": True,
+                "why": tr("not exposed to the network: a block would contain nothing")}
     # Un binario de sistema no visto al aprender es lo normal (un admin, una actualización).
     # Suspenderlo congelaría TODOS sus procesos, incluida la shell del operador (B9).
     if finding.get("kind") in ("executables", "processes") and finding.get("sev") == "low":
-        return {"tier": 0, "action": "registrar y vigilar (binario de sistema nuevo)",
-                "reversible": True, "why": "señal de baja confianza: no justifica suspender nada"}
+        return {"tier": 0, "action": tr("log and watch (new system binary)"),
+                "reversible": True, "why": tr("low-confidence signal: it does not justify "
+                                              "suspending anything")}
     tier, action, reversible, why = _PLAN.get(
-        finding.get("kind", ""), (0, "registrar y vigilar", True, "señal débil; observar primero")
+        finding.get("kind", ""), (0, tr("log and watch"), True, tr("weak signal; observe first"))
     )
     return {"tier": tier, "action": action, "reversible": reversible, "why": why}
 
@@ -180,7 +190,7 @@ def ssh_ports() -> set[int]:
 
 def _out_of_bounds(cfg: dict) -> list[str]:
     raw = cfg.get("out_of_bounds") or ""
-    if raw.strip() in ("", "(ninguno)"):
+    if raw.strip() in ("", "(none)", "(ninguno)"):
         return []
     return [t.strip() for t in re.split(r"[,\s]+", raw) if t.strip()]
 
@@ -234,35 +244,35 @@ def protected_reason(finding: dict, cfg: dict | None = None) -> str | None:
     if kind == "listen_ports" and target.get("port"):
         port = int(target["port"])
         if port in ssh_ports():
-            return "puerto SSH: bloquearlo te dejaría fuera del servidor"
+            return tr("SSH port: blocking it would lock you out of the server")
         if str(port) in oob:
-            return "puerto marcado fuera-de-límites"
+            return tr("port marked out-of-bounds")
     if kind in ("port_scan", "auth_bruteforce", "intel_ip") and target.get("ip"):
         ip = str(target["ip"])
         if ip in _never_block_ips():
-            return "IP intocable (propia del host o con sesión de operador activa)"
+            return tr("untouchable IP (the host's own or with an active operator session)")
         if ip in oob:
-            return "IP marcada fuera-de-límites"
+            return tr("IP marked out-of-bounds")
     if kind == "reverse_shell":
         ip = str(target.get("ip") or "")
         if ip and ip in _never_block_ips():
-            return "la contraparte es intocable (propia del host o sesión de operador)"
+            return tr("the peer is untouchable (the host's own or an operator session)")
         if ip in oob:
-            return "IP marcada fuera-de-límites"
+            return tr("IP marked out-of-bounds")
         exe = str(target.get("exe") or "")
         base = exe.rsplit("/", 1)[-1]
         if base in _PROTECTED_EXES or exe == sys.executable:
-            return f"proceso crítico ({base}): solo se observa"
+            return tr("critical process ({base}): observed only", base=base)
     if kind in ("executables", "processes"):
         name = str(target.get("exe") or target.get("process") or "")
         base = name.rsplit("/", 1)[-1]
         if base in _PROTECTED_EXES or name == sys.executable:
-            return f"proceso crítico ({base})"
+            return tr("critical process ({base})", base=base)
         if any(t and t in name for t in oob):
-            return "proceso marcado fuera-de-límites"
+            return tr("process marked out-of-bounds")
     path = str(target.get("path") or target.get("file") or "")
     if path and any(path.startswith(t) for t in oob if t.startswith("/")):
-        return "ruta marcada fuera-de-límites"
+        return tr("path marked out-of-bounds")
     return None
 
 
@@ -287,6 +297,7 @@ def register_block(finding: dict, revert: dict, ttl_min: int | None = DEFAULT_TT
             "fp": fingerprint(finding),
             "detail": finding.get("detail"),
             "revert": revert,
+            **({"origin_of": finding["origin_of"]} if finding.get("origin_of") else {}),
             "applied_at": _iso(now),
             "expires_at": None if ttl_min is None else _iso(now + timedelta(minutes=ttl_min)),
         }
@@ -393,7 +404,7 @@ def _apply_revert(revert) -> str | None:
                     done += 1
             except OSError:
                 continue
-        return f"SIGCONT a {done} proceso(s) de {exe}"
+        return tr("SIGCONT to {done} process(es) of {exe}", done=done, exe=exe)
     if isinstance(revert, dict) and revert.get("tool") == "usermod":
         import pwd
 
@@ -405,9 +416,10 @@ def _apply_revert(revert) -> str | None:
         try:
             # anti recreación de cuenta: solo se desbloquea si sigue siendo el mismo uid
             if pwd.getpwnam(user).pw_uid != uid:
-                return f"cuenta '{user}' recreada con otro uid: no se desbloquea"
+                return tr("account '{user}' was recreated with another uid: not unlocked",
+                          user=user)
         except KeyError:
-            return f"cuenta '{user}' ya no existe: nada que desbloquear"
+            return tr("account '{user}' no longer exists: nothing to unlock", user=user)
         # se restaura el estado PREVIO: una cuenta que el admin ya tenía bloqueada sigue así
         argv = ["usermod", "-e", expire, user]
         if not revert.get("was_locked"):
@@ -415,10 +427,11 @@ def _apply_revert(revert) -> str | None:
         try:
             r = subprocess.run(argv, capture_output=True, text=True, timeout=15)
         except (OSError, subprocess.TimeoutExpired):
-            return f"no se pudo restaurar la cuenta '{user}': usermod no respondió"
+            return tr("could not restore account '{user}': usermod did not respond", user=user)
         if r.returncode != 0:
-            return f"no se pudo restaurar la cuenta '{user}' ({r.stderr.strip()[:60]})"
-        return f"{' '.join(argv)} (estado previo de la cuenta restaurado)"
+            return tr("could not restore account '{user}' ({v})",
+                      user=user, v=r.stderr.strip()[:60])
+        return tr("{argv} (previous account state restored)", argv=' '.join(argv))
     return None
 
 
@@ -431,8 +444,8 @@ def _holds_until_human(block: dict) -> bool:
 
 def _until(block: dict) -> str:
     if _holds_until_human(block):
-        return "hasta que lo decidas"
-    return f"hasta {str(block.get('expires_at'))[11:16]} UTC"
+        return tr("until you decide")
+    return tr("until {v} UTC", v=str(block.get('expires_at'))[11:16])
 
 
 def expire_blocks(now=None) -> list[dict]:
@@ -593,7 +606,8 @@ def restore_quarantined(qid: str) -> str | None:
         meta = manifest[q]
         dest = meta["quarantined_from"]
         if os.path.lexists(dest):
-            return f"ya existe {printable(dest)}: no se pisa. Muévelo antes si quieres recuperar este"
+            return tr("{dest} already exists: not overwritten. Move it first if you want this one "
+                      "back", dest=printable(dest))
         try:
             with open(q, "rb") as src:
                 out = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -602,10 +616,11 @@ def restore_quarantined(qid: str) -> str | None:
             os.chmod(dest, int(meta.get("mode", 0o600)))
             os.unlink(q)
         except OSError as e:
-            return f"no se pudo restaurar {printable(dest)} ({e.strerror})"
+            return tr("could not restore {dest} ({strerror})",
+                      dest=printable(dest), strerror=e.strerror)
         del manifest[q]
         config.write_json(_vault_manifest_path(), manifest)
-    done = f"restaurado en {printable(dest)}"
+    done = tr("restored to {dest}", dest=printable(dest))
     record({"kind": "quarantine_restored", "detail": dest, "result": done})
     return done
 
@@ -618,20 +633,21 @@ def _kill_and_quarantine(finding: dict) -> str:
     target = finding.get("target") or {}
     exe = str(target.get("exe") or target.get("process") or "")
     if not exe.startswith("/"):
-        return "sin ruta de ejecutable resuelta: no se mata por nombre"
+        return tr("no resolved executable path: nothing is killed by name")
     base = exe.rsplit("/", 1)[-1]
     if base in _PROTECTED_EXES or exe == sys.executable:
-        return f"proceso crítico ({base}): jamás se mata"
+        return tr("critical process ({base}): never killed", base=base)
     pids = [p for p in _pids_for_exe(exe) if p > 1 and p != os.getpid()]
     parts = []
     if exe.startswith(baseline._SYSTEM_DIRS):
-        parts.append("vive en un directorio del sistema: el fichero no se toca")
+        parts.append(tr("lives in a system directory: the file is not touched"))
     else:
         # primero la evidencia: si se borró a sí mismo, al morir se pierde con él
         source = f"/proc/{pids[0]}/exe" if pids and not os.path.exists(exe) else None
         q = quarantine_file(exe, source=source)
-        parts.append(f"fichero en cuarentena (recupéralo con: arx restore {os.path.basename(q)})" if q
-                     else "el fichero no se pudo poner en cuarentena")
+        parts.append(tr("file quarantined (recover it with: arx restore {q})",
+                        q=os.path.basename(q)) if q
+                     else tr("the file could not be quarantined"))
     killed = 0
     for pid in pids:
         try:
@@ -639,7 +655,7 @@ def _kill_and_quarantine(finding: dict) -> str:
             killed += 1
         except OSError:
             continue
-    parts.insert(0, f"{killed} proceso(s) terminado(s)" if pids else "no quedaba ningún proceso vivo")
+    parts.insert(0, tr("{killed} process(es) terminated", killed=killed) if pids else tr("no process left alive"))
     return " · ".join(parts)
 
 
@@ -648,17 +664,18 @@ def _drop_suid(path: str) -> str:
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError as e:
-        return f"no se pudo abrir {printable(path)} ({e.strerror})"
+        return tr("could not open {path} ({strerror})", path=printable(path), strerror=e.strerror)
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
-            return f"{printable(path)} ya no es un fichero normal: no se toca"
+            return tr("{path} is no longer a regular file: not touched", path=printable(path))
         os.fchmod(fd, stat.S_IMODE(st.st_mode) & ~0o6000)
     except OSError as e:
-        return f"no se pudo cambiar {printable(path)} ({e.strerror})"
+        return tr("could not change {path} ({strerror})", path=printable(path), strerror=e.strerror)
     finally:
         os.close(fd)
-    return f"bit SUID retirado de {printable(path)}: ya no da privilegios. Si era legítimo: chmod u+s"
+    return tr("SUID bit removed from {path}: it no longer gives privileges. If it was legitimate: "
+              "chmod u+s", path=printable(path))
 
 
 def _restore_from_vault(key: str, current_files: list[str] | None = None) -> str:
@@ -708,10 +725,10 @@ def _restore_from_vault(key: str, current_files: list[str] | None = None) -> str
             quarantined.append(q)
     if not restored and not quarantined:
         if not known:
-            return f"sin respaldo en el vault para '{key}' — restauración manual necesaria"
-        return f"'{key}' ya coincide con el sellado — nada que restaurar"
-    return (f"restaurado {len(restored)} fichero(s) de '{key}' desde el vault; "
-            f"versiones hostiles en cuarentena: {len(quarantined)}")
+            return tr("no backup in the vault for '{key}': manual restore needed", key=key)
+        return tr("'{key}' already matches the sealed version: nothing to restore", key=key)
+    return (tr("restored {n} file(s) of '{key}' from the vault; hostile versions quarantined: {n2}",
+               n=len(restored), key=key, n2=len(quarantined)))
 
 
 def _shadow_entry(user: str) -> list[str] | None:
@@ -803,34 +820,37 @@ def _lock_account(user: str, finding: dict, allow_uid0: bool = False) -> tuple[b
     import pwd
 
     if not _USERNAME_RE.fullmatch(user):
-        return False, f"nombre de cuenta inválido ({user}): no se bloquea"
+        return False, tr("invalid account name ({user}): not locked", user=user)
     try:
         uid = pwd.getpwnam(user).pw_uid
     except KeyError:
-        return False, f"la cuenta '{user}' ya no existe: nada que bloquear"
+        return False, tr("account '{user}' no longer exists: nothing to lock", user=user)
     if user == "root" or (uid < 1000 and not (allow_uid0 and uid == 0)):
-        return False, f"cuenta de sistema ({user}, uid {uid}): jamás se bloquea automáticamente"
+        return False, tr("system account ({user}, uid {uid}): never locked automatically",
+                         user=user, uid=uid)
     if user in _out_of_bounds(config.load_config()):
-        return False, f"cuenta '{user}' marcada fuera-de-límites: no se bloquea"
+        return False, tr("account '{user}' marked out-of-bounds: not locked", user=user)
     if not shutil.which("usermod"):
-        return False, "sin usermod en este host: no hay ejecutor seguro de bloqueo de cuenta"
+        return False, tr("no usermod on this host: no safe account-lock executor")
     if any(b for b in _load_blocks() if _holds_until_human(b) and b["revert"].get("user") == user):
         # bloquear otra vez guardaría "bloqueada" como estado previo y nunca se restauraría
-        return True, f"la cuenta '{user}' ya estaba bloqueada por Arx. Decide tú:  arx unlock {user}"
+        return True, tr("account '{user}' was already locked by Arx. Your call:  arx unlock {user}",
+                        user=user)
     state = _shadow_state(user)
     if state is None:
-        return False, f"no pude leer el estado de '{user}' en /etc/shadow: no se bloquea"
+        return False, tr("could not read the state of '{user}' in /etc/shadow: not locked",
+                         user=user)
     if _leaves_no_admin(user):
-        return False, (f"'{user}' es la última cuenta de administración con acceso: bloquearla te "
-                       "dejaría fuera del servidor. No se bloquea")
+        return False, (tr("'{user}' is the last admin account with access: locking it would lock "
+                          "you out of the server. Not locked", user=user))
     was_locked, expire = state
     r = subprocess.run(["usermod", "-L", "-e", "1", user], capture_output=True, text=True, timeout=15)
     if r.returncode != 0:
-        return False, f"no se pudo bloquear la cuenta ({r.stderr.strip()[:48]})"
+        return False, tr("could not lock the account ({v})", v=r.stderr.strip()[:48])
     register_block(finding, {"tool": "usermod", "user": user, "uid": uid,
                              "was_locked": was_locked, "expire": expire}, ttl_min=None)
-    return True, (f"cuenta '{user}' bloqueada: no entra ni con contraseña ni con llave SSH. No se "
-                  f"desbloquea sola: decide tú con  arx unlock {user}")
+    return True, (tr("account '{user}' locked: no entry by password or SSH key. It does not unlock "
+                     "on its own: your call with  arx unlock {user}", user=user))
 
 
 def _proc_uid(pid: int) -> int | None:
@@ -909,11 +929,12 @@ def _block_origin(origin: str, user: str, cfg: dict | None) -> str | None:
         ipaddress.ip_address(origin)
     except ValueError:
         return None
-    f = {"kind": "auth_bruteforce", "sev": "high", "target": {"ip": origin},
-         "detail": f"origen de la cuenta bloqueada {user}: {origin}"}
+    f = {"kind": "auth_bruteforce", "sev": "high", "target": {"ip": origin}, "origin_of": user,
+         "fp_key": f"auth_bruteforce|origen de la cuenta bloqueada {user}: {origin}",
+         "detail": tr("origin of locked account {user}: {origin}", user=user, origin=origin)}
     reason = protected_reason(f, cfg)
     if reason:
-        return f"su IP {origin} no se bloquea: {reason}"
+        return tr("its IP {origin} is not blocked: {reason}", origin=origin, reason=reason)
     status, revert = _execute_tier1(f, cfg)
     if revert:
         _note_action()
@@ -921,25 +942,29 @@ def _block_origin(origin: str, user: str, cfg: dict | None) -> str | None:
 
 
 def _identity_summary(rep: dict) -> str:
-    lines = [f"Cuenta '{rep['user']}': " + ("TODOS SUS ACCESOS CERRADOS" if rep["locked"] else "no se actuó"),
-             f"  Detectado: {rep['detail']}", f"  Decidió: {rep['decided_by']}"]
+    lines = [tr("Account '{user}': ", user=rep['user']) + (tr("ALL ACCESS CLOSED") if rep["locked"] else tr("no action taken")),
+             tr("  Detected: {detail}", detail=rep['detail']), tr("  Decided by: {decided_by}",
+                                                 decided_by=rep['decided_by'])]
     v = rep.get("verdict")
     if v:
-        lines.append(f"  Veredicto del modelo: {v['veredicto']} ({v['confianza']}%). {v['razon']}")
+        lines.append(tr("  Model verdict: {verdict} ({confidence}%). {reason}",
+                        verdict=tr(v['verdict']), confidence=v['confidence'], reason=v['reason']))
     lines.append(f"  {rep['lock']}")
     if rep["locked"]:
         cmds = [p["cmd"] or f"pid {p['pid']}" for p in rep["closed"]]
-        lines.append(f"  Sesiones y procesos cerrados: {len(cmds)}. Una sesión cerrada no se puede recuperar.")
+        lines.append(tr("  Sessions and processes closed: {n}. A closed session cannot be "
+                        "recovered.", n=len(cmds)))
         lines += [f"    · {c[:70]}" for c in cmds[:8]]
         if len(cmds) > 8:
-            lines.append(f"    · y {len(cmds) - 8} más (arx forensics)")
+            lines.append(tr("    · and {v} more (arx forensics)", v=len(cmds) - 8))
         if rep["survivors"]:
-            lines.append(f"  ⚠ SIGUEN VIVOS: {rep['survivors'][:8]}. Revísalos a mano.")
+            lines.append(tr("  ⚠ STILL ALIVE: {v}. Check them by hand.", v=rep['survivors'][:8]))
         if rep.get("origin_block"):
             lines.append(f"  {rep['origin_block']}")
-        lines.append("  No cubre lo que no pasa por la cuenta: tokens de API, claves robadas de "
-                     "otros servicios o persistencia ya instalada como root.")
-        lines.append(f"  Decide tú:  arx unlock {rep['user']}   ·   si era legítima, después:  arx accept")
+        lines.append(tr("  This does not cover what does not go through the account: API tokens, "
+                        "keys stolen from other services, or persistence already installed as root."))
+        lines.append(tr("  Your call:  arx unlock {user}   ·   if it was legitimate, then:  arx "
+                        "accept", user=rep['user']))
     return "\n".join(lines)
 
 
@@ -1016,15 +1041,16 @@ def _verdict_refusal(user: str, origin: str, entry: dict | None, enforce: bool,
                      cfg: dict, now: datetime) -> str | None:
     """Por qué NO se actúa sobre un veredicto del modelo. Todo esto lo decide el código."""
     if not enforce:
-        return "modo observar: con --enforce se habrían cerrado sus accesos"
+        return tr("observe mode: with --enforce its access would have been closed")
     if cfg.get("llm_identity_actions") is False:
-        return "desactivado en la configuración (llm_identity_actions)"
+        return tr("disabled in the configuration (llm_identity_actions)")
     if (entry or {}).get("human_cleared"):
-        return "ya la desbloqueaste tú: el modelo no te lleva la contraria"
+        return tr("you already unlocked it: the model does not overrule you")
     if not has_live_session(user, origin):
-        return "sin sesión viva comprobable desde ese origen (auth.log se puede falsificar)"
+        return tr("no verifiable live session from that origin (auth.log can be forged)")
     if len(_recent_llm_locks(now)) >= MAX_LLM_LOCKS_PER_HOUR:
-        return f"ya bloqueó {MAX_LLM_LOCKS_PER_HOUR} cuentas en una hora: puede estar manipulado"
+        return tr("it already locked {MAX_LLM_LOCKS_PER_HOUR} accounts in an hour: it may be "
+                  "manipulated", MAX_LLM_LOCKS_PER_HOUR=MAX_LLM_LOCKS_PER_HOUR)
     return None
 
 
@@ -1046,18 +1072,19 @@ def apply_verdicts(pairs: list[tuple[dict, dict]], verdicts: list[dict], enforce
             finding = by_fp.get(v["id"])
             if not finding or finding.get("kind") != "login_users":
                 continue
-            if v["veredicto"] not in ("amenaza", "sospecha") or v["confianza"] < threshold:
+            if v["verdict"] not in ("threat", "suspicion") or v["confidence"] < threshold:
                 continue
             st = load_findings()
             item = str((finding.get("target") or {}).get("user") or "")
             user, _, origin = item.partition("@")
             refusal = _verdict_refusal(user, origin, st.get(v["id"]), enforce, cfg, now)
-            decided = "el modelo, sin esperar tu palabra (lo permite --enforce)"
+            decided = tr("the model, without waiting for your word (--enforce allows it)")
             if refusal:
                 rep = {"user": user, "origin": origin, "locked": False, "decided_by": decided,
                        "verdict": v, "detail": finding.get("detail"), "lock": refusal,
                        "closed": [], "survivors": [], "origin_block": None}
-                rep["summary"] = _identity_summary(rep) + f"\n  Sigue pendiente de ti:  arx authorize {v['id'][:6]}"
+                rep["summary"] = _identity_summary(rep) + tr("\n  Still waiting on you:  arx "
+                                                             "authorize {v}", v=v['id'][:6])
                 record({"kind": "identity_refused", "sev": finding.get("sev"), "detail": finding.get("detail"),
                         "result": rep["summary"], "verdict": v})
                 reports.append(rep)
@@ -1067,7 +1094,8 @@ def apply_verdicts(pairs: list[tuple[dict, dict]], verdicts: list[dict], enforce
                 config.write_json(_llm_locks_path(), _recent_llm_locks(now) + [_iso(now)])
                 _save_pending([p for p in _load_pending() if p["id"] != v["id"][:6]])
                 if v["id"] in st:
-                    st[v["id"]]["status"] = f"bloqueada por veredicto del modelo → decide tú: arx unlock {user}"
+                    st[v["id"]]["status"] = tr("locked by model verdict → your call: arx unlock "
+                                               "{user}", user=user)
                     _save_findings(st)
             reports.append(rep)
     return reports
@@ -1077,6 +1105,11 @@ def locked_accounts() -> list[dict]:
     """Cuentas que Arx mantiene bloqueadas a la espera de que una persona decida."""
     return [{"user": b["revert"].get("user"), "since": b.get("applied_at"), "detail": b.get("detail")}
             for b in _load_blocks() if _holds_until_human(b)]
+
+
+def revert_failed(done: str | None) -> bool:
+    """¿El revert dice que no pudo? Todo mensaje de ese fallo empieza por este texto."""
+    return bool(done) and done.startswith(tr("could not"))
 
 
 def unlock_account(user: str) -> str | None:
@@ -1090,11 +1123,11 @@ def unlock_account(user: str) -> str | None:
         mine = [b for b in blocks if _holds_until_human(b) and b["revert"].get("user") == user]
         if not mine:
             return None
-        done = _apply_revert(mine[0]["revert"]) if _is_linux_root() else "listo para ejecutar en destino"
-        if done and done.startswith("no se pudo"):
+        done = _apply_revert(mine[0]["revert"]) if _is_linux_root() else tr("ready to run on the target")
+        if revert_failed(done):
             return done  # sigue bloqueada: no se finge
         # su IP de origen tampoco debe seguir cerrada una hora más
-        origin = [b for b in blocks if str(b.get("detail", "")).startswith(f"origen de la cuenta bloqueada {user}:")]
+        origin = [b for b in blocks if b.get("origin_of") == user]
         for b in origin:
             if _is_linux_root():
                 _apply_revert(b.get("revert"))
@@ -1107,7 +1140,8 @@ def unlock_account(user: str) -> str | None:
         _save_pending([p for p in _load_pending() if not (
             p.get("kind") == "login_users"
             and str((p.get("target") or {}).get("user", "")).partition("@")[0] == user)])
-    record({"kind": "identity_unlocked", "detail": f"cuenta '{user}' desbloqueada por decisión humana",
+    record({"kind": "identity_unlocked", "detail": tr("account '{user}' unlocked by human decision",
+                                                      user=user),
             "result": done})
     return done
 
@@ -1116,16 +1150,16 @@ def _execute_tier2(finding: dict) -> str:
     """Ejecuta una remediación Tier 2 ya autorizada por el humano. Nunca antes."""
     kind, target = finding.get("kind"), finding.get("target") or {}
     if not _is_linux_root():
-        return "listo para ejecutar en destino (requiere Linux + root)"
+        return tr("ready to run on the target (requires Linux + root)")
     if kind == "integrity" and target.get("file"):
         return _restore_from_vault(str(target["file"]))
     if kind == "login_users" and target.get("user"):
-        return contain_identity(finding, "tú, con tu palabra de autorización")["summary"]
+        return contain_identity(finding, tr("you, with your authorization word"))["summary"]
     if kind in ("listen_ports", "port_scan", "auth_bruteforce", "reverse_shell", "intel_ip"):
         # reapareció tras expirar y decidiste tú: la misma contención, otra hora
         cfg = config.load_config()
         reason = protected_reason(finding, cfg)
-        return f"protegido ({reason}): no se actúa" if reason else _execute_tier1(finding, cfg)[0]
+        return tr("protected ({reason}): no action taken", reason=reason) if reason else _execute_tier1(finding, cfg)[0]
     if kind in ("executables", "processes"):
         return _kill_and_quarantine(finding)
     if kind == "suid_new" and target.get("path"):
@@ -1133,9 +1167,9 @@ def _execute_tier2(finding: dict) -> str:
     if kind == "uid0_account" and target.get("user"):
         locked, msg = _lock_account(str(target["user"]), finding, allow_uid0=True)
         # comparte uid con root: cerrar por uid mataría todo lo de root
-        return msg + (". Sus sesiones abiertas NO se cierran: comparten uid con root. Búscalas con "
-                      "`who` y ciérralas a mano" if locked else "")
-    return "plan registrado — aún sin ejecutor Tier 2 para este tipo"
+        return msg + (tr(". Its open sessions are NOT closed: they share a uid with root. Find "
+                         "them with `who` and close them by hand") if locked else "")
+    return tr("plan logged: no Tier 2 executor yet for this type")
 
 
 # ── cola de acciones Tier 2 pendientes de autorización humana ─────────────────
@@ -1204,15 +1238,16 @@ def accept(fp: str) -> str | None:
     if not e or not e.get("set"):
         return None
     if not baseline.accept(e["set"], e["item"]):
-        return "No se pudo actualizar la línea base (¿existe y contiene ese conjunto?)."
+        return tr("Could not update the baseline (does it exist and contain that set?).")
     contained = _active_block(fp)
     forget(fp)
     record({"kind": "accepted", "detail": e.get("detail")})
-    out = [f"✓ Aceptado como normal: {e['item']}" + ("  ·  su bloqueo se ha levantado" if contained else "")]
+    out = [tr("✓ Accepted as normal: {item}", item=e['item']) + (tr("  ·  its block has been lifted") if contained else "")]
     if e.get("vaccine") and vaccines.note_false_positive(e["vaccine"]):  # a la tercera se retira sola
-        out.append(f"⚠ Vacuna {e['vaccine']} retirada: la has desmentido varias veces.")
+        out.append(tr("⚠ Vaccine {vaccine} removed: you have refuted it several times.",
+                      vaccine=e['vaccine']))
     if str(e["item"]).partition("@")[0] in {a["user"] for a in locked_accounts()}:
-        out.append("⚠ Esa cuenta sigue bloqueada: aceptar no la desbloquea. Usa:  arx unlock")
+        out.append(tr("⚠ That account stays locked: accepting does not unlock it. Use:  arx unlock"))
     return "\n".join(out)
 
 
@@ -1319,8 +1354,11 @@ def restore_kernel_blocks(now=None) -> dict | None:
     if not missing:
         return None
     return {"sev": "high", "kind": "firewall_reset",
-            "detail": f"el firewall se vació (reinicio o flush): {restored} de {missing} bloqueos repuestos",
-            "why": "un reinicio lo explica; si no reiniciaste, alguien con root borró las reglas de Arx"}
+            "fp_key": f"firewall_reset|el firewall se vació (reinicio o flush): {restored} de {missing} bloqueos repuestos",
+            "detail": tr("the firewall was emptied (reboot or flush): {restored} of {missing} "
+                         "blocks put back", restored=restored, missing=missing),
+            "why": tr("a reboot explains it; if you did not reboot, someone with root deleted "
+                      "Arx's rules")}
 
 
 def _nft_chain(listing: str, name: str) -> str:
@@ -1460,7 +1498,7 @@ def _execute_tier1(finding: dict, cfg: dict | None = None) -> tuple[str, dict | 
     respuesta a escaneo/fuerza bruta: "block" (por defecto) o "tarpit" (estrangular).
     """
     if not _is_linux_root():
-        return "listo para ejecutar en destino (requiere Linux + root)", None
+        return tr("ready to run on the target (requires Linux + root)"), None
     kind = finding.get("kind")
     target = finding.get("target") or {}
     if kind == "listen_ports" and target.get("port"):
@@ -1469,44 +1507,46 @@ def _execute_tier1(finding: dict, cfg: dict | None = None) -> tuple[str, dict | 
             # nftables también con ufw activo: un DROP en su propia tabla manda sea cual sea el
             # orden de las reglas de ufw, no toca las del admin y expira solo aunque Arx caiga.
             if not _nft_setup():
-                return "nftables presente pero no se pudo preparar la tabla arx", None
+                return tr("nftables present but the arx table could not be prepared"), None
             r = subprocess.run(["nft", "add", "element", "inet", "arx", f"block_{proto}",
                                 f"{{ {port} timeout {DEFAULT_TTL_MIN}m }}"],
                                capture_output=True, text=True, timeout=15)
             if r.returncode == 0:
                 revert = {"tool": "nft", "port": port, "proto": proto}
                 register_block(finding, revert)
-                return (f"puerto {port}/{proto} bloqueado en nftables "
-                        f"(timeout nativo {DEFAULT_TTL_MIN} min + reversión de Arx)"), revert
-            return f"nft falló al bloquear ({r.stderr.strip()[:48]})", None
+                return (tr("port {port}/{proto} blocked in nftables (native timeout "
+                           "{DEFAULT_TTL_MIN} min + Arx revert)",
+                           port=port, proto=proto, DEFAULT_TTL_MIN=DEFAULT_TTL_MIN)), revert
+            return tr("nft failed to block ({v})", v=r.stderr.strip()[:48]), None
         if shutil.which("ufw") and _ufw_active():
             # `ufw deny` sobre un puerto con regla la SOBRESCRIBE, y al revertir la borraría
             if _ufw_has_port_rule(port):
-                return (f"ufw ya tiene una regla para el puerto {port}: no se toca (bloquear la "
-                        "destruiría). Instala nftables para cortar sin tocar tus reglas"), None
+                return (tr("ufw already has a rule for port {port}: not touched (blocking would "
+                           "destroy it). Install nftables to cut it without touching your rules",
+                           port=port)), None
             r = subprocess.run(["ufw", "prepend", "deny", f"{port}/{proto}"],
                                capture_output=True, text=True, timeout=15)
             if r.returncode == 0:
                 revert = {"tool": "ufw", "port": port, "proto": proto}
                 register_block(finding, revert)
-                return (f"puerto {port}/{proto} bloqueado en ufw "
-                        f"(auto-expira en {DEFAULT_TTL_MIN} min)"), revert
-            return f"no se pudo bloquear el puerto ({r.stderr.strip()[:48]})", None
+                return (tr("port {port}/{proto} blocked in ufw (auto-expires in {DEFAULT_TTL_MIN} "
+                           "min)", port=port, proto=proto, DEFAULT_TTL_MIN=DEFAULT_TTL_MIN)), revert
+            return tr("could not block the port ({v})", v=r.stderr.strip()[:48]), None
         if shutil.which("ufw"):
             # `ufw deny` "funciona" con ufw apagado pero no filtra nada → no fingir contención
-            return "ufw está INACTIVO: un bloqueo no tendría efecto (actívalo o decide tú)", None
-        return "sin ufw ni nftables: no hay ejecutor seguro de bloqueo en este host", None
+            return tr("ufw is INACTIVE: a block would have no effect (enable it or decide yourself)"), None
+        return tr("no ufw or nftables: no safe block executor on this host"), None
     if kind in ("executables", "processes"):
         exe = str(target.get("exe") or target.get("process") or "")
         if not exe.startswith("/"):
             # suspender por NOMBRE es inseguro (match erróneo) → se propone, no se auto-ejecuta
-            return "sin ruta de ejecutable resuelta: no se suspende por nombre", None
+            return tr("no resolved executable path: nothing is suspended by name"), None
         base = exe.rsplit("/", 1)[-1]
         if base in _PROTECTED_EXES:
-            return f"proceso crítico ({base}): jamás se suspende", None
+            return tr("critical process ({base}): never suspended", base=base), None
         pids = [p for p in _pids_for_exe(exe) if p > 1 and p != os.getpid()]
         if not pids:
-            return "el proceso ya no está vivo: nada que suspender", None
+            return tr("the process is no longer alive: nothing to suspend"), None
         stopped = 0
         for pid in pids:
             try:
@@ -1515,19 +1555,19 @@ def _execute_tier1(finding: dict, cfg: dict | None = None) -> tuple[str, dict | 
             except OSError:
                 continue
         if not stopped:
-            return "no se pudo suspender (carrera o permisos)", None
+            return tr("could not suspend (race or permissions)"), None
         revert = {"tool": "sigstop", "exe": exe, "pids": pids}
         register_block(finding, revert)
-        return (f"proceso suspendido ({stopped} pid) — SIGCONT automático al expirar "
-                f"({DEFAULT_TTL_MIN} min)"), revert
+        return (tr("process suspended ({stopped} pid): automatic SIGCONT on expiry "
+                   "({DEFAULT_TTL_MIN} min)", stopped=stopped, DEFAULT_TTL_MIN=DEFAULT_TTL_MIN)), revert
     if kind == "canary":
-        return "nivel de alerta elevado y contexto capturado", None
+        return tr("alert level raised and context captured"), None
     if kind in ("port_scan", "auth_bruteforce", "intel_ip") and target.get("ip"):
         ip = str(target["ip"])
         try:
             fam = ipaddress.ip_address(ip).version
         except ValueError:
-            return f"IP inválida ({ip}): no se bloquea", None
+            return tr("invalid IP ({ip}): not blocked", ip=ip), None
         # Política de respuesta (Core): "tarpit" estrangula per-IP en vez de bloquear. Solo a
         # escaneos: 2 conexiones/s apenas frenan una fuerza bruta SSH (medido: de 56 a 34
         # contraseñas en 20 s), así que esa se sigue bloqueando.
@@ -1536,29 +1576,30 @@ def _execute_tier1(finding: dict, cfg: dict | None = None) -> tuple[str, dict | 
         if kind == "port_scan" and (cfg or {}).get("ip_response") == "tarpit":
             if _nft_available():
                 if not _nft_setup():
-                    return "nftables presente pero no se pudo preparar la tabla arx", None
+                    return tr("nftables present but the arx table could not be prepared"), None
                 r = subprocess.run(["nft", "add", "element", "inet", "arx", f"tarpit{fam}",
                                     f"{{ {ip} timeout {DEFAULT_TTL_MIN}m }}"],
                                    capture_output=True, text=True, timeout=15)
                 if r.returncode == 0:
                     revert = {"tool": "nft_tarpit", "ip": ip}
                     register_block(finding, revert)
-                    return (f"IP {ip} ESTRANGULADA en nftables (rate-limit per-IP ~2 conx/s "
-                            f"y ~50 paq/s; auto-expira en {DEFAULT_TTL_MIN} min)"), revert
-                return f"nft falló al estrangular la IP ({r.stderr.strip()[:48]})", None
+                    return (tr("IP {ip} THROTTLED in nftables (per-IP rate limit ~2 conn/s and ~50 "
+                               "pkt/s; auto-expires in {DEFAULT_TTL_MIN} min)",
+                               ip=ip, DEFAULT_TTL_MIN=DEFAULT_TTL_MIN)), revert
+                return tr("nft failed to throttle the IP ({v})", v=r.stderr.strip()[:48]), None
             # sin nft no hay tarpit posible → se sigue por la rama de bloqueo (honesto)
         if _nft_available():
             if not _nft_setup():
-                return "nftables presente pero no se pudo preparar la tabla arx", None
+                return tr("nftables present but the arx table could not be prepared"), None
             r = subprocess.run(["nft", "add", "element", "inet", "arx", f"block_ipv{fam}",
                                 f"{{ {ip} timeout {DEFAULT_TTL_MIN}m }}"],
                                capture_output=True, text=True, timeout=15)
             if r.returncode == 0:
                 revert = {"tool": "nft_ip", "ip": ip}
                 register_block(finding, revert)
-                return (f"IP {ip} bloqueada en nftables "
-                        f"(timeout nativo {DEFAULT_TTL_MIN} min + reversión de Arx)"), revert
-            return f"nft falló al bloquear la IP ({r.stderr.strip()[:48]})", None
+                return (tr("IP {ip} blocked in nftables (native timeout {DEFAULT_TTL_MIN} min + "
+                           "Arx revert)", ip=ip, DEFAULT_TTL_MIN=DEFAULT_TTL_MIN)), revert
+            return tr("nft failed to block the IP ({v})", v=r.stderr.strip()[:48]), None
         if shutil.which("ufw") and _ufw_active():
             # prepend: ufw aplica la primera regla que casa, y un `deny` añadido al final queda
             # detrás de tu `allow 22/tcp`: la IP "bloqueada" seguiría llegando al SSH.
@@ -1567,18 +1608,19 @@ def _execute_tier1(finding: dict, cfg: dict | None = None) -> tuple[str, dict | 
             if r.returncode == 0:
                 revert = {"tool": "ufw_ip", "ip": ip}
                 register_block(finding, revert)
-                return (f"IP {ip} bloqueada en ufw, solo para conexiones nuevas: las ya abiertas "
-                        f"siguen (instala nftables para cortarlas). Auto-expira en {DEFAULT_TTL_MIN} min"), revert
-            return f"no se pudo bloquear la IP ({r.stderr.strip()[:48]})", None
+                return (tr("IP {ip} blocked in ufw, for new connections only: those already open "
+                           "stay up (install nftables to cut them). Auto-expires in "
+                           "{DEFAULT_TTL_MIN} min", ip=ip, DEFAULT_TTL_MIN=DEFAULT_TTL_MIN)), revert
+            return tr("could not block the IP ({v})", v=r.stderr.strip()[:48]), None
         if shutil.which("ufw"):
-            return "ufw está INACTIVO: un bloqueo no tendría efecto (actívalo o decide tú)", None
-        return "sin ufw ni nftables: no hay ejecutor seguro de bloqueo en este host", None
+            return tr("ufw is INACTIVE: a block would have no effect (enable it or decide yourself)"), None
+        return tr("no ufw or nftables: no safe block executor on this host"), None
     if kind == "reverse_shell" and target.get("ip"):
         ip = str(target["ip"])
         try:
             fam = ipaddress.ip_address(ip).version
         except ValueError:
-            return f"IP inválida ({ip}): no se actúa", None
+            return tr("invalid IP ({ip}): no action taken", ip=ip), None
         port, exe = target.get("port"), str(target.get("exe") or "")
         actions, reverts = [], []
         # 1) cortar el canal: el rc de `nft add element` es fiable; el de `ss -K` no lo es
@@ -1589,9 +1631,9 @@ def _execute_tier1(finding: dict, cfg: dict | None = None) -> tuple[str, dict | 
                                capture_output=True, text=True, timeout=15)
             if r.returncode == 0:
                 reverts.append({"tool": "nft_c2", "ip": ip, "port": port})
-                actions.append(f"canal C2 cortado en nftables ({ip}:{port})")
+                actions.append(tr("C2 channel cut in nftables ({ip}:{port})", ip=ip, port=port))
         if not reverts:
-            actions.append("el canal C2 SIGUE ABIERTO (sin nftables utilizable)")
+            actions.append(tr("the C2 channel IS STILL OPEN (no usable nftables)"))
         # 2) suspender SOLO el proceso dueño; anti reutilización de PID: solo si
         #    /proc/<pid>/exe sigue siendo el mismo binario (nunca se suspende por nombre).
         stopped = []
@@ -1607,15 +1649,16 @@ def _execute_tier1(finding: dict, cfg: dict | None = None) -> tuple[str, dict | 
                     continue
         if stopped:
             reverts.append({"tool": "sigstop", "exe": exe, "pids": stopped})
-            actions.append(f"proceso dueño suspendido ({len(stopped)} pid)")
+            actions.append(tr("owning process suspended ({n} pid)", n=len(stopped)))
         else:
-            actions.append("sin proceso vivo que suspender")
+            actions.append(tr("no live process to suspend"))
         if not reverts:
             return " · ".join(actions), None
         for revert in reverts:
             register_block(finding, revert)
-        return " · ".join(actions) + f" — se deshace solo en {DEFAULT_TTL_MIN} min", reverts[0]
-    return "propuesta (sin ejecutor automático seguro para este tipo)", None
+        return " · ".join(actions) + tr(": undoes itself in {DEFAULT_TTL_MIN} min",
+                                         DEFAULT_TTL_MIN=DEFAULT_TTL_MIN), reverts[0]
+    return tr("proposal (no safe automatic executor for this type)"), None
 
 
 def handle(finding: dict, enforce: bool = False, authorized: bool = False,
@@ -1644,45 +1687,49 @@ def handle(finding: dict, enforce: bool = False, authorized: bool = False,
         outcome["new"] = entry is None
         entry = entry or {"first_seen": _iso(now), "seen": 0, "kind": finding.get("kind"),
                           "detail": finding.get("detail"), "set": finding.get("set"),
-                          "item": finding.get("item"), "vaccine": finding.get("vaccine")}
+                          "item": finding.get("item"), "vaccine": finding.get("vaccine"),
+                          "ip": (finding.get("target") or {}).get("ip")}
         entry["seen"] += 1
         entry["last_seen"] = _iso(now)
 
         reason = protected_reason(finding, cfg) if tier == 1 else None
         if tier == 0:
-            status = "observado y registrado"
+            status = tr("observed and logged")
         elif tier == 1 and reason:
             outcome["tier"] = 0
-            status = f"protegido ({reason}) — solo se observa"
+            status = tr("protected ({reason}): observed only", reason=reason)
         elif tier == 1 and (blk := _active_block(fp, now)):
-            status = f"ya contenido (bloqueo activo {_until(blk)})"
+            status = tr("already contained (active block {blk})", blk=_until(blk))
         elif tier == 1 and entry.get("blocked_before"):
             outcome["tier"] = 2
-            pid = _add_pending(finding, {"action": f"{plan['action']} — REAPARECIÓ tras expirar el bloqueo"})
+            pid = _add_pending(finding, {"action": tr("{action}: REAPPEARED after the block expired",
+                                                      action=plan['action'])})
             outcome["pending_id"] = pid
-            status = f"reapareció tras expirar el bloqueo → decide tú: arx authorize {pid}  ·  o acepta: arx accept {fp}"
+            status = tr("reappeared after the block expired → your call: arx authorize {pid}  ·  "
+                        "or accept: arx accept {fp}", pid=pid, fp=fp)
         elif tier == 1 and not enforce:
-            status = "propuesta auto — activa --enforce para aplicar"
+            status = tr("automatic proposal: enable --enforce to apply")
         elif tier == 1 and breaker_tripped(now, finding.get("sev")):
-            status = (f"FRENO DE SEGURIDAD: ya hubo {MAX_TIER1_PER_HOUR} acciones automáticas en la "
-                      "última hora → solo observo")
+            status = (tr("SAFETY BRAKE: already {MAX_TIER1_PER_HOUR} automatic actions in the last "
+                         "hour → observing only", MAX_TIER1_PER_HOUR=MAX_TIER1_PER_HOUR))
         elif tier == 1:
             status, revert = _execute_tier1(finding, cfg)
             if revert:
                 outcome["revert"] = revert
                 _note_action(now)
                 if finding.get("set"):  # lo primero que quiere saber quien acaba de instalar algo
-                    status += f" · si es legítimo:  arx accept {fp}"
+                    status += tr(" · if legitimate:  arx accept {fp}", fp=fp)
         elif tier == 2 and (blk := _active_block(fp, now) or _lock_of(finding)):
-            status = f"ya autorizado y activo {_until(blk)}"
+            status = tr("already authorized and active {blk}", blk=_until(blk))
         elif tier == 2 and entry.get("human_cleared"):
-            status = f"la desbloqueaste tú: solo se observa (hazla normal con: arx accept {fp})"
+            status = tr("you unlocked it: observed only (make it normal with: arx accept {fp})",
+                        fp=fp)
         elif authorized:
-            status = "autorizada por palabra ✓"
+            status = tr("authorized by word ✓")
         else:  # tier 2
             pid = _add_pending(finding, plan)
             outcome["pending_id"] = pid
-            status = f"PENDIENTE (id {pid}) — autoriza con: arx authorize {pid}"
+            status = tr("PENDING (id {pid}): authorize with: arx authorize {pid}", pid=pid)
         outcome["status"] = status
 
         changed = entry.get("status") != status

@@ -17,6 +17,7 @@ import subprocess
 from datetime import datetime, timedelta, timezone
 
 from arx import config
+from arx.i18n import tr
 from arx.modules import response
 from arx.redact import printable
 
@@ -26,11 +27,11 @@ MIN_SEEN = 20        # barridos
 MIN_DAYS = 3
 # Lo que escribe cada propuesta y cómo se comprueba con `sshd -T`
 _SSH_FIXES = {
-    "ssh-sin-contrasena": {"line": "PasswordAuthentication no", "key": "passwordauthentication", "value": "no",
-                           "bad": ("yes",), "title": "que SSH no admita contraseñas, solo llaves"},
-    "ssh-root-sin-contrasena": {"line": "PermitRootLogin prohibit-password", "key": "permitrootlogin",
+    "ssh-no-password": {"line": "PasswordAuthentication no", "key": "passwordauthentication", "value": "no",
+                           "bad": ("yes",), "title": tr("stop SSH accepting passwords, keys only")},
+    "ssh-root-key-only": {"line": "PermitRootLogin prohibit-password", "key": "permitrootlogin",
                                 "value": "without-password", "bad": ("yes",),
-                                "title": "que root solo entre por SSH con llave"},
+                                "title": tr("root can only log in over SSH with a key")},
 }
 
 
@@ -92,9 +93,11 @@ def _ssh_proposals() -> list[dict]:
     for pid, fix in _SSH_FIXES.items():
         if effective.get(fix["key"]) not in fix["bad"] or pid in _applied():
             continue
-        out.append({"id": pid, "kind": "postura", "title": fix["title"],
-                    "why": (f"has recibido {attacks} ataque(s) de fuerza bruta: con esto dejarían de poder funcionar"
-                            if attacks else "evita que una contraseña débil o robada baste para entrar"),
+        out.append({"id": pid, "kind": "posture", "title": fix["title"],
+                    "why": (tr("you have had {attacks} brute-force attack(s): with this they could "
+                               "no longer work", attacks=attacks)
+                            if attacks else tr("keeps a weak or stolen password from being enough "
+                                               "to get in")),
                     "admin_with_key": _admin_with_key()})
     return out
 
@@ -111,8 +114,10 @@ def _repeat_proposals(now: datetime | None = None) -> list[dict]:
         except ValueError:
             continue
         if e.get("seen", 0) >= MIN_SEEN and first <= cutoff:
-            out.append({"id": fp, "kind": "normalizar", "title": f"aceptar como normal: {printable(e.get('item'))}",
-                        "why": f"visto {e['seen']} veces desde {str(e.get('first_seen'))[:10]}, sin que nadie lo revisara"})
+            out.append({"id": fp, "kind": "normalize", "title": tr("accept as normal: {v}",
+                                                                    v=printable(e.get('item'))),
+                        "why": tr("seen {seen} times since {v}, with nobody reviewing it",
+                                  seen=e['seen'], v=str(e.get('first_seen'))[:10])})
     return out
 
 
@@ -145,40 +150,43 @@ def _write_dropin(lines: list[str]) -> None:
         return
     fd = os.open(SSHD_DROPIN, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
     with os.fdopen(fd, "w") as f:
-        f.write("# Arx: propuesta aprobada por el operador. Deshazlo con: arx proposals revert <id>\n")
+        f.write("# Arx: proposal approved by the operator. Undo it with: arx proposals revert <id>\n")
         f.write("\n".join(lines) + "\n")
 
 
 def apply_ssh(pid: str) -> str:
     fix = _SSH_FIXES.get(pid)
     if fix is None:
-        return f"no conozco la propuesta {printable(pid)}"
-    if pid == "ssh-sin-contrasena" and not _admin_with_key():
-        return "no se aplica: ninguna cuenta de administración tiene llave SSH, y te quedarías fuera"
+        return tr("unknown proposal {pid}", pid=printable(pid))
+    if pid == "ssh-no-password" and not _admin_with_key():
+        return tr("not applied: no admin account has an SSH key, and you would be locked out")
     if not _includes_dropins():
-        return f"no se aplica: sshd_config no incluye {SSHD_DROPIN_DIR}/ y no tendría efecto"
+        return tr("not applied: sshd_config does not include {SSHD_DROPIN_DIR}/ and it would have "
+                  "no effect", SSHD_DROPIN_DIR=SSHD_DROPIN_DIR)
     current = [_SSH_FIXES[p]["line"] for p in _applied()]
     _write_dropin(sorted({*current, fix["line"]}))
     effective = _sshd_effective()
     if effective is None or effective.get(fix["key"]) != fix["value"]:  # sshd -T falla si no es válida
         _write_dropin(current)
-        return "no se aplica: sshd no lo acepta o sigue con otro valor. Se ha dejado como estaba"
+        return tr("not applied: sshd does not accept it or keeps another value. It was left as it "
+                  "was")
     if not _reload_sshd():
         _write_dropin(current)
-        return "no se pudo recargar sshd: se ha dejado como estaba"
+        return tr("could not reload sshd: it was left as it was")
     response.record({"kind": "proposal_applied", "detail": fix["title"], "result": fix["line"]})
-    return (f"hecho: {fix['title']}. Las sesiones abiertas siguen. Pruébalo desde OTRA terminal antes de cerrar "
-            f"esta. Se deshace con:  arx proposals revert {pid}")
+    return (tr("done: {title}. Open sessions stay up. Test it from ANOTHER terminal before closing "
+               "this one. Undo with:  arx proposals revert {pid}", title=fix['title'], pid=pid))
 
 
 def revert_ssh(pid: str) -> str:
     fix = _SSH_FIXES.get(pid)
     if fix is None or pid not in _applied():
-        return f"la propuesta {printable(pid)} no está aplicada"
+        return tr("proposal {pid} is not applied", pid=printable(pid))
     _write_dropin([_SSH_FIXES[p]["line"] for p in _applied() if p != pid])
     reloaded = _reload_sshd()
     response.record({"kind": "proposal_reverted", "detail": fix["title"]})
-    return f"deshecho: {fix['title']}" + ("" if reloaded else ". Ojo: no pude recargar sshd, hazlo a mano")
+    return tr("undone: {title}", title=fix['title']) + ("" if reloaded else tr(". Note: could not reload sshd, do it "
+                                                                 "by hand"))
 
 
 def run(action: str = "list", pid: str | None = None) -> int:
@@ -188,32 +196,33 @@ def run(action: str = "list", pid: str | None = None) -> int:
         props = all_proposals()
         applied = _applied()
         if not props and not applied:
-            print("Arx no tiene nada que proponerte ahora mismo.")
+            print(tr("Arx has nothing to propose right now."))
             return 0
         if props:
-            print("\n▸ Arx te propone (nada de esto se aplica solo):")
+            print(tr("\n▸ Arx proposes (none of this applies on its own):"))
         for p in props:
-            print(f"  {p['id']}\n      {p['title']}\n      por qué: {p['why']}")
-            if p.get("kind") == "postura" and p["id"] == "ssh-sin-contrasena" and not p.get("admin_with_key"):
-                print("      ⚠ hoy no se puede: ninguna cuenta de administración tiene llave SSH")
+            print(tr("  {id}\n      {title}\n      why: {why}",
+                     id=p['id'], title=p['title'], why=p['why']))
+            if p.get("kind") == "posture" and p["id"] == "ssh-no-password" and not p.get("admin_with_key"):
+                print(tr("      ⚠ not possible today: no admin account has an SSH key"))
         for a in applied:
-            print(f"  aplicada: {a}  ·  se deshace con:  arx proposals revert {a}")
+            print(tr("  applied: {a}  ·  undo with:  arx proposals revert {a}", a=a))
         if props:
-            print("\nAplica una con:  arx proposals apply <id>\n")
+            print(tr("\nApply one with:  arx proposals apply <id>\n"))
         return 0
     cfg = config.load_config()
     if not cfg.get("auth_word"):
-        print("No hay palabra de autorización configurada. Ejecuta:  arx setup")
+        print(tr("No authorization word configured. Run:  arx setup"))
         return 1
-    word = getpass.getpass("Palabra de autorización: ").strip()
+    word = getpass.getpass(tr("Authorization word: ")).strip()
     if not config.verify_word(word, cfg.get("auth_word", {})):
-        print("Palabra incorrecta. No se ha cambiado nada.")
+        print(tr("Wrong word. Nothing was changed."))
         return 1
     if action == "revert":
         msg = revert_ssh(str(pid))
     elif pid in _SSH_FIXES:
         msg = apply_ssh(str(pid))
     else:
-        msg = response.accept(str(pid)) or f"no hay ninguna propuesta con id {printable(pid)}"
+        msg = response.accept(str(pid)) or tr("no proposal with id {pid}", pid=printable(pid))
     print(msg)
-    return 0 if msg.startswith(("hecho", "deshecho", "✓")) else 1
+    return 0 if msg.startswith((tr("done"), tr("undone"), "✓")) else 1

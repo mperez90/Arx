@@ -20,6 +20,7 @@ import urllib.request
 from datetime import datetime, timezone
 
 from arx import __version__, config
+from arx.i18n import tr
 
 GRACE_DAYS = 14
 DENY_CODES = {400, 401, 404, 410, 422}  # respuestas que significan "esta licencia no vale"
@@ -135,16 +136,18 @@ def activate(key: str, hostname: str, os_str: str, version: str, post=_post) -> 
         )
     except urllib.error.HTTPError as e:
         if e.code in (403, 409):
-            return {"ok": False, "reason": "esa llave ya está en uso en otro servidor — "
-                    "libérala con 'arx license deactivate' allí, o desde tu portal de Polar"}
+            return {"ok": False, "reason": tr("that key is already in use on another server: "
+                                              "release it with 'arx license deactivate' there, or "
+                                              "from your Polar portal")}
         if e.code == 404:
-            return {"ok": False, "reason": "llave no reconocida — revisa que la pegaste completa"}
-        return {"ok": False, "reason": f"la consola rechazó la activación (HTTP {e.code})"}
+            return {"ok": False, "reason": tr("key not recognized: check that you pasted all of it")}
+        return {"ok": False, "reason": tr("the console rejected the activation (HTTP {code})",
+                                          code=e.code)}
     except (urllib.error.URLError, TimeoutError, OSError) as e:
-        return {"ok": False, "reason": f"sin conexión con Polar: {e}"}
+        return {"ok": False, "reason": tr("no connection to Polar: {e}", e=e)}
     activation_id = resp.get("id")
     if not activation_id:
-        return {"ok": False, "reason": "Polar no devolvió activation_id"}
+        return {"ok": False, "reason": tr("Polar did not return an activation_id")}
     st = load()
     st.update({"key": key, "activation_id": activation_id, "conditions": CONDITIONS})
     save(st)
@@ -154,7 +157,7 @@ def activate(key: str, hostname: str, os_str: str, version: str, post=_post) -> 
 def validate(post=_post, now: datetime | None = None) -> dict:
     st = load()
     if not st.get("key") or not st.get("activation_id"):
-        return {"ok": False, "reason": "sin licencia activada"}
+        return {"ok": False, "reason": tr("no license activated")}
     env = _env()
     now = now or datetime.now(timezone.utc)
     try:
@@ -177,9 +180,9 @@ def validate(post=_post, now: datetime | None = None) -> dict:
             st["cache"] = cache
             save(st)
             return {"ok": False, "status": "denied", "http": e.code, "tier": "core"}
-        return {"ok": False, "offline": True, "reason": f"servidor {e.code}"}
+        return {"ok": False, "offline": True, "reason": tr("server {code}", code=e.code)}
     except (urllib.error.URLError, TimeoutError, OSError) as e:
-        return {"ok": False, "offline": True, "reason": f"sin conexión: {e}"}
+        return {"ok": False, "offline": True, "reason": tr("no connection: {e}", e=e)}
 
     status = resp.get("status")
     tier = env["benefits"].get(resp.get("benefit_id"), "core")  # sin benefit_id → Core
@@ -212,14 +215,14 @@ def effective_tier(now: datetime | None = None) -> tuple[str, str]:
     """Devuelve (tier_efectivo, razón). Núcleo de la doctrina fallar-abierto."""
     st = load()
     if not st.get("key"):
-        return "core", "sin licencia (Core)"
+        return "core", tr("no license (Core)")
     cache = st.get("cache") or {}
     if cache.get("sig") and not _verify(cache):
-        return "core", "caché de licencia manipulada → Core"
+        return "core", tr("tampered license cache → Core")
     if cache.get("status") == "revoked":
-        return "core", "licencia revocada por el servidor"
+        return "core", tr("license revoked by the server")
     if cache.get("status") == "denied":
-        return "core", f"rechazada por el servidor (HTTP {cache.get('http', '?')})"
+        return "core", tr("rejected by the server (HTTP {http})", http=cache.get('http', '?'))
 
     now = now or datetime.now(timezone.utc)
     last = _parse_iso(cache.get("last_validated_at", ""))
@@ -230,13 +233,15 @@ def effective_tier(now: datetime | None = None) -> tuple[str, str]:
         # (Un salto ADELANTE no se distingue localmente de una expiración real → degrada a
         #  Core, nunca a "sin protección"; un host en línea se autocorrige al revalidar.)
         if age_days < -1:
-            return cache.get("tier", "core"), "anomalía de reloj (retroceso) — mantengo el tier"
+            return cache.get("tier", "core"), tr("clock anomaly (went backwards): keeping the tier")
         if exp and exp < now:
-            return "core", "licencia expirada por fecha"
+            return "core", tr("license expired by date")
         if age_days <= GRACE_DAYS:
-            return cache.get("tier", "core"), f"válida (validada hace {int(max(age_days, 0))} d)"
-        return "core", f"gracia agotada ({int(age_days)} d sin validar) → Core"
-    return "core", "sin validación exitosa previa → Core"
+            return cache.get("tier", "core"), tr("valid (validated {v} d ago)",
+                                                 v=int(max(age_days, 0)))
+        return "core", tr("grace period over ({age_days} d without validating) → Core",
+                          age_days=int(age_days))
+    return "core", tr("no previous successful validation → Core")
 
 
 def tier_allows(feature: str, tier: str | None = None) -> bool:
@@ -262,7 +267,8 @@ def deactivate(post=_post) -> dict:
             )
         except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError) as e:
             return {"ok": False, "released": False,
-                    "reason": f"no se pudo liberar en Polar ({e}). Libérala desde tu portal de Polar."}
+                    "reason": tr("could not release it in Polar ({e}). Release it from your Polar "
+                                 "portal.", e=e)}
     st.pop("activation_id", None)
     st.pop("cache", None)
     save(st)

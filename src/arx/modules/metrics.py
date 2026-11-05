@@ -13,6 +13,7 @@ import json
 from datetime import datetime, timedelta, timezone
 
 from arx import __version__, config
+from arx.i18n import tr
 
 TARGET_FP_PER_DAY = 0.1
 _HIGH = ("high", "crit")
@@ -88,21 +89,29 @@ def run(days: int = 7, as_json: bool = False) -> int:
         print(json.dumps(m, ensure_ascii=False, indent=1))
         return 0
     if not m["days_covered"]:
-        print("Aún no hay nada que medir: Arx no ha registrado ningún evento.")
+        print(tr("Nothing to measure yet: Arx has not recorded any event."))
         return 0
-    print(f"\n▸ Arx — ruido en este host (últimos {m['days_covered']} días)")
-    print(f"  hallazgos nuevos      {m['findings_new']}")
-    print(f"  altos o críticos      {m['alerts_high']}  ({m['alerts_high_per_day']}/día)")
-    print(f"  falsos positivos      {m['false_positives']}  ({m['false_positives_per_day']}/día · "
-          f"objetivo < {TARGET_FP_PER_DAY}/día)")
-    print(f"  altos sin revisar     {m['unreviewed_high']}")
-    verdict = {True: "sí", False: "no", None: "aún no se puede saber: revisa las alertas"}[m["within_target"]]
-    print(f"  dentro del objetivo   {verdict}")
-    print(f"  acciones automáticas  {m['automatic_actions']}")
+    print(tr("\n▸ Arx: noise on this host (last {days_covered} days)",
+             days_covered=m['days_covered']))
+    print(tr("  new findings          {findings_new}", findings_new=m['findings_new']))
+    print(tr("  high or critical      {alerts_high}  ({alerts_high_per_day}/day)",
+             alerts_high=m['alerts_high'], alerts_high_per_day=m['alerts_high_per_day']))
+    print(tr("  false positives       {false_positives}  ({false_positives_per_day}/day · target < "
+             "{TARGET_FP_PER_DAY}/day)",
+             false_positives=m['false_positives'], false_positives_per_day=m['false_positives_per_day'],
+             TARGET_FP_PER_DAY=TARGET_FP_PER_DAY))
+    print(tr("  high, unreviewed      {unreviewed_high}", unreviewed_high=m['unreviewed_high']))
+    verdict = {True: tr("yes"), False: "no", None: tr("cannot tell yet: review the alerts")}[m["within_target"]]
+    print(tr("  within target         {verdict}", verdict=verdict))
+    print(tr("  automatic actions     {automatic_actions}",
+             automatic_actions=m['automatic_actions']))
     if m["accounts_locked_by_model"]:
-        print(f"  cuentas que bloqueó el modelo  {m['accounts_locked_by_model']}")
+        print(tr("  accounts locked by the model  {accounts_locked_by_model}",
+                 accounts_locked_by_model=m['accounts_locked_by_model']))
     for kind, n in m["high_by_kind"].items():
         print(f"    {kind:<18} {n}")
-    print("\n  Un falso positivo solo cuenta si lo marcas (arx accept, arx unlock): lo que no revises")
-    print("  sale como «sin revisar», no como acierto. Para compartir solo las cifras: arx metrics --json\n")
+    print(tr("\n  A false positive only counts if you mark it (arx accept, arx unlock): whatever "
+             "you do not review"))
+    print(tr("  shows as «unreviewed», not as a hit. To share only the numbers: arx metrics "
+             "--json\n"))
     return 0

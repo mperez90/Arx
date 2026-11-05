@@ -10,7 +10,7 @@ source lab/systemd/lib.sh
 lab_up
 
 step "journald: lo que dice el servicio se puede leer al momento"
-check "el arranque aparece en el journal" wait_for 15 bash -c "docker exec $VIC journalctl -u arx --no-pager -q | grep -q 'en guardia'"
+check "el arranque aparece en el journal" wait_for 15 bash -c "docker exec $VIC journalctl -u arx --no-pager -q | grep -q 'on guard'"
 
 step "Restart=always: morir no deja el host sin guardia"
 PID=$(v systemctl show -p MainPID --value arx)
@@ -21,7 +21,7 @@ step "el servicio endurecido actúa de verdad: escaneo real"
 a nmap -sS -p 9000-9020 --max-retries 1 victim >/dev/null 2>&1
 if wait_for 70 in_block_set "$ATTACKER_IP"; then pass "IP bloqueada por el servicio"; else fail "IP bloqueada por el servicio"; fi
 if reaches 22; then fail "el atacante ya no llega al SSH"; else pass "el atacante ya no llega al SSH"; fi
-check "al momento lo explica en el journal" bash -c "docker exec $VIC journalctl -u arx --no-pager -q | grep -q 'escaneo desde'"
+check "al momento lo explica en el journal" bash -c "docker exec $VIC journalctl -u arx --no-pager -q | grep -q 'scan from'"
 slate
 
 step "el servicio endurecido suspende un dropper en /tmp y en /home"
@@ -44,7 +44,7 @@ if [ -n "$PEND" ]; then
   release
   if a sshpass -p clave-bob ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 bob@victim true 2>/dev/null; then
     fail "la contraseña robada sigue sin entrar"; else pass "la contraseña robada sigue sin entrar"; fi
-  v arx status | grep -E "cuentas bloq" | sed 's/^/  /'
+  v arx status | grep -E "locked accts" | sed 's/^/  /'
   word unlock bob | sed 's/^/  /'
   check "tras arx unlock vuelve a entrar" a sshpass -p clave-bob ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 bob@victim true
 fi
@@ -62,8 +62,8 @@ wait_for 15 v systemctl is-active -q arx
 docker exec -d "$ATT" sshpass -p clave-bob ssh -o StrictHostKeyChecking=no bob@victim "sleep 900"
 closed() { ! docker exec "$ATT" pgrep -f "ssh.*bob@victim" >/dev/null; }
 if wait_for 70 closed; then pass "el servicio cerró solo la sesión sin terminal"; else fail "el servicio cerró solo la sesión sin terminal"; fi
-check "la cuenta queda bloqueada" bash -c "docker exec $VIC arx status | grep -q 'cuentas bloq.*bob'"
-check "el dueño lo lee en el journal, con el contexto" bash -c "docker exec $VIC journalctl -u arx --no-pager -q | grep -q 'Veredicto del modelo: amenaza'"
+check "la cuenta queda bloqueada" bash -c "docker exec $VIC arx status | grep -q 'locked accts.*bob'"
+check "el dueño lo lee en el journal, con el contexto" bash -c "docker exec $VIC journalctl -u arx --no-pager -q | grep -q 'Model verdict: threat'"
 word unlock bob | sed 's/^/  /'
 v bash -c 'rm -f /etc/systemd/system/arx.service.d/stub.conf; systemctl daemon-reload; systemctl restart arx'
 slate
@@ -112,7 +112,7 @@ v bash -c 'ufw allow 22/tcp >/dev/null; for p in 9001 9002 9003 9004 9005 9006 9
 check "ufw activo y el SSH llega" reaches 22
 a nmap -sS -p 9001-9010 --max-retries 1 victim >/dev/null 2>&1
 v arx guard --once --enforce >/dev/null 2>&1
-v arx status | grep -E "bloqueos" | sed 's/^/  /'
+v arx status | grep -E "T1 blocks" | sed 's/^/  /'
 v ufw status numbered | head -6 | sed 's/^/  /'
 if reaches 22; then fail "ufw: el atacante bloqueado no llega a un puerto permitido"; else pass "ufw: el atacante bloqueado no llega a un puerto permitido"; fi
 release; scan_clean
@@ -167,21 +167,21 @@ said() { a curl -s http://localhost:8081/sent | grep -q "$1"; }
 code() { vpy "import base64, time
 from arx import config, totp
 print(totp._code(base64.b32decode(config.load_secrets()['telegram_totp']), int(time.time() // 30)))"; }
-inject 666 "/estado"
+inject 666 "/status"
 sleep 5
-if said "Esperan"; then fail "a un desconocido no se le contesta"; else pass "a un desconocido no se le contesta"; fi
-inject 4242 "/estado"
-if wait_for 15 said "Esperan"; then pass "el dueño recibe respuesta"; else fail "el dueño recibe respuesta"; fi
+if said "Waiting on your"; then fail "a un desconocido no se le contesta"; else pass "a un desconocido no se le contesta"; fi
+inject 4242 "/status"
+if wait_for 15 said "Waiting on your"; then pass "el dueño recibe respuesta"; else fail "el dueño recibe respuesta"; fi
 v bash -c 'echo "* * * * * root /bin/true" > /etc/cron.d/persistencia'
 PEND=""
 find_cron() { PEND=$(docker exec "$VIC" arx authorize 2>/dev/null | grep -E '^\s+[0-9a-f]{6}\s' | grep "cron" | awk '{print $1}' | head -1); [ -n "$PEND" ]; }
 if wait_for 70 find_cron; then pass "la persistencia queda pendiente ($PEND)"; else fail "la persistencia queda pendiente"; fi
-if wait_for 15 said "cambió cron"; then pass "la alerta llega al chat"; else fail "la alerta llega al chat"; fi
-inject 4242 "/autorizar $PEND 000000"
-if wait_for 15 said "incorrecto"; then pass "con un código falso no se hace nada"; else fail "con un código falso no se hace nada"; fi
+if wait_for 15 said "cron changed"; then pass "la alerta llega al chat"; else fail "la alerta llega al chat"; fi
+inject 4242 "/authorize $PEND 000000"
+if wait_for 15 said "Wrong or already used"; then pass "con un código falso no se hace nada"; else fail "con un código falso no se hace nada"; fi
 if v test -f /etc/cron.d/persistencia; then pass "el fichero sigue ahí tras el código falso"; else fail "el fichero sigue ahí tras el código falso"; fi
-inject 4242 "/autorizar $PEND $(code)"
-if wait_for 15 said "Autorizada"; then pass "con el código bueno, se ejecuta"; else fail "con el código bueno, se ejecuta"; fi
+inject 4242 "/authorize $PEND $(code)"
+if wait_for 15 said "Authorized"; then pass "con el código bueno, se ejecuta"; else fail "con el código bueno, se ejecuta"; fi
 if v test -f /etc/cron.d/persistencia; then fail "la persistencia desapareció del sistema"; else pass "la persistencia desapareció del sistema"; fi
 # Autorizar desde el chat ocurre DENTRO del servicio. Con ProtectHome no podría tocar /root ni /home.
 if v systemd-run --quiet --wait -p ProtectHome=read-only touch /root/.ssh/control 2>/dev/null; then
@@ -193,7 +193,7 @@ v bash -c 'echo "ssh-ed25519 AAAAC3Nza intruso" >> /root/.ssh/authorized_keys'
 find_key() { PEND=$(docker exec "$VIC" arx authorize 2>/dev/null | grep -E '^\s+[0-9a-f]{6}\s' | grep "authorized_keys_root" | awk '{print $1}' | head -1); [ -n "$PEND" ]; }
 if wait_for 70 find_key; then pass "la llave plantada queda pendiente ($PEND)"; else fail "la llave plantada queda pendiente"; fi
 sleep 31  # un código por paso de reloj: el anterior ya está usado
-inject 4242 "/autorizar $PEND $(code)"
+inject 4242 "/authorize $PEND $(code)"
 gone() { ! docker exec "$VIC" grep -q intruso /root/.ssh/authorized_keys; }
 if wait_for 15 gone; then pass "autorizado desde el chat, la llave plantada ya no está"; else fail "autorizado desde el chat, la llave plantada ya no está"; fi
 check "la legítima sigue" v grep -q legitima /root/.ssh/authorized_keys

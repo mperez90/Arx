@@ -55,13 +55,13 @@ cat > "$PKG/DEBIAN/postinst" <<'EOF'
 set -e
 cat <<'MSG'
 
-Arx instalado. Para ponerlo en guardia:
-  sudo arx setup            # modelo LLM, palabra de autorización, licencia
-  sudo arx recon            # mapear el servidor
-  sudo arx learn            # aprender lo normal (repetir unos días)
-  sudo arx learn --seal     # cerrar la línea base
-  sudo arx service install  # defensa 24/7 en modo observar (systemd)
-  sudo arx notify test      # comprobar que te llegan las alertas
+Arx installed. To put it on guard:
+  sudo arx setup            # language, LLM model, authorization word, license
+  sudo arx recon            # map the server
+  sudo arx learn            # learn what is normal (repeat over a few days)
+  sudo arx learn --seal     # seal the baseline
+  sudo arx service install  # 24/7 defense in observe mode (systemd)
+  sudo arx notify test      # check that alerts reach you
 
 MSG
 exit 0
@@ -84,10 +84,10 @@ chmod 0755 "$PKG/DEBIAN/prerm"
 mkdir -p "$ROOT/dist"
 DEB="$ROOT/dist/arx_${VERSION}_all.deb"
 if ! command -v dpkg-deb >/dev/null 2>&1; then
-  echo "Árbol del paquete listo en: $PKG"
+  echo "Package tree ready at: $PKG"
   find "$PKG" -type f | sed "s|$PKG|  |"
   echo ""
-  echo "dpkg-deb no está en este sistema. Para producir el .deb, corre esto en Ubuntu/Debian o CI:"
+  echo "dpkg-deb is not on this system. To build the .deb, run this on Ubuntu/Debian or CI:"
   echo "  packaging/build-deb.sh $VERSION"
   exit 1
 fi

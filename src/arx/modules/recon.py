@@ -20,12 +20,14 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from arx.i18n import tr
+
 TIMEOUT = 8  # segundos por comando; los colectores lentos lo suben explícitamente
 
 # ── severidad ────────────────────────────────────────────────────────────────
 SEV_ORDER = {"crit": 0, "high": 1, "med": 2, "low": 3, "info": 4}
 SEV_COLOR = {"crit": "91;1", "high": "91", "med": "93", "low": "90", "info": "90"}
-SEV_LABEL = {"crit": "CRÍTICO", "high": "ALTO", "med": "MEDIO", "low": "BAJO", "info": "INFO"}
+SEV_LABEL = {"crit": tr("CRITICAL"), "high": "ALTO", "med": "MEDIO", "low": "BAJO", "info": "INFO"}
 
 
 # ── helpers de E/S robustos ──────────────────────────────────────────────────
@@ -472,10 +474,11 @@ def analyze_surface(inv: dict) -> list[dict]:
         f.append(
             {
                 "sev": "info",
-                "area": "perímetro",
-                "detail": f"{p['proto']} {p['local']} escucha en todas las interfaces "
-                f"({p['process'] or 'proceso desconocido'})",
-                "why": "Cada puerto expuesto es superficie de ataque; hay que vigilarlo y basar su tráfico.",
+                "area": tr("perimeter"),
+                "detail": tr("{proto} {local} listens on all interfaces ({v})",
+                             proto=p['proto'], local=p['local'], v=p['process'] or tr("unknown process")),
+                "why": tr("Every exposed port is attack surface; it should be watched and its "
+                          "traffic baselined."),
             }
         )
 
@@ -486,7 +489,8 @@ def analyze_surface(inv: dict) -> list[dict]:
                 "sev": "high",
                 "area": "ssh",
                 "detail": f"PermitRootLogin = {ssh['permit_root_login']}",
-                "why": "Login directo de root amplía el impacto de credenciales filtradas o fuerza bruta.",
+                "why": tr("Direct root login widens the impact of leaked credentials or brute "
+                          "force."),
             }
         )
     if str(ssh.get("password_auth", "")).lower() == "yes":
@@ -495,7 +499,7 @@ def analyze_surface(inv: dict) -> list[dict]:
                 "sev": "med",
                 "area": "ssh",
                 "detail": "PasswordAuthentication = yes",
-                "why": "Habilita fuerza bruta/credential stuffing; preferible solo claves.",
+                "why": tr("Enables brute force/credential stuffing; keys only is preferable."),
             }
         )
 
@@ -506,8 +510,8 @@ def analyze_surface(inv: dict) -> list[dict]:
             {
                 "sev": "med",
                 "area": "firewall",
-                "detail": "Firewall inactivo o no detectado (ufw/nftables)",
-                "why": "Sin firewall, todo puerto abierto queda expuesto sin filtrado.",
+                "detail": tr("Firewall inactive or not detected (ufw/nftables)"),
+                "why": tr("Without a firewall, every open port is exposed unfiltered."),
             }
         )
 
@@ -516,9 +520,10 @@ def analyze_surface(inv: dict) -> list[dict]:
         f.append(
             {
                 "sev": "low",
-                "area": "usuarios",
-                "detail": f"{len(suid)} binarios SUID (revisar excesos)",
-                "why": "Cada SUID es vía potencial de escalada; conviene fijar la línea base y vigilar cambios.",
+                "area": tr("users"),
+                "detail": tr("{n} SUID binaries (review for excess)", n=len(suid)),
+                "why": tr("Each SUID is a potential escalation path; set the baseline and watch "
+                          "for changes."),
             }
         )
 
@@ -528,8 +533,8 @@ def analyze_surface(inv: dict) -> list[dict]:
             {
                 "sev": "low",
                 "area": "hardware",
-                "detail": f"Disco raíz al {hw['root_used_pct']}%",
-                "why": "Disco lleno degrada logs y respuesta; también puede ser exfiltración/DoS.",
+                "detail": tr("Root disk at {root_used_pct}%", root_used_pct=hw['root_used_pct']),
+                "why": tr("A full disk degrades logs and response; it may also be exfiltration/DoS."),
             }
         )
 
@@ -540,27 +545,34 @@ def analyze_surface(inv: dict) -> list[dict]:
 # ── plan de defensa base (seam para el LLM) ──────────────────────────────────
 def plan_defense(inv: dict, findings: list[dict]) -> list[tuple[str, str]]:
     plan: list[tuple[str, str]] = [
-        ("sensores", "Activar osquery + auditd + Falco/eBPF: estado del sistema, syscalls y comportamiento en kernel."),
-        ("baseline", "Aprender lo normal de procesos, red, usuarios y horarios (ventana conservadora) con integridad de arranque."),
+        (tr("sensors"), tr("Enable osquery + auditd + Falco/eBPF: system state, syscalls and "
+                        "kernel-level behavior.")),
+        ("baseline", tr("Learn what is normal in processes, network, users and schedules "
+                        "(conservative window) with boot integrity.")),
     ]
     homes = [u["home"] for u in inv.get("users", {}).get("human_users", [])]
     plan.append(
-        ("canarios", f"Plantar honeytokens en {len(homes) + 1} ubicaciones (homes + /root) y vigilar acceso con inotify.")
+        ("canarios", tr("Plant honeytokens in {v} places (homes + /root) and watch access with "
+                        "inotify.", v=len(homes) + 1))
     )
     plan.append(
-        ("integridad", "Vigilar cambios en authorized_keys, sudoers, cron y el conjunto SUID; alertar ante cualquier variación.")
+        (tr("integrity"), tr("Watch for changes in authorized_keys, sudoers, cron and the SUID set; "
+                          "alert on any change."))
     )
     exposed = [p for p in inv.get("ports") or [] if p.get("exposed") == "all"]
     if exposed:
         plan.append(
-            ("perímetro", f"Monitorizar {len(exposed)} servicios expuestos; correlacionar orígenes y picos anómalos contra la base.")
+            (tr("perimeter"), tr("Monitor {n} exposed services; correlate sources and anomalous "
+                              "spikes against the baseline.", n=len(exposed)))
         )
     if any(x["area"] == "firewall" for x in findings):
         plan.append(
-            ("firewall", "Proponer política de firewall por defecto-denegar (Tier 2, requiere tu aprobación por ser potencialmente disruptivo).")
+            ("firewall", tr("Propose a default-deny firewall policy (Tier 2, needs your approval "
+                            "as it may be disruptive)."))
         )
     plan.append(
-        ("motor", "El motor (LLM) revisará este inventario async y afinará el plan con contexto de amenazas actuales.")
+        (tr("engine"), tr("The engine (LLM) will review this inventory asynchronously and refine the "
+                     "plan with current threat context."))
     )
     return plan
 
@@ -579,55 +591,61 @@ def render_console(inv: dict, findings: list[dict], plan: list[tuple[str, str]])
     exposed = [p for p in ports if p.get("exposed") == "all"]
     highs = [f for f in findings if f["sev"] in ("crit", "high")]
 
-    print("\n╔═ Arx · reconocimiento inicial " + "═" * 34)
+    print(tr("\n╔═ Arx · initial reconnaissance ") + "═" * 34)
     print(f"║ {os_.get('distro') or os_.get('platform')}  ·  kernel {os_.get('kernel')}  ·  {os_.get('arch')}")
     print(f"║ host {os_.get('hostname')}  ·  uptime {os_.get('uptime_h', '?')} h")
     print("╚" + "═" * 64)
 
-    print("\n▸ Hardware")
+    print(tr("\n▸ Hardware"))
     print(_line("CPU", f"{hw.get('cpu_count')} vCPU · {hw.get('cpu_model', 'n/d')}"))
-    print(_line("Memoria", f"{hw.get('mem_total_gb', '?')} GB ({hw.get('mem_available_gb', '?')} GB libres)"))
-    print(_line("Disco raíz", f"{hw.get('root_disk_gb', '?')} GB · {hw.get('root_used_pct', '?')}% usado"))
+    print(_line(tr("Memory"), tr("{mem_total_gb} GB ({mem_available_gb} GB free)",
+                              mem_total_gb=hw.get('mem_total_gb', '?'),
+                              mem_available_gb=hw.get('mem_available_gb', '?'))))
+    print(_line(tr("Root disk"), tr("{root_disk_gb} GB · {root_used_pct}% used",
+                                  root_disk_gb=hw.get('root_disk_gb', '?'),
+                                  root_used_pct=hw.get('root_used_pct', '?'))))
 
-    print("\n▸ Red")
+    print(tr("\n▸ Network"))
     for a in net.get("addresses", [])[:6]:
         print(_line("iface", a))
     if net.get("dns"):
         print(_line("DNS", ", ".join(net["dns"])))
 
-    print(f"\n▸ Puertos en escucha ({len(ports)} · {len(exposed)} expuestos a todas las interfaces)")
+    print(tr("\n▸ Listening ports ({n} · {n2} exposed on all interfaces)",
+             n=len(ports), n2=len(exposed)))
     for p in ports[:15]:
         tag = _c("EXPUESTO", "high") if p["exposed"] == "all" else ("local" if p["exposed"] == "local" else "iface ")
         print(f"  [{tag}] {p['proto']:<4} {p['local']:<24} {p['process'][:40]}")
     if len(ports) > 15:
-        print(f"  … (+{len(ports) - 15} más en el JSON)")
+        print(tr("  … (+{v} more in the JSON)", v=len(ports) - 15))
 
     svcs = inv.get("services")
     if svcs is not None:
-        print(f"\n▸ Servicios activos ({len(svcs)})")
+        print(tr("\n▸ Active services ({n})", n=len(svcs)))
         print("  " + ", ".join(svcs[:12]) + (f" … (+{len(svcs) - 12})" if len(svcs) > 12 else ""))
 
-    print("\n▸ Usuarios y accesos")
-    print(_line("Humanos", ", ".join(u["user"] for u in users.get("human_users", [])) or "n/d"))
+    print(tr("\n▸ Users and access"))
+    print(_line(tr("Humans"), ", ".join(u["user"] for u in users.get("human_users", [])) or "n/d"))
     if users.get("sudo_members"):
         print(_line("sudo", ", ".join(sorted(set(users["sudo_members"])))))
     if users.get("suid_binaries") is not None:
-        print(_line("SUID", f"{len(users['suid_binaries'])} binarios"))
+        print(_line("SUID", tr("{n} binaries", n=len(users['suid_binaries']))))
 
     cont = inv.get("containers")
     if cont:
-        print(f"\n▸ Contenedores ({len(cont['running'])} en marcha)")
+        print(tr("\n▸ Containers ({n} running)", n=len(cont['running'])))
         for c in cont["running"][:8]:
             print("  " + c)
 
-    print(f"\n▸ Superficie de ataque — {len(findings)} hallazgos ({len(highs)} de prioridad alta)")
+    print(tr("\n▸ Attack surface: {n} findings ({n2} high priority)",
+             n=len(findings), n2=len(highs)))
     for x in findings:
         print(f"  {_c(SEV_LABEL[x['sev']].ljust(8), x['sev'])} [{x['area']}] {x['detail']}")
         print(f"           ↳ {x['why']}")
     if not findings:
-        print("  (sin hallazgos deterministas; el motor hará la revisión fina)")
+        print(tr("  (no deterministic findings; the engine will do the fine review)"))
 
-    print("\n▸ Plan de defensa propuesto")
+    print(tr("\n▸ Proposed defense plan"))
     for area, action in plan:
         print(f"  • {area:<12} {action}")
     print()
@@ -650,5 +668,5 @@ def run(json_path: str | None = None, save: bool = True) -> int:
     render_console(inv, findings, plan)
     if save:
         dest = save_report(inv, findings, plan, json_path)
-        print(f"▸ Inventario completo guardado en: {dest}\n")
+        print(tr("▸ Full inventory saved to: {dest}\n", dest=dest))
     return 0

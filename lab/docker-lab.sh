@@ -167,8 +167,8 @@ done
 PUB=$(docker exec "$VIC" cat /work/feed.pub)
 docker exec -d "$ATT" python3 -m http.server 8000 --directory /srv/canal
 sleep 1
-docker exec "$VIC" python3 /src/lab/driver.py vaccine-apply "$PUB" valida || FAILED=1
-docker exec "$VIC2" python3 /src/lab/driver.py vaccine-apply "$PUB" insuficiente || FAILED=1
+docker exec "$VIC" python3 /src/lab/driver.py vaccine-apply "$PUB" valid || FAILED=1
+docker exec "$VIC2" python3 /src/lab/driver.py vaccine-apply "$PUB" insufficient || FAILED=1
 # Una IP pública de verdad en el atacante: una vacuna no admite redes privadas
 docker exec "$ATT" ip addr add 185.220.101.50/32 dev eth0
 docker exec "$VIC" ip route add 185.220.101.50/32 via "$ATTACKER_IP"

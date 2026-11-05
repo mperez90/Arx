@@ -16,6 +16,7 @@ import sys
 from pathlib import Path
 
 from arx import config
+from arx.i18n import tr
 
 UNIT_PATH = "/etc/systemd/system/arx.service"
 
@@ -52,9 +53,9 @@ Type=simple
 ExecStart={exec_start} guard{' --enforce' if enforce else ''}
 Restart=always
 RestartSec=10
-# Corre como root: contiene amenazas (firewall, señales, ficheros del sistema).
-# Endurecido sin bloquear su función. Sin ProtectHome: autorizar desde el chat ocurre dentro de este
-# servicio, y restaurar un authorized_keys o retirar un dropper de /home fallaría.
+# Runs as root: it contains threats (firewall, signals, system files).
+# Hardened without blocking its job. No ProtectHome: authorizing from the chat happens inside this
+# service, and restoring an authorized_keys or removing a dropper from /home would fail.
 ProtectClock=true
 ProtectKernelTunables=true
 RestrictSUIDSGID=true
@@ -73,27 +74,28 @@ def _prereqs_ok() -> bool:
 
 
 def _manual_instructions(dest: Path) -> None:
-    print(f"Unit systemd generado en: {dest}")
+    print(tr("systemd unit generated at: {dest}", dest=dest))
     if not sys.platform.startswith("linux"):
-        print("Este no es un host Linux. En el servidor Ubuntu:")
+        print(tr("This is not a Linux host. On the Ubuntu server:"))
     elif not _systemd_available():
-        print("systemd no detectado aquí. En un servidor con systemd:")
+        print(tr("systemd not detected here. On a server with systemd:"))
     else:
-        print("Requiere root. Instálalo con:")
+        print(tr("Requires root. Install it with:"))
     print(f"  sudo cp {dest} {UNIT_PATH}")
     print("  sudo systemctl daemon-reload && sudo systemctl enable --now arx")
 
 
 def install(exec_start: str | None = None, enforce: bool = False) -> int:
     if not _prereqs_ok():
-        print("⚠ Prerequisitos incompletos para operar 24/7:")
-        print("  ejecuta  setup → recon → learn → learn --seal  antes de arrancar el servicio.")
-        print("  (Sin baseline sellada, guard sale con error y systemd reintentaría en bucle.)\n")
+        print(tr("⚠ Prerequisites missing to run 24/7:"))
+        print(tr("  run  setup → recon → learn → learn --seal  before starting the service."))
+        print(tr("  (Without a sealed baseline, guard exits with an error and systemd would retry "
+                 "in a loop.)\n"))
     text = unit_text(exec_start or _default_exec(), enforce)
     if not enforce:
-        print("ℹ Modo OBSERVAR: Arx detecta, registra y alerta, pero no aplica acciones Tier 1.\n"
-              "  Revisa unos días sus hallazgos (arx status) y, si son fiables, reinstala con:\n"
-              "  arx service install --enforce\n")
+        print(tr("ℹ OBSERVE mode: Arx detects, logs and alerts, but does not apply Tier 1 "
+                 "actions.\n  Review its findings for a few days (arx status) and, if they are "
+                 "reliable, reinstall with:\n  arx service install --enforce\n"))
     if not (_systemd_available() and _is_root()):
         dest = config.state_dir() / "arx.service"
         dest.write_text(text)
@@ -103,15 +105,15 @@ def install(exec_start: str | None = None, enforce: bool = False) -> int:
     subprocess.run(["systemctl", "daemon-reload"], check=False)
     r = subprocess.run(["systemctl", "enable", "--now", "arx"], check=False)
     if r.returncode == 0:
-        print("✓ Arx instalado como servicio systemd y arrancado (enable --now).")
+        print(tr("✓ Arx installed as a systemd service and started (enable --now)."))
         return 0
-    print("Unit escrito, pero systemctl falló. Revisa:  systemctl status arx")
+    print(tr("Unit written, but systemctl failed. Check:  systemctl status arx"))
     return 1
 
 
 def uninstall() -> int:
     if not (_systemd_available() and _is_root()):
-        print("Requiere Linux + root con systemd. En el servidor:")
+        print(tr("Requires Linux + root with systemd. On the server:"))
         print(f"  sudo systemctl disable --now arx && sudo rm -f {UNIT_PATH} && sudo systemctl daemon-reload")
         return 0
     subprocess.run(["systemctl", "disable", "--now", "arx"], check=False)
@@ -120,13 +122,14 @@ def uninstall() -> int:
     except OSError:
         pass
     subprocess.run(["systemctl", "daemon-reload"], check=False)
-    print("✓ Servicio Arx retirado.")
+    print(tr("✓ Arx service removed."))
     return 0
 
 
 def status() -> int:
     if not _systemd_available():
-        print("Estado del servicio: requiere systemd (systemctl). En el servidor:  systemctl status arx")
+        print(tr("Service status: requires systemd (systemctl). On the server:  systemctl status "
+                 "arx"))
         return 0
     subprocess.run(["systemctl", "status", "arx", "--no-pager"], check=False)
     return 0

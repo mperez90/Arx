@@ -11,8 +11,8 @@ from arx.modules import guard  # noqa: E402
 
 def answer(batch, base, cfg):
     ids = [o["fp"] for f, o in batch if f.get("kind") == "login_users"]
-    return "Respuesta simulada.\nVEREDICTOS: " + json.dumps(
-        [{"id": i, "veredicto": "amenaza", "confianza": 95, "razon": "simulado en el lab"} for i in ids])
+    return "Simulated answer.\nVERDICTS: " + json.dumps(
+        [{"id": i, "verdict": "threat", "confidence": 95, "reason": "simulated in the lab"} for i in ids])
 
 
 guard._assess_with_engine = answer

@@ -20,21 +20,26 @@ import urllib.error
 import urllib.request
 
 from arx import __version__, config, notify, redact, totp
+from arx.i18n import tr
 
 API = "https://api.telegram.org"
 POLL_S = 25
 MAX_FAILS = 5
 LOCKOUT_S = 900
 MAX_MUTE_H = 72
-HELP = ("Comandos:\n"
-        "/estado · /hallazgos · /pendientes · /informe\n"
-        "/callar <horas> — silencia las alertas no críticas\n"
-        "Con tu código de 6 dígitos:\n"
-        "/autorizar <id> <código>\n"
-        "/desbloquear <cuenta> <código>\n"
-        "/aceptar <id> <código>\n"
-        "/modo observar|proteger <código>\n"
-        "Cualquier otro texto se lo pregunto al modelo, si lo hay. Él no puede actuar.")
+HELP = (tr("Commands:\n/status · /findings · /pending · /report\n"
+           "/mute <hours>: silence non-critical alerts\n"
+           "With your 6-digit code:\n/authorize <id> <code>\n"
+           "/unlock <account> <code>\n/accept <id> <code>\n"
+           "/mode observe|protect <code>\nAny other text goes to the model, if there is one. It "
+           "cannot act."))
+
+
+# Los comandos en español siguen valiendo, sea cual sea el idioma de la salida
+_ALIASES = {"/ayuda": "/help", "/estado": "/status", "/hallazgos": "/findings", "/pendientes": "/pending",
+            "/informe": "/report", "/callar": "/mute", "/autorizar": "/authorize", "/desbloquear": "/unlock",
+            "/aceptar": "/accept", "/modo": "/mode"}
+_MODES = {"observe": False, "protect": True, "observar": False, "proteger": True}
 
 
 class Conflict(Exception):
@@ -90,7 +95,8 @@ def _check_code(code: str, now: float | None = None) -> str | None:
     now = time.time() if now is None else now
     st = _load()
     if now < st.get("locked_until", 0):
-        return f"Demasiados códigos fallidos: no acepto ninguno hasta dentro de {int(st['locked_until'] - now) // 60 + 1} min."
+        return tr("Too many failed codes: none accepted for another {v} min.",
+                  v=int(st['locked_until'] - now) // 60 + 1)
     secret = config.load_secrets().get("telegram_totp", "")
     counter = totp.counter_for(code, secret, now)
     if counter is None or counter <= st.get("last_counter", -1):
@@ -98,7 +104,7 @@ def _check_code(code: str, now: float | None = None) -> str | None:
         if st["fails"] >= MAX_FAILS:
             st["locked_until"], st["fails"] = now + LOCKOUT_S, 0
         _save(st)
-        return "Código incorrecto o ya usado. No se ha hecho nada."
+        return tr("Wrong or already used code. Nothing was done.")
     st["last_counter"], st["fails"] = counter, 0
     _save(st)
     return None
@@ -110,12 +116,12 @@ def _estado() -> str:
 
     base = baseline.load()
     pend, locked = response.list_pending(), response.locked_accounts()
-    lines = ["Arx en guardia" if base and base["meta"].get("sealed") else "Arx sin línea base sellada",
-             f"Modo: {'proteger' if guard.mode_seen() else 'observar'}",
-             f"Bloqueos activos: {len(response._load_blocks())}" + (" · ⚠ FRENO" if response.breaker_tripped() else ""),
-             f"Esperan tu decisión: {len(pend)}"]
+    lines = [tr("Arx on guard") if base and base["meta"].get("sealed") else tr("Arx without a sealed baseline"),
+             tr("Mode: {v}", v=tr("protect") if guard.mode_seen() else tr("observe")),
+             tr("Active blocks: {n}", n=len(response._load_blocks())) + (tr(" · ⚠ BRAKE") if response.breaker_tripped() else ""),
+             tr("Waiting on your decision: {n}", n=len(pend))]
     if locked:
-        lines.append("Cuentas bloqueadas: " + ", ".join(a["user"] for a in locked))
+        lines.append(tr("Locked accounts: ") + ", ".join(a["user"] for a in locked))
     return "\n".join(lines)
 
 
@@ -124,7 +130,7 @@ def _hallazgos() -> str:
 
     rows = sorted(response.load_findings().items(), key=lambda kv: kv[1].get("last_seen", ""), reverse=True)[:12]
     if not rows:
-        return "Sin hallazgos."
+        return tr("No findings.")
     return "\n".join(f"{fp}  {redact.printable(e.get('detail'))[:90]}" for fp, e in rows)
 
 
@@ -133,11 +139,11 @@ def _pendientes() -> str:
 
     pend, locked = response.list_pending(), response.locked_accounts()
     if not pend and not locked:
-        return "Nada espera tu decisión."
+        return tr("Nothing is waiting on your decision.")
     lines = [f"{p['id']} [{p.get('sev')}] {redact.printable(p.get('detail'))[:90]}\n  → {p.get('remediation')}" for p in pend]
     if pend:
-        lines.append("Autoriza con: /autorizar <id> <código>")
-    lines += [f"Cuenta bloqueada: {a['user']} — /desbloquear {a['user']} <código>" for a in locked]
+        lines.append(tr("Authorize with: /authorize <id> <code>"))
+    lines += [tr("Locked account: {user}: /unlock {user} <code>", user=a['user']) for a in locked]
     return "\n".join(lines)
 
 
@@ -145,15 +151,21 @@ def _informe() -> str:
     from arx.modules import forensics, metrics
 
     m = metrics.compute(7)
-    r = forensics.build_report()["resumen"]
-    return (f"Últimos {m['days_covered']} días: {m['alerts_high']} alertas altas o críticas, {m['false_positives']} falsos "
-            f"positivos, {m['unreviewed_high']} sin revisar, {m['automatic_actions']} acciones automáticas.\n"
-            f"Contención activa: {r.get('contencion_activa', '—')} · en cuarentena: {r.get('evidencia_en_cuarentena', '—')}\n"
-            "El informe forense sellado completo: arx forensics, en el servidor.")
+    r = forensics.build_report()["summary"]
+    return (tr("Last {days_covered} days: {alerts_high} high or critical alerts, {false_positives} "
+               "false positives, {unreviewed_high} unreviewed, {automatic_actions} automatic "
+               "actions.\nActive containment: {active_containment} · in quarantine: "
+               "{quarantined_evidence}\nThe full sealed forensic report: arx forensics, on the "
+               "server.",
+               days_covered=m['days_covered'], alerts_high=m['alerts_high'],
+               false_positives=m['false_positives'], unreviewed_high=m['unreviewed_high'],
+               automatic_actions=m['automatic_actions'],
+               active_containment=r.get('active_containment', '—'),
+               quarantined_evidence=r.get('quarantined_evidence', '—')))
 
 
 def daily_text() -> str:
-    return "Resumen del día\n" + _informe() + "\n\n" + _pendientes()
+    return tr("Daily summary\n") + _informe() + "\n\n" + _pendientes()
 
 
 def _ask_model(text: str, cfg: dict) -> str:
@@ -162,14 +174,14 @@ def _ask_model(text: str, cfg: dict) -> str:
 
     eng = engine.Engine(cfg)
     if not eng.providers_in_order():
-        return "Sin modelo configurado. " + HELP
+        return tr("No model configured. ") + HELP
     if guard._budget_left(cfg) <= 0:
-        return "Hoy ya se agotó el presupuesto de consultas al modelo."
+        return tr("The model query budget for today is used up.")
     guard._spend_budget()
     try:
         return eng.ask([{"role": "user", "content": redact.scrub(text)}], system=guard.SYSTEM_PROMPT)[0]
     except engine.ProviderError:
-        return "Ningún proveedor del modelo ha respondido."
+        return tr("No model provider responded.")
 
 
 def handle_text(text: str, cfg: dict, now: float | None = None) -> str:
@@ -179,48 +191,55 @@ def handle_text(text: str, cfg: dict, now: float | None = None) -> str:
     parts = text.strip().split()
     if not parts:
         return HELP
-    cmd = parts[0].split("@")[0].lower()
+    typed = parts[0].split("@")[0].lower()
+    cmd = _ALIASES.get(typed, typed)
     args = parts[1:]
     if not cmd.startswith("/"):
         return _ask_model(text, cfg)
-    if cmd in ("/start", "/ayuda", "/help"):
+    if cmd in ("/start", "/help"):
         return HELP
-    if cmd == "/estado":
+    if cmd == "/status":
         return _estado()
-    if cmd == "/hallazgos":
+    if cmd == "/findings":
         return _hallazgos()
-    if cmd == "/pendientes":
+    if cmd == "/pending":
         return _pendientes()
-    if cmd == "/informe":
+    if cmd == "/report":
         return _informe()
-    if cmd == "/callar":
+    if cmd == "/mute":
         hours = args[0].rstrip("h") if args else ""
         if not (hours.isdigit() and 0 <= int(hours) <= MAX_MUTE_H):
-            return f"Uso: /callar <horas>, hasta {MAX_MUTE_H}. /callar 0 las vuelve a activar."
+            return tr("Usage: /mute <hours>, up to {MAX_MUTE_H}. /mute 0 turns them back on.",
+                      MAX_MUTE_H=MAX_MUTE_H)
         notify.mute(int(hours), now)
-        return f"Alertas no críticas silenciadas {hours} h. Las críticas siguen llegando." if int(hours) else "Alertas activas."
-    if cmd not in ("/autorizar", "/desbloquear", "/aceptar", "/modo"):
-        return "No conozco ese comando. " + HELP
+        return tr("Non-critical alerts silenced for {hours} h. Critical ones still arrive.",
+                  hours=hours) if int(hours) else tr("Alerts on.")
+    if cmd not in ("/authorize", "/unlock", "/accept", "/mode"):
+        return tr("I don't know that command. ") + HELP
     if len(args) != 2:
-        return f"Uso: {cmd} <{'cuenta' if cmd == '/desbloquear' else 'id'}> <código de 6 dígitos>"
+        return tr("Usage: {cmd} <{v}> <6-digit code>",
+                  cmd=typed, v=tr("account") if cmd == "/unlock" else "id")
     target, code = args
     problem = _check_code(code, now)
     if problem:
         return problem
-    response.record({"kind": "telegram_command", "detail": f"{cmd} {redact.printable(target)}"})
-    if cmd == "/autorizar":
+    response.record({"kind": "telegram_command", "detail": f"{typed} {redact.printable(target)}"})
+    if cmd == "/authorize":
         item = response.authorize_pending(target)
-        return f"Autorizada: {item['detail']}\n{item.get('executed', '—')}" if item else f"No hay ninguna acción pendiente con id {target}."
-    if cmd == "/desbloquear":
+        return tr("Authorized: {detail}\n{executed}",
+                  detail=item['detail'], executed=item.get('executed', '—')) if item else tr("No pending action with id {target}.",
+                                                                                              target=target)
+    if cmd == "/unlock":
         done = response.unlock_account(target)
-        return f"Cuenta {target}: {done}" if done else f"Arx no tiene bloqueada la cuenta {target}."
-    if cmd == "/aceptar":
+        return tr("Account {target}: {done}", target=target, done=done) if done else tr("Arx has not locked account {target}.",
+                                                          target=target)
+    if cmd == "/accept":
         msg = response.accept(target)
-        return msg or f"No hay un hallazgo aceptable con id {target}."
-    if target not in ("observar", "proteger"):
-        return "Uso: /modo observar|proteger <código>"
+        return msg or tr("No acceptable finding with id {target}.", target=target)
+    if target not in _MODES:
+        return tr("Usage: /mode observe|protect <code>")
     set_mode(target)
-    return f"Modo {target}: se aplica en el siguiente barrido."
+    return tr("Mode {target}: applies on the next sweep.", target=target)
 
 
 # ── modo: el servicio arranca con uno; el dueño puede cambiarlo desde el chat ─
@@ -234,8 +253,8 @@ def set_mode(mode: str) -> None:
 
 def effective_enforce(started_with: bool | None) -> bool:
     mode = config.read_json(_mode_path(), {}).get("mode")
-    if mode in ("observar", "proteger"):
-        return mode == "proteger"
+    if mode in _MODES:
+        return _MODES[mode]
     return bool(started_with)
 
 
@@ -258,7 +277,7 @@ def poll_once(cfg: dict, post=_post, now: float | None = None, timeout: int = PO
         try:
             answer = handle_text(msg["text"], config.load_config() or cfg, now)
         except Exception as e:  # un comando roto no puede parar el canal
-            answer = f"No pude atenderlo ({type(e).__name__})."
+            answer = tr("Could not handle it ({name}).", name=type(e).__name__)
         _reply(cfg, chat, answer, post)
         handled += 1
     return handled
@@ -272,7 +291,8 @@ def loop(cfg: dict) -> None:
             poll_once(cfg)
         except Conflict:
             if not warned:
-                print("  ⚠ Otro programa lee los mensajes de este bot: Telegram queda solo para alertas salientes.")
+                print(tr("  ⚠ Another program is reading this bot's messages: Telegram stays for "
+                         "outgoing alerts only."))
                 warned = True
             time.sleep(60)
         except Exception:

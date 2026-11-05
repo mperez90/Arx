@@ -27,6 +27,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from arx import config
+from arx.i18n import tr
 from arx.modules import recon
 
 # Severidad del desvío según qué conjunto introduce algo nuevo.
@@ -300,20 +301,22 @@ def compare(baseline: dict, snap: dict) -> list[dict]:
         for item in observed:
             if item not in known:
                 sev = KIND_SEV.get(key, "med")
-                why = f"no aparece en la línea base de {key} ({len(known)} conocidos)"
+                why = tr("not in the {key} baseline ({n} known)", key=key, n=len(known))
                 if key == "executables" and item.startswith(_SUSPECT_DIRS):
-                    sev, why = "high", why + "; además corre desde un directorio temporal"
+                    sev, why = "high", why + tr("; it also runs from a temporary directory")
                 elif key == "executables" and item.startswith(_SYSTEM_DIRS):
                     sev = "low"
                 anomalies.append(
                     {
                         "sev": sev,
                         "kind": key,
-                        "detail": f"nuevo en {key}: {item}",
+                        "detail": tr("new in {key}: {item}", key=key, item=item),
                         "why": why,
                         "target": _target_for(key, item),
                         "set": key,
                         "item": item,
+                        # semilla histórica de la huella: no es texto, y no cambia con el idioma
+                        "fp_key": f"{key}|nuevo en {key}: {item}",
                     }
                 )
     gauges = baseline.get("gauges", {})
@@ -326,8 +329,9 @@ def compare(baseline: dict, snap: dict) -> list[dict]:
                     {
                         "sev": "low",
                         "kind": "gauge",
-                        "detail": f"{key}={val:.1f} sobre el rango aprendido [{g['min']:.1f}, {g['max']:.1f}]",
-                        "why": "valor fuera del comportamiento normal aprendido",
+                        "detail": tr("{key}={val:.1f} above the learned range [{min:.1f}, "
+                                     "{max:.1f}]", key=key, val=val, min=g['min'], max=g['max']),
+                        "why": tr("value outside the learned normal behavior"),
                         "fp_key": f"gauge|{key}",  # el valor cambia cada barrido; la amenaza no
                     }
                 )
@@ -394,21 +398,24 @@ def accept(key: str, item: str) -> bool:
 # ── informe / estado ─────────────────────────────────────────────────────────
 def summary(baseline: dict) -> None:
     m = baseline["meta"]
-    print("\n▸ Línea base de Arx")
-    print(f"  muestras       {m['samples']}  ·  {'SELLADA' if m.get('sealed') else 'aprendiendo'}")
-    print(f"  creada         {m['created']}   actualizada {m['updated']}")
+    print(tr("\n▸ Arx baseline"))
+    print(tr("  samples        {samples}  ·  {v}",
+             samples=m['samples'], v='SELLADA' if m.get('sealed') else 'aprendiendo'))
+    print(tr("  created        {created}   updated {updated}",
+             created=m['created'], updated=m['updated']))
     for key, d in baseline.get("sets", {}).items():
-        print(f"  {key:<14} {len(d)} conocidos")
+        print(tr("  {key:<14} {n} known", key=key, n=len(d)))
     for key, g in baseline.get("gauges", {}).items():
         mean = g["sum"] / g["n"] if g["n"] else 0
-        print(f"  {key:<14} rango [{g['min']:.1f}, {g['max']:.1f}]  media {mean:.1f}")
+        print(tr("  {key:<14} range [{min:.1f}, {max:.1f}]  mean {mean:.1f}",
+                 key=key, min=g['min'], max=g['max'], mean=mean))
     alerts = baseline.get("integrity_alerts", [])
     if alerts:
-        print(f"  ⚠ integridad   {len(alerts)} cambio(s) en ficheros críticos durante el aprendizaje:")
+        print(tr("  ⚠ integrity    {n} change(s) in critical files during learning:", n=len(alerts)))
         for a in alerts[-3:]:
             print(f"      {a['at']}  →  {', '.join(a['changed'])}")
     else:
-        print("  integridad     sin cambios en ficheros críticos ✓")
+        print(tr("  integrity      no changes in critical files ✓"))
     print()
 
 
@@ -417,7 +424,7 @@ def run(samples: int = 1, interval: int = 0, seal: bool = False, status: bool = 
     if status:
         b = load()
         if not b:
-            print("No hay línea base todavía. Ejecuta:  arx learn")
+            print(tr("No baseline yet. Run:  arx learn"))
             return 0
         summary(b)
         return 0
@@ -426,7 +433,7 @@ def run(samples: int = 1, interval: int = 0, seal: bool = False, status: bool = 
 
     if seal:
         if baseline["meta"]["samples"] == 0:
-            print("No puedes sellar una base vacía. Ejecuta `arx learn` primero.")
+            print(tr("You cannot seal an empty baseline. Run `arx learn` first."))
             return 1
         baseline["meta"]["sealed"] = True
         # la huella dice QUE cambió el conjunto SUID, no cuál: sin la lista no se sabe qué hay de nuevo
@@ -440,10 +447,11 @@ def run(samples: int = 1, interval: int = 0, seal: bool = False, status: bool = 
         # La pista de escaneo (nft scan4/6) nace con el sellado: debe estar activa
         # ANTES del primer ataque, no en la primera respuesta.
         tracked = response.ensure_nft_tracking()
-        print(f"✓ Línea base SELLADA con {baseline['meta']['samples']} muestras. Lista para `arx guard`.")
-        print(f"✓ Respaldo de {n} fichero(s) crítico(s) en el vault (habilita restauración Tier 2).")
+        print(tr("✓ Baseline SEALED with {samples} samples. Ready for `arx guard`.",
+                 samples=baseline['meta']['samples']))
+        print(tr("✓ Backup of {n} critical file(s) in the vault (enables Tier 2 restore).", n=n))
         if tracked:
-            print("✓ Pista de escaneo nft activa (inet arx: scan4/scan6 + sets de bloqueo).")
+            print(tr("✓ nft scan trail active (inet arx: scan4/scan6 + block sets)."))
         return 0
 
     from arx.modules import sensors
@@ -455,8 +463,10 @@ def run(samples: int = 1, interval: int = 0, seal: bool = False, status: bool = 
         if i < samples - 1 and interval > 0:
             time.sleep(interval)
     save(baseline)
-    print(f"✓ {samples} muestra(s) integrada(s). Total acumulado: {baseline['meta']['samples']}.")
+    print(tr("✓ {samples} sample(s) taken. Running total: {samples2}.",
+             samples=samples, samples2=baseline['meta']['samples']))
     summary(baseline)
     if not baseline["meta"]["sealed"]:
-        print("Cuando el sistema haya mostrado su comportamiento normal, sella la base:  arx learn --seal\n")
+        print(tr("Once the system has shown its normal behavior, seal the baseline:  arx learn "
+                 "--seal\n"))
     return 0

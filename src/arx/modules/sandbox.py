@@ -13,7 +13,7 @@ docker.sock) es una promesa Pro y vivirá aparte. Aquí no se ejecuta nada JAMÁ
 Corre sobre ficheros que controla el atacante, DENTRO del bucle de guardia: nunca puede
 colgarse ni tumbar a Arx. Por eso solo abre ficheros regulares (un FIFO bloquearía la
 lectura para siempre), todas las regex tienen cuantificadores acotados y hay un presupuesto
-de tiempo real. Lo que no se puede analizar se dice ("desconocido"), nunca es "limpio".
+de tiempo real. Lo que no se puede analizar se dice ("unknown"), nunca es "clean".
 """
 from __future__ import annotations
 
@@ -27,6 +27,7 @@ import signal
 import stat
 import threading
 
+from arx.i18n import tr
 from arx.redact import printable
 
 MAX_READ = 5 * 1024 * 1024   # primeros 5 MiB: tipo, entropía, strings y reglas
@@ -44,45 +45,45 @@ _STRING_RE = re.compile(rb"[\x20-\x7e]{4,}")
 # que este propio fichero no se marque a sí mismo.
 RULES_VERSION = "2"
 RULES: list[dict] = [
-    {"name": "eicar-test", "sev": "malicioso", "type": "substr",
+    {"name": "eicar-test", "sev": "malicious", "type": "substr",
      "needle": b"EICAR-STANDARD-" + b"ANTIVIRUS-TEST-FILE",  # partida: este fichero no se autodelata
-     "why": "fichero de prueba EICAR (estándar antivirus)"},
-    {"name": "revshell-devtcp", "sev": "malicioso", "type": "regex",
+     "why": tr("EICAR test file (antivirus standard)")},
+    {"name": "revshell-devtcp", "sev": "malicious", "type": "regex",
      "pattern": r"/dev/(?:tcp|udp)/[\w.${}\-]{1,64}/[\w${}\-]{1,16}",
-     "why": "reverse shell por /dev/tcp de bash"},
-    {"name": "revshell-nc-exec", "sev": "malicioso", "type": "regex",
+     "why": tr("reverse shell via bash /dev/tcp")},
+    {"name": "revshell-nc-exec", "sev": "malicious", "type": "regex",
      "pattern": r"\bn(?:et)?c(?:at)?\b[^\n]{0,80}?\s(?:-\w{0,8}[ec]\w{0,8}|--(?:sh-)?exec)\b"
                 r"[^\n]{0,40}?(?:/bin/|\b(?:ba)?sh\b)",
-     "why": "netcat que ejecuta un shell al conectar"},
-    {"name": "revshell-fifo", "sev": "malicioso", "type": "regex",
+     "why": tr("netcat that runs a shell on connect")},
+    {"name": "revshell-fifo", "sev": "malicious", "type": "regex",
      "pattern": r"mkfifo\b[^\n]{0,200}?\|\s{0,4}(?:nc|ncat|netcat|telnet)\b",
-     "why": "reverse shell con FIFO y netcat"},
-    {"name": "revshell-python", "sev": "malicioso", "type": "regex",
+     "why": tr("reverse shell with FIFO and netcat")},
+    {"name": "revshell-python", "sev": "malicious", "type": "regex",
      "pattern": r"socket\.socket[\s\S]{0,300}?(?:os\.dup2|subprocess\.\w{1,12}\([^\n]{0,40}(?:/bin/|\bsh\b))"
                 r"|pty\.spawn\(\s{0,4}[\"'](?:/bin/)?(?:ba|z|da)?sh",
-     "why": "reverse shell en Python (socket con dup2 o un shell, o pty.spawn)"},
-    {"name": "revshell-perl", "sev": "malicioso", "type": "regex",
+     "why": tr("Python reverse shell (socket with dup2 or a shell, or pty.spawn)")},
+    {"name": "revshell-perl", "sev": "malicious", "type": "regex",
      "pattern": r"use\s{1,4}Socket\b[\s\S]{0,300}?exec\s{0,4}\(?\s{0,4}[\"'](?:/bin/)?(?:ba|z|da)?sh",
-     "why": "reverse shell en Perl (socket con exec de un shell)"},
-    {"name": "revshell-php", "sev": "malicioso", "type": "regex",
+     "why": tr("Perl reverse shell (socket with exec of a shell)")},
+    {"name": "revshell-php", "sev": "malicious", "type": "regex",
      "pattern": r"fsockopen\s{0,4}\([\s\S]{0,200}?(?:exec|shell_exec|system|passthru|proc_open)"
                 r"\s{0,4}\(\s{0,4}[\"'](?:/bin/)?(?:ba|z|da)?sh",
-     "why": "reverse shell en PHP (fsockopen con ejecución de un shell)"},
-    {"name": "download-pipe-shell", "sev": "sospechoso", "type": "regex",
+     "why": tr("PHP reverse shell (fsockopen running a shell)")},
+    {"name": "download-pipe-shell", "sev": "suspicious", "type": "regex",
      "pattern": r"(?:curl|wget)\b[^\n|]{0,120}\|\s{0,4}(?:sudo\s{1,4})?" + _SHELL,
-     "why": "descarga tubería directa a un shell (curl|sh)"},
-    {"name": "base64-pipe-shell", "sev": "sospechoso", "type": "regex",
+     "why": tr("download piped straight into a shell (curl|sh)")},
+    {"name": "base64-pipe-shell", "sev": "suspicious", "type": "regex",
      "pattern": r"base64\s{1,4}(?:--decode|-d\w{0,2})\b[^\n|]{0,80}\|\s{0,4}" + _SHELL,
-     "why": "payload en base64 ejecutado por un shell"},
-    {"name": "crypto-miner", "sev": "sospechoso", "type": "regex",
+     "why": tr("base64 payload run by a shell")},
+    {"name": "crypto-miner", "sev": "suspicious", "type": "regex",
      "pattern": r"stratum\+tcp://|\bxmrig\b|\bminerd\b|\bcryptonight\b",
-     "why": "indicadores de minero de criptomoneda"},
-    {"name": "high-entropy-exec", "sev": "sospechoso", "type": "entropy",
+     "why": tr("cryptocurrency miner indicators")},
+    {"name": "high-entropy-exec", "sev": "suspicious", "type": "entropy",
      "min_entropy": 7.2, "only_types": {"elf", "pe"},
-     "why": "ejecutable con entropía muy alta (empaquetado/cifrado)"},
+     "why": tr("executable with very high entropy (packed/encrypted)")},
 ]
 
-_SEV_RANK = {"malicioso": 2, "sospechoso": 1}
+_SEV_RANK = {"malicious": 2, "suspicious": 1}
 
 
 def validate() -> list[str]:
@@ -91,22 +92,22 @@ def validate() -> list[str]:
     for r in RULES:
         rid = r.get("name")
         if not rid or rid in seen:
-            errors.append(f"regla sin nombre o duplicada: {rid}")
+            errors.append(tr("unnamed or duplicate rule: {rid}", rid=rid))
         seen.add(rid)
         if r.get("sev") not in _SEV_RANK:
-            errors.append(f"{rid}: severidad inválida {r.get('sev')}")
+            errors.append(tr("{rid}: invalid severity {sev}", rid=rid, sev=r.get('sev')))
         t = r.get("type")
         if t == "substr" and not isinstance(r.get("needle"), bytes):
-            errors.append(f"{rid}: substr necesita 'needle' en bytes")
+            errors.append(tr("{rid}: substr needs 'needle' as bytes", rid=rid))
         elif t == "regex":
             try:
                 re.compile(r["pattern"])
             except (re.error, KeyError):
-                errors.append(f"{rid}: regex inválida")
+                errors.append(tr("{rid}: invalid regex", rid=rid))
         elif t == "entropy" and not isinstance(r.get("min_entropy"), (int, float)):
-            errors.append(f"{rid}: entropy necesita 'min_entropy' numérico")
+            errors.append(tr("{rid}: entropy needs a numeric 'min_entropy'", rid=rid))
         elif t not in ("substr", "regex", "entropy", "filetype"):
-            errors.append(f"{rid}: tipo de matcher desconocido {t}")
+            errors.append(tr("{rid}: unknown matcher type {t}", rid=rid, t=t))
     return errors
 
 
@@ -124,10 +125,10 @@ def file_type(data: bytes) -> str:
     if data[:4] == b"PK\x03\x04":
         return "zip"
     if not data:
-        return "vacío"
+        return tr("empty")
     sample = data[:4096]
     printable = sum(1 for b in sample if 0x20 <= b <= 0x7e or b in (9, 10, 13))
-    return "texto" if printable / len(sample) > 0.85 else "datos"
+    return tr("text") if printable / len(sample) > 0.85 else tr("data")
 
 
 def shannon_entropy(data: bytes) -> float:
@@ -177,11 +178,11 @@ def _rule_hits(data: bytes, text: str, ftype: str, entropy: float) -> list[dict]
 
 
 def _verdict(hits: list[dict]) -> str:
-    if any(h["sev"] == "malicioso" for h in hits):
-        return "malicioso"
-    if any(h["sev"] == "sospechoso" for h in hits):
-        return "sospechoso"
-    return "limpio"
+    if any(h["sev"] == "malicious" for h in hits):
+        return "malicious"
+    if any(h["sev"] == "suspicious" for h in hits):
+        return "suspicious"
+    return "clean"
 
 
 class _BudgetExceeded(Exception):
@@ -207,7 +208,7 @@ def _time_budget(seconds: float):
 
 
 def _unknown(path: str, reason: str) -> dict:
-    return {"path": path, "ok": False, "verdict": "desconocido", "reasons": [reason],
+    return {"path": path, "ok": False, "verdict": "unknown", "reasons": [reason],
             "rules_version": RULES_VERSION}
 
 
@@ -218,7 +219,7 @@ def _analyze(path: str) -> dict:
     with os.fdopen(fd, "rb") as f:
         st = os.fstat(f.fileno())
         if not stat.S_ISREG(st.st_mode):
-            return _unknown(path, "no es un fichero regular: no se lee")
+            return _unknown(path, tr("not a regular file: not read"))
         head = f.read(MAX_READ)
         digest = hashlib.sha256(head)
         tail, total = b"", len(head)
@@ -239,9 +240,10 @@ def _analyze(path: str) -> dict:
     partial = total > len(head) + len(tail)
     verdict = _verdict(hits)
     reasons = [h["why"] for h in hits]
-    if partial and verdict == "limpio":  # lo no analizado no se puede declarar limpio
-        verdict = "desconocido"
-        reasons = [f"sin indicadores, pero solo se analizaron {len(head) + len(tail)} de {total} B"]
+    if partial and verdict == "clean":  # lo no analizado no se puede declarar limpio
+        verdict = "unknown"
+        reasons = [tr("no indicators, but only {v} of {total} B were analyzed",
+                      v=len(head) + len(tail), total=total)]
     return {
         "path": path, "ok": True, "sha256": digest.hexdigest(),
         "size": total, "truncated": partial,
@@ -257,13 +259,14 @@ def analyze(path: str, budget: float = SCAN_BUDGET_S) -> dict:
         with _time_budget(budget):
             return _analyze(path)
     except OSError as e:
-        return _unknown(path, f"ilegible: {e}")
+        return _unknown(path, tr("unreadable: {e}", e=e))
     except _BudgetExceeded:
-        why = f"el análisis agotó su presupuesto de {budget:g} s (posible fichero trampa)"
+        why = tr("the analysis ran out of its {budget:g} s budget (possible trap file)",
+                 budget=budget)
         return {"path": path, "ok": True, "sha256": None, "size": None, "truncated": True,
-                "type": "desconocido", "shebang": None, "entropy": None, "strings": [],
-                "hits": [{"rule": "analysis-budget", "sev": "sospechoso", "why": why}],
-                "reasons": [why], "verdict": "sospechoso", "rules_version": RULES_VERSION}
+                "type": tr("unknown"), "shebang": None, "entropy": None, "strings": [],
+                "hits": [{"rule": "analysis-budget", "sev": "suspicious", "why": why}],
+                "reasons": [why], "verdict": "suspicious", "rules_version": RULES_VERSION}
 
 
 _CACHE: dict[tuple, dict] = {}  # el hallazgo se repite cada barrido: no re-analizar lo igual
@@ -297,15 +300,16 @@ def enrich_finding(finding: dict) -> dict:
         rep = _analyze_cached(exe)
     except OSError:
         return finding  # ya no está en disco (p. ej. se borró a sí mismo)
-    if rep["verdict"] not in ("malicioso", "sospechoso"):
+    if rep["verdict"] not in ("malicious", "suspicious"):
         return finding
     f = dict(finding)
     tag = ", ".join(h["rule"] for h in rep["hits"][:3])
     f["fp_key"] = finding.get("fp_key") or f"{finding.get('kind', '')}|{finding.get('detail', '')}"
-    f["detail"] = f"{finding.get('detail', '')} · sandbox: {rep['verdict']} ({tag})"
-    f["why"] = f"{finding.get('why', '')} · análisis estático: {rep['verdict']}"
+    f["detail"] = f"{finding.get('detail', '')} · sandbox: {tr(rep['verdict'])} ({tag})"
+    f["why"] = tr("{why} · static analysis: {verdict}",
+                  why=finding.get('why', ''), verdict=tr(rep['verdict']))
     f["sandbox"] = {k: v for k, v in rep.items() if k != "strings"}  # sale a la consola de flota
-    if rep["verdict"] == "malicioso":
+    if rep["verdict"] == "malicious":
         f["sev"] = "high"
     vaccine = next((h["vaccine"] for h in rep["hits"] if h.get("vaccine")), None)
     if vaccine:  # si el operador lo desmiente, cuenta contra esa vacuna
@@ -314,7 +318,7 @@ def enrich_finding(finding: dict) -> dict:
 
 
 # ── salida de consola (arx scan <fichero>) ────────────────────────────────────
-_COLOR = {"malicioso": "91;1", "sospechoso": "93", "limpio": "92", "desconocido": "90"}
+_COLOR = {"malicious": "91;1", "suspicious": "93", "clean": "92", "unknown": "90"}
 
 
 def _c(text: str, verdict: str) -> str:
@@ -325,25 +329,25 @@ def _c(text: str, verdict: str) -> str:
 
 
 def render(rep: dict) -> None:
-    print(f"\n▸ Análisis estático · {printable(rep['path'])}")
+    print(tr("\n▸ Static analysis · {v}", v=printable(rep['path'])))
     if not rep.get("ok"):
         print(f"  {'; '.join(rep.get('reasons', ['ilegible']))}")
         return
     shebang = f"  · shebang: {printable(rep['shebang'])}" if rep.get("shebang") else ""
-    print(f"  tipo       {rep['type']}{shebang}")
-    print(f"  sha256     {rep['sha256'] or 'no calculado'}")
-    print(f"  tamaño     {rep['size'] if rep['size'] is not None else '?'} B"
-          + ("  (análisis parcial)" if rep["truncated"] else ""))
-    print(f"  entropía   {rep['entropy']} bits/byte")
-    print(f"  veredicto  {_c(rep['verdict'].upper(), rep['verdict'])}")
-    if rep["verdict"] == "desconocido":
+    print(tr("  type       {type}{shebang}", type=rep['type'], shebang=shebang))
+    print(f"  sha256     {rep['sha256'] or tr('not computed')}")
+    print(tr("  size       {v} B", v=rep['size'] if rep['size'] is not None else '?')
+          + (tr("  (partial analysis)") if rep["truncated"] else ""))
+    print(tr("  entropy    {entropy} bits/byte", entropy=rep['entropy']))
+    print(tr("  verdict    {v}", v=_c(tr(rep['verdict']).upper(), rep['verdict'])))
+    if rep["verdict"] == "unknown":
         print(f"  {'; '.join(rep['reasons'])}")
     elif rep["hits"]:
-        print("  reglas que casaron:")
+        print(tr("  matched rules:"))
         for h in rep["hits"]:
-            print(f"    [{h['sev']}] {h['rule']} — {h['why']}")
+            print(f"    [{tr(h['sev'])}] {h['rule']} — {h['why']}")
     else:
-        print("  (ninguna regla casó; sin indicadores estáticos de malware)")
+        print(tr("  (no rule matched; no static malware indicators)"))
     print()
 
 
@@ -351,4 +355,4 @@ def run(path: str) -> int:
     """`arx scan <fichero>`: 0 si limpio, 1 si sospechoso/malicioso/desconocido."""
     rep = analyze(path)
     render(rep)
-    return 0 if rep.get("verdict") == "limpio" else 1
+    return 0 if rep.get("verdict") == "clean" else 1

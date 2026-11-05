@@ -59,7 +59,7 @@ sleep 2
 if reaches 80; then pass "nginx llega tras aceptar"; else fail "nginx llega tras aceptar"; fi
 if reaches 8080; then pass "la app de /opt llega tras aceptar"; else fail "la app de /opt llega tras aceptar"; fi
 if v bash -c 'ps -eo stat,comm | awk "\$1 ~ /^T/ {print \$2}" | grep -qE "servidor|tarea"'; then fail "lo aceptado ya no está suspendido"; else pass "lo aceptado ya no está suspendido"; fi
-if wait_for 40 bash -c "! docker exec $VIC arx authorize 2>/dev/null | grep -q 'cambió passwd'"; then pass "el alta del usuario ya no espera tu decisión"; else fail "el alta del usuario ya no espera tu decisión"; fi
+if wait_for 40 bash -c "! docker exec $VIC arx authorize 2>/dev/null | grep -q 'passwd changed'"; then pass "el alta del usuario ya no espera tu decisión"; else fail "el alta del usuario ya no espera tu decisión"; fi
 
 step "el ruido, en cifras"
 v arx metrics --days 1

@@ -21,11 +21,11 @@ for f in /root/lab-data/* "$@"; do
   [ -f "$f" ] && python3 -c "import sys,base64; d=open(sys.argv[1],'rb').read(); open(sys.argv[1]+'.enc','wb').write(base64.b64encode(d))" "$f" && rm "$f"
 done
 SH
-if wait_for 70 incident "DESAPARECIDO"; then pass "los señuelos cifrados dan la alarma"; else fail "los señuelos cifrados dan la alarma"; fi
+if wait_for 70 incident "canary GONE"; then pass "los señuelos cifrados dan la alarma"; else fail "los señuelos cifrados dan la alarma"; fi
 
 step "tormenta: más acciones de las que permite el freno, y después un reverse shell"
 v bash -c 'for p in 7001 7002 7003 7004 7005 7006 7007 7008; do systemd-run --quiet --unit=ruido-$p nc -k -l $p; done'
-tripped() { docker exec "$VIC" arx status | grep -q "FRENO DE SEGURIDAD"; }
+tripped() { docker exec "$VIC" arx status | grep -q "SAFETY BRAKE"; }
 if wait_for 70 tripped; then pass "el freno salta y Arx deja de actuar"; else fail "el freno salta y Arx deja de actuar"; fi
 BLOCKED=$(v nft list set inet arx block_tcp | grep -oE '700[0-9]' | sort -u | wc -l)
 if [ "$BLOCKED" -le 5 ]; then pass "se detuvo en el límite ($BLOCKED puertos de 8)"; else fail "se detuvo en el límite ($BLOCKED puertos de 8)"; fi
@@ -61,7 +61,7 @@ v bash -c 'test -f /root/lab-data/doc1.txt.enc' && pass "la evidencia del ataque
 
 step "y queda el informe"
 v arx forensics | tail -6 | sed 's/^/  /'
-REP=$(v bash -c 'ls -t /var/lib/arx/forensics/forense-*.json 2>/dev/null | head -1')
+REP=$(v bash -c 'ls -t /var/lib/arx/forensics/forensic-*.json 2>/dev/null | head -1')
 if [ -n "$REP" ] && v arx forensics --verify "$REP" >/dev/null; then pass "informe sellado y verificable"; else fail "informe sellado y verificable"; fi
 v arx metrics --days 1 | sed -n 2,8p | sed 's/^/  /'
 

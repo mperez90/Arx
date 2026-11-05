@@ -1,48 +1,46 @@
-# VM de niveles 7–10 — "modo real"
+# VM for levels 7–10: the real thing
 
-El mini-lab Docker cubre L3–L9 de forma rápida, pero los niveles altos necesitan un
-sistema completo: systemd de verdad, auditd, persistencia real y **permiso para destruir**.
-Esta VM es desechable por diseño.
+The Docker mini-lab covers L3–L9 quickly, but the top levels need a full system: real systemd,
+auditd, real persistence and **permission to destroy**. This VM is disposable by design.
 
-## Topología
+## Topology
 
 ```
-┌─────────────────┐   red host-only   ┌──────────────────┐
-│  VÍCTIMA         │ ◄──────────────► │  ATACANTE         │
+┌─────────────────┐   host-only net   ┌──────────────────┐
+│  VICTIM          │ ◄──────────────► │  ATTACKER         │
 │  Ubuntu 22.04    │  192.168.64.10   │  Kali Linux       │
 │  + Arx --enforce │                  │  (kali-rolling)   │
 └─────────────────┘                   └──────────────────┘
-   snapshot "oro" ──► restaurar entre niveles
+   "gold" snapshot ──► restore between levels
 ```
 
-Lo que se puede sin VM ya está en `lab/systemd-lab.sh` y `lab/level10.sh`. Esta VM añade kernel
-propio, auditd, Falco y un reinicio de verdad.
+What can be done without a VM is already in `lab/systemd-lab.sh` and `lab/level10.sh`. This VM adds
+its own kernel, auditd, Falco and a real reboot.
 
-## Montaje (Apple Silicon — UTM)
+## Setup (Apple Silicon, UTM)
 
-1. **UTM** (gratis, App Store o brew). Nueva VM → Linux → ISO `ubuntu-22.04-live-server-arm64`.
-   2 CPU / 4 GB RAM / 25 GB disco alcanzan.
-2. Red: **Host-Only** (sin NAT saliente durante L10; para instalar paquetes, cambiar a
-   NAT temporalmente y volver).
-3. Instala Ubuntu, luego dentro de la VM:
+1. **UTM** (free, App Store or brew). New VM → Linux → ISO `ubuntu-22.04-live-server-arm64`.
+   2 CPU / 4 GB RAM / 25 GB disk are enough.
+2. Network: **Host-Only** (no outbound NAT during L10; to install packages, switch to NAT for a
+   moment and back).
+3. Install Ubuntu, then inside the VM:
    ```bash
-   bash lab/vm/setup-victim.sh      # instala Arx del release, learn+seal, canarios, servicio
+   bash lab/vm/setup-victim.sh      # installs Arx from the release, learn+seal, canaries, service
    ```
-4. Apaga limpio y toma el **snapshot "oro"** (UTM → botón derecho → Clone o
-   `qemu-img snapshot`). Todo nivel destructivo empieza desde oro.
-5. Atacante: otra VM con Kali ARM64 en la misma red host-only.
+4. Shut down cleanly and take the **"gold" snapshot** (UTM → right click → Clone, or
+   `qemu-img snapshot`). Every destructive level starts from gold.
+5. Attacker: another VM with Kali ARM64 on the same host-only network.
 
-## Niveles
+## Levels
 
-| Nivel | Script (se ejecuta DESDE el atacante o dentro según indique) | Qué debe pasar |
+| Level | Script (run FROM the attacker or inside, as indicated) | What must happen |
 |---|---|---|
-| 7 | `attacks/l7-suid.sh` (dentro, vía SSH ganada) | crit por integridad SUID en ≤ 1 h (o inmediato con `--once`) |
-| 8 | `attacks/l8-persist.sh` (dentro) | crit → Tier 2 → autorización → restauración desde vault + evidencia en cuarentena |
-| 9 | `attacks/l9-antiforensics.sh` (dentro) | lectura de canarios detectada; truncado de logs registrado como gap si no hay hallazgo |
-| 10 | `attacks/l10-destroy.sh` (dentro — DESTRUYE la VM) | el freno de seguridad salta (≤5 acciones/h), alertas críticas masivas, Arx no hace nada irreversible; la VM puede morir |
+| 7 | `attacks/l7-suid.sh` (inside, over the gained SSH) | crit from SUID integrity in ≤ 1 h (or at once with `--once`) |
+| 8 | `attacks/l8-persist.sh` (inside) | crit → Tier 2 → authorization → restore from the vault + evidence in quarantine |
+| 9 | `attacks/l9-antiforensics.sh` (inside) | canary reads detected; log truncation logged as a gap if there's no finding |
+| 10 | `attacks/l10-destroy.sh` (inside, DESTROYS the VM) | the safety brake trips (≤5 actions/h), mass critical alerts, Arx does nothing irreversible |
 
-## Disciplina de evidencia
+## Evidence discipline
 
-Cada nivel deja: salida del atacante, `incidents.jsonl`, `arx status`, y notas en
-`lab/vm/scoreboard.md`. Lo que falle se convierte en bug nuevo en
-`DevelopDocs/registro-bugs.md` con su test de regresión.
+Each level leaves: attacker output, `incidents.jsonl`, `arx status`, and notes in
+`lab/vm/scoreboard.md`. Whatever fails becomes a new bug with its regression test.

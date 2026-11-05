@@ -18,6 +18,7 @@ import getpass
 import socket
 
 from arx import config, totp
+from arx.i18n import SUPPORTED, lang, set_lang, tr
 from arx.modules import telegram
 
 # (proveedor, modelo por defecto). El orden es también el orden de fallback base.
@@ -40,27 +41,34 @@ def _ask_secret(prompt: str) -> str:
 def show() -> int:
     cfg = config.load_config()
     if not cfg:
-        print("Arx no está configurado todavía. Ejecuta:  arx setup")
+        print(tr("Arx is not configured yet. Run:  arx setup"))
         return 0
-    print("\n▸ Configuración de Arx")
+    print(tr("\n▸ Arx configuration"))
+    print(f"  lang           {lang()}")
     print(f"  dir            {config.config_dir()}")
-    print(f"  orden fallback {' → '.join(cfg.get('fallback_order', [])) or '(ninguno)'}")
+    print(tr("  fallback order {v}", v=' → '.join(cfg.get('fallback_order', [])) or tr("(none)")))
     for prov, model in cfg.get("providers", {}).items():
-        print(f"  {prov:<12} modelo {model}  ·  clave {config.redact(config.get_api_key(prov))}")
-    print(f"  palabra auth   {'configurada' if cfg.get('auth_word') else 'NO configurada'}")
-    print(f"  alcance        {cfg.get('scope', '(todo el host)')}")
-    print(f"  fuera-límites  {cfg.get('out_of_bounds', '(ninguno)')}")
-    print(f"  baseline       {cfg.get('baseline_days', '?')} días")
-    print(f"  LLM            solo ante hallazgos nuevos · máx {cfg.get('llm_daily_budget', 48)}/día")
+        print(tr("  {prov:<12} model {model}  ·  key {v}",
+                 prov=prov, model=model, v=config.redact(config.get_api_key(prov))))
+    print(tr("  auth word      {v}",
+             v=tr("configured") if cfg.get('auth_word') else tr("NOT configured")))
+    print(tr("  scope          {scope}", scope=cfg.get('scope', tr("(the whole host)"))))
+    print(tr("  out-of-bounds  {out_of_bounds}",
+             out_of_bounds=cfg.get('out_of_bounds', tr("(none)"))))
+    print(tr("  baseline       {baseline_days} days", baseline_days=cfg.get('baseline_days', '?')))
+    print(tr("  LLM            only on new findings · max {llm_daily_budget}/day",
+             llm_daily_budget=cfg.get('llm_daily_budget', 48)))
     n = cfg.get("notify") or {}
-    tg = "sí" if n.get("telegram_chat_id") and config.load_secrets().get("telegram_bot_token") else "no"
-    print(f"  alertas        telegram {tg} · webhook {'sí' if n.get('webhook_url') else 'no'} "
-          f"· desde sev {n.get('min_sev', 'high')}")
-    print(f"  gobierno chat  {'sí, con código de un solo uso' if n.get('telegram_interactive') else 'no'}")
-    print(f"  ante escaneo   {cfg.get('ip_response', 'block')}")
-    print(f"  modelo bloquea {'no' if cfg.get('llm_identity_actions') is False else 'sí, con --enforce'}"
-          f" · desde {cfg.get('llm_lock_min_confidence', 70)}% de confianza")
-    print(f"  licencia       {cfg.get('license_tier', 'core')}\n")
+    tg = tr("yes") if n.get("telegram_chat_id") and config.load_secrets().get("telegram_bot_token") else "no"
+    print(tr("  alerts         telegram {tg} · webhook {v} · from sev {min_sev}",
+             tg=tg, v=tr("yes") if n.get('webhook_url') else 'no', min_sev=n.get('min_sev', 'high')))
+    print(tr("  chat control   {v}",
+             v=tr("yes, with a one-time code") if n.get('telegram_interactive') else 'no'))
+    print(tr("  on a scan      {ip_response}", ip_response=cfg.get('ip_response', 'block')))
+    print(tr("  model locks    {v} · from {llm_lock_min_confidence}% confidence",
+             v='no' if cfg.get('llm_identity_actions') is False else tr("yes, with --enforce"),
+             llm_lock_min_confidence=cfg.get('llm_lock_min_confidence', 70)))
+    print(tr("  license        {license_tier}\n", license_tier=cfg.get('license_tier', 'core')))
     return 0
 
 
@@ -70,46 +78,50 @@ def run(show_only: bool = False) -> int:
 
     cfg = config.load_config()
     store = config.load_secrets()
-    print("\n═ Arx · configuración ═")
+    chosen = _ask("Language / Idioma (en/es)", cfg.get("lang") or lang()).lower()
+    set_lang(chosen if chosen in SUPPORTED else lang())
+    print(tr("\n═ Arx · configuration ═"))
 
-    print("\n1) Proveedores LLM  (Enter en la clave = omitir ese proveedor)")
+    print(tr("\n1) LLM providers  (Enter on the key = skip that provider)"))
     providers: dict[str, str] = {}
     for prov, default_model in PROVIDERS:
-        key = _ask_secret(f"   Clave API de {prov} (vacío = omitir)")
+        key = _ask_secret(tr("   API key for {prov} (empty = skip)", prov=prov))
         if key:
             store[prov] = key
         if key or prov in store:
-            providers[prov] = _ask(f"   Modelo de {prov}", default_model)
+            providers[prov] = _ask(tr("   Model for {prov}", prov=prov), default_model)
     if not providers:
-        print("   ⚠ Sin proveedores: Arx no podrá razonar hasta que configures al menos uno.")
+        print(tr("   ⚠ No providers: Arx cannot reason until you configure at least one."))
     order = [p for p, _ in PROVIDERS if p in providers]
 
-    print("\n2) Palabra de autorización  (para acciones irreversibles · Tier 2)")
-    while True:
-        w1 = _ask_secret("   Palabra")
+    print(tr("\n2) Authorization word  (for irreversible actions · Tier 2)"))
+    for _ in range(5):  # sin terminal (entrada cerrada) las respuestas vacías no se acaban nunca
+        w1 = _ask_secret(tr("   Word"))
         if not w1:
-            print("   No puede quedar vacía.")
+            print(tr("   It cannot be empty."))
             continue
-        if w1 != _ask_secret("   Repite la palabra"):
-            print("   No coinciden, reintenta.")
+        if w1 != _ask_secret(tr("   Repeat the word")):
+            print(tr("   They do not match, try again."))
             continue
         break
+    else:
+        raise SystemExit(tr("No authorization word: setup cancelled, nothing was saved."))
     auth = config.hash_word(w1)
 
-    print("\n3) Alcance")
-    scope = _ask("   Qué defiende Arx", "todo el host")
-    oob = _ask("   Fuera de límites — puertos, rutas, procesos o cuentas que NUNCA debe tocar, "
-               "separados por coma (el puerto SSH ya está protegido)", cfg.get("out_of_bounds", "(ninguno)"))
+    print(tr("\n3) Scope"))
+    scope = _ask(tr("   What Arx defends"), tr("the whole host"))
+    oob = _ask(tr("   Out of bounds: ports, paths, processes or accounts it must NEVER touch, "
+                  "comma-separated (the SSH port is already protected)"), cfg.get("out_of_bounds", tr("(none)")))
 
-    print("\n4) Aprendizaje y motor")
-    days = _ask("   Días de ventana de baseline", "7")
-    budget = _ask("   Máximo de consultas al LLM por día (solo se usa ante hallazgos nuevos)",
+    print(tr("\n4) Learning and engine"))
+    days = _ask(tr("   Baseline window in days"), "7")
+    budget = _ask(tr("   Maximum LLM queries per day (only used on new findings)"),
                   str(cfg.get("llm_daily_budget", 48)))
 
-    print("\n5) Licencia")
+    print(tr("\n5) License"))
     tier = _ask("   Tier (core/pro/business)", "core").lower()
     if tier in ("pro", "business"):
-        key = _ask_secret("   Clave de licencia (Enter para activar más tarde)")
+        key = _ask_secret(tr("   License key (Enter to activate later)"))
         if key:
             import platform
 
@@ -121,61 +133,68 @@ def run(show_only: bool = False) -> int:
                 if res.get("ok"):
                     lic_mod.validate()
                     et, _ = lic_mod.effective_tier()
-                    print(f"   ✓ Licencia activada en este servidor · tier {et}")
+                    print(tr("   ✓ License activated on this server · tier {et}", et=et))
                 else:
                     store["license_key"] = key
-                    print(f"   ⚠ No pude activar ahora ({res.get('reason')}). "
-                          "Guardada; reintenta:  arx license activate <LLAVE>")
+                    print(tr("   ⚠ Could not activate now ({reason}). Saved; retry:  arx license "
+                             "activate <KEY>", reason=res.get('reason')))
             except Exception as e:  # sin conexión, etc.
                 store["license_key"] = key
-                print(f"   ⚠ Sin conexión para activar ({e}). "
-                      "Guardada; reintenta:  arx license activate <LLAVE>")
+                print(tr("   ⚠ No connection to activate ({e}). Saved; retry:  arx license "
+                         "activate <KEY>", e=e))
 
-    print("\n6) Alertas  (Enter = omitir)")
+    print(tr("\n6) Alerts  (Enter = skip)"))
     notify_cfg = dict(cfg.get("notify") or {})
-    print("   Telegram: en la app, habla con @BotFather, envíale /newbot y sigue sus pasos. Te dará un token.\n"
-          "   Crea un bot solo para Arx: es tuyo, y nadie más que tú pasa por él.")
-    tg_token = _ask_secret("   Token del bot de Telegram (vacío = mantener/omitir)")
+    print(tr("   Telegram: in the app, talk to @BotFather, send it /newbot and follow its steps. "
+             "It will give you a token.\n   Create a bot just for Arx: it is yours, and nobody but "
+             "you goes through it."))
+    tg_token = _ask_secret(tr("   Telegram bot token (empty = keep/skip)"))
     if tg_token:
         store["telegram_bot_token"] = tg_token
         name = telegram.bot_name(tg_token)
         if name:
-            print(f"   ✓ Bot @{name}. Envíale ahora cualquier mensaje desde tu móvil (espero 90 s)…")
+            print(tr("   ✓ Bot @{name}. Send it any message from your phone now (waiting 90 s)…",
+                     name=name))
             chat = telegram.detect_chat_id(tg_token)
             if chat:
                 notify_cfg["telegram_chat_id"] = chat
-                print(f"   ✓ Tu chat es el {chat}. Solo este chat podrá hablar con Arx.")
+                print(tr("   ✓ Your chat is {chat}. Only this chat can talk to Arx.", chat=chat))
             else:
-                print("   No llegó ningún mensaje: escribe el chat_id a mano.")
+                print(tr("   No message arrived: type the chat_id by hand."))
         else:
-            print("   ⚠ No pude comprobar ese token ahora (¿es correcto? ¿hay conexión?). Se guarda igualmente.")
+            print(tr("   ⚠ Could not check that token now (is it right? is there a connection?). "
+                     "Saving it anyway."))
     if tg_token or store.get("telegram_bot_token"):
-        notify_cfg["telegram_chat_id"] = _ask("   chat_id de Telegram al que avisar",
+        notify_cfg["telegram_chat_id"] = _ask(tr("   Telegram chat_id to alert"),
                                               notify_cfg.get("telegram_chat_id"))
-        interactive = _ask("   ¿Gobernar Arx desde ese chat? (consultar, y autorizar con código de un solo uso) (s/n)",
-                           "s" if notify_cfg.get("telegram_interactive") else "n").lower() == "s"
+        interactive = _ask(tr("   Control Arx from that chat? (query, and authorize with a "
+                              "one-time code) (y/n)"),
+                           tr("y") if notify_cfg.get("telegram_interactive") else "n").lower() in ("y", "s")
         notify_cfg["telegram_interactive"] = interactive
         if interactive and not store.get("telegram_totp"):
             store["telegram_totp"] = totp.new_secret()
-            print("   Añade esta clave a tu app de autenticación (Google Authenticator, Aegis, 1Password…):")
+            print(tr("   Add this key to your authenticator app (Google Authenticator, Aegis, "
+                     "1Password…):"))
             print(f"     {store['telegram_totp']}")
             print(f"     {totp.uri(store['telegram_totp'], socket.gethostname())}")
-            print("   Es lo que te pedirá Arx para actuar desde el chat: tu palabra nunca viaja por él.")
-    notify_cfg["webhook_url"] = _ask("   URL de webhook (Slack/Discord/n8n…)", notify_cfg.get("webhook_url"))
-    notify_cfg["min_sev"] = _ask("   Avisar desde severidad (crit/high/med)", notify_cfg.get("min_sev", "high"))
+            print(tr("   This is what Arx will ask for to act from the chat: your word never "
+                     "travels through it."))
+    notify_cfg["webhook_url"] = _ask(tr("   Webhook URL (Slack/Discord/n8n…)"), notify_cfg.get("webhook_url"))
+    notify_cfg["min_sev"] = _ask(tr("   Alert from severity (crit/high/med)"), notify_cfg.get("min_sev", "high"))
 
-    print("\n7) Respuesta automática  (solo actúa con --enforce)")
-    ip_response = _ask("   Ante un escaneo: block (cortar la IP) o tarpit (estrangularla: útil si la IP "
-                       "puede ser compartida)", cfg.get("ip_response", "block")).lower()
+    print(tr("\n7) Automatic response  (only acts with --enforce)"))
+    ip_response = _ask(tr("   On a scan: block (cut the IP) or tarpit (throttle it: useful if the "
+                          "IP may be shared)"), cfg.get("ip_response", "block")).lower()
     llm_acts = True
     if providers:
-        print("   Si el modelo confirma como amenaza un acceso desconocido, Arx puede bloquear esa cuenta "
-              "y\n   cerrar sus sesiones sin esperarte, y te avisa con todo el contexto. Nunca toca root,\n"
-              "   cuentas de sistema ni la última cuenta de administración.")
-        llm_acts = _ask("   ¿Permitirlo? (s/n)", "n" if cfg.get("llm_identity_actions") is False else "s").lower() != "n"
+        print(tr("   If the model confirms unknown access as a threat, Arx can lock that account "
+                 "and\n   close its sessions without waiting for you, and alerts you with the full "
+                 "context. It never touches root,\n   system accounts or the last admin account."))
+        llm_acts = _ask(tr("   Allow it? (y/n)"), "n" if cfg.get("llm_identity_actions") is False else tr("y")).lower() != "n"
 
     cfg.update(
         {
+            "lang": lang(),
             "ip_response": ip_response if ip_response in ("block", "tarpit") else "block",
             "llm_identity_actions": llm_acts,
             "providers": providers,
@@ -192,8 +211,8 @@ def run(show_only: bool = False) -> int:
     config.save_config(cfg)
     config.save_secrets(store)
 
-    print("\n✓ Configuración guardada:")
+    print(tr("\n✓ Configuration saved:"))
     print(f"    {config.config_path()}  (0600)")
     print(f"    {config.secrets_path()}  (0600)")
-    print("\nSiguiente paso:  arx recon\n")
+    print(tr("\nNext step:  arx recon\n"))
     return 0

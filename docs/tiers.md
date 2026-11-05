@@ -1,37 +1,36 @@
-# Arx — matriz de tiers
+# Arx: tier matrix
 
-El **Core** es defensa real y gratuita, y es lo único disponible hoy. **Pro** y **Business**
-están **planificados**: abren después de la fase de pruebas públicas de Core, y esta tabla
-describe lo previsto, no lo que ya se puede comprar. Cada ✅ de pago debe existir y estar
-probado antes de abrir su venta.
+**Core** is real, free defense, and it's the only tier available today. **Pro** and **Business**
+are **planned**: they open after Core's public testing phase, and this table describes what's
+intended, not what you can buy now. Every paid ✅ must exist and be tested before it goes on sale.
 
-| Capacidad | Core (gratis) | Pro (1 dispositivo) | Business (por dispositivo) |
+| Capability | Core (free) | Pro (1 device) | Business (per device) |
 |---|---|---|---|
-| Wizard de instalación (consola) | ✅ | ✅ | ✅ |
-| Reconocimiento inicial + inventario | ✅ | ✅ | ✅ |
-| Línea base (ejecutables·puertos·servicios·usuarios + medidores) | ✅ | ✅ | ✅ |
-| Canarios / honeytokens | ✅ | ✅ | ✅ |
-| Sensores (osquery·auditd·Falco, si están instalados) | ✅ | ✅ | ✅ |
-| Respuesta Tier 0/1 (automática y reversible) | ✅ | ✅ | ✅ |
-| Respuesta Tier 2 (humano + palabra) | ✅ | ✅ | ✅ |
-| Bloqueo de cuentas: cierra sesiones y accesos, solo una persona lo levanta | ✅ | ✅ | ✅ |
-| El modelo (tu clave) puede confirmar una amenaza y cerrar esa cuenta, con salvaguardas | ✅ | ✅ | ✅ |
-| Gobierno desde Telegram, con código de un solo uso | ✅ | ✅ | ✅ |
-| Propuestas (normalizar, endurecer SSH): Arx propone, tú apruebas | ✅ | + autónomo con rollback | + autónomo con rollback |
-| Vacunas firmadas, validadas en cada host (el canal aún no está abierto) | ✅ | ✅ | ✅ |
-| Análisis estático de ficheros (`arx scan`) | ✅ | ✅ | ✅ |
-| Informe forense sellado (`arx forensics`) | ✅ | ✅ | ✅ |
-| Intel de amenazas | comunitaria, por las vacunas (el canal aún no está abierto) | **gestionada, tiempo real** | gestionada + privada |
-| Detecciones avanzadas por TTP | básicas | ✅ | ✅ |
-| Auto-pentest del propio host | — | ✅ (curado) | ✅ |
-| Evaluación autorizada de los activos propios (Kali/Parrot) | — | — | ✅ |
-| Informes de postura | básico | ✅ | compliance (SOC2/ISO) |
-| Consola central + correlación entre hosts | — | — | ✅ |
-| Hosts que se defienden entre sí | — | — | ✅ |
-| Integración SIEM/SOAR · RBAC · auditoría | — | — | ✅ |
-| Soporte | comunidad | estándar | SLA (+MDR opcional, por contrato aparte) |
+| Install wizard (console) | ✅ | ✅ | ✅ |
+| Initial reconnaissance + inventory | ✅ | ✅ | ✅ |
+| Baseline (executables · ports · services · users + gauges) | ✅ | ✅ | ✅ |
+| Canaries / honeytokens | ✅ | ✅ | ✅ |
+| Sensors (osquery · auditd · Falco, if installed) | ✅ | ✅ | ✅ |
+| Tier 0/1 response (automatic and reversible) | ✅ | ✅ | ✅ |
+| Tier 2 response (human + word) | ✅ | ✅ | ✅ |
+| Account lock: closes sessions and access, only a person lifts it | ✅ | ✅ | ✅ |
+| The model (your key) can confirm a threat and close that account, with safeguards | ✅ | ✅ | ✅ |
+| Control from Telegram, with a one-time code | ✅ | ✅ | ✅ |
+| Proposals (normalize, harden SSH): Arx proposes, you approve | ✅ | + autonomous with rollback | + autonomous with rollback |
+| Signed vaccines, validated on each host (the channel isn't open yet) | ✅ | ✅ | ✅ |
+| Static file analysis (`arx scan`) | ✅ | ✅ | ✅ |
+| Sealed forensic report (`arx forensics`) | ✅ | ✅ | ✅ |
+| Threat intel | community, through vaccines (the channel isn't open yet) | **managed, real time** | managed + private |
+| Advanced TTP detections | basic | ✅ | ✅ |
+| Self-pentest of the host itself | — | ✅ (curated) | ✅ |
+| Authorized assessment of your own assets (Kali/Parrot) | — | — | ✅ |
+| Posture reports | basic | ✅ | compliance (SOC2/ISO) |
+| Central console + cross-host correlation | — | — | ✅ |
+| Hosts that defend each other | — | — | ✅ |
+| SIEM/SOAR integration · RBAC · audit | — | — | ✅ |
+| Support | community | standard | SLA (+ optional MDR, under a separate contract) |
 
-**Core es solo defensivo.** Los tiers de pago añaden evaluación autorizada de los activos
-propios, con alcance impuesto por código y aprobación humana por ejercicio. Sin C2 ni
-pivoting empaquetados, y nunca contra terceros: no hay hack-back en ningún tier. El código
-de esa evaluación no vive en este repositorio.
+**Core is defense only.** The paid tiers add authorized assessment of your own assets, with
+scope enforced by code and human approval for each exercise. No packaged C2 or pivoting, and
+never against third parties: there's no hack-back in any tier. The code for that assessment
+doesn't live in this repository.
