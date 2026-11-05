@@ -41,7 +41,7 @@ check "Arx sigue en pie tras la fork bomb" v systemctl is-active -q arx
 
 step "borrado de logs"
 v rm -f /var/log/auth.log /var/log/syslog
-if wait_for 70 incident "desapareció"; then pass "borrar el log de autenticación da la alarma"; else fail "borrar el log de autenticación da la alarma"; fi
+if wait_for 70 incident "log_tamper"; then pass "borrar el log de autenticación da la alarma"; else fail "borrar el log de autenticación da la alarma"; fi
 
 step "matar a Arx: vuelve, y sigue defendiendo"
 PID=$(v systemctl show -p MainPID --value arx)
