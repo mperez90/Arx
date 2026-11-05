@@ -14,7 +14,9 @@ probado antes de abrir su venta.
 | Sensores (osquery·auditd·Falco, si están instalados) | ✅ | ✅ | ✅ |
 | Respuesta Tier 0/1 (automática y reversible) | ✅ | ✅ | ✅ |
 | Respuesta Tier 2 (humano + palabra) | ✅ | ✅ | ✅ |
-| Intel de amenazas | comunitaria (retraso) | **gestionada, tiempo real** | gestionada + privada |
+| Análisis estático de ficheros (`arx scan`) | ✅ | ✅ | ✅ |
+| Informe forense sellado (`arx forensics`) | ✅ | ✅ | ✅ |
+| Intel de amenazas | comunitaria (retraso; aún no disponible) | **gestionada, tiempo real** | gestionada + privada |
 | Detecciones avanzadas por TTP | básicas | ✅ | ✅ |
 | Auto-pentest del propio host | — | ✅ (curado) | ✅ |
 | Evaluación autorizada de los activos propios (Kali/Parrot) | — | — | ✅ |

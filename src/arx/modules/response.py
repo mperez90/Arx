@@ -51,7 +51,7 @@ _PLAN: dict[str, tuple[int, str, bool, str]] = {
                     "suspender es reversible (SIGCONT); no destruye evidencia"),
     "processes": (1, "suspender el proceso (SIGSTOP) para análisis", True,
                   "suspender es reversible (SIGCONT); no destruye evidencia"),
-    "login_users": (2, "bloquear la cuenta (usermod -L, reversible, auto-expira)", True,
+    "login_users": (2, "bloquear nuevos accesos de la cuenta, con contraseña o llave SSH (auto-expira)", True,
                     "una cuenta nueva conectada puede ser un admin legítimo → requiere tu "
                     "palabra; el bloqueo se deshace solo y jamás toca root ni cuentas de sistema"),
     "canary": (1, "elevar el nivel de alerta y capturar el contexto del acceso al señuelo", True,
@@ -91,7 +91,7 @@ def classify(finding: dict) -> dict:
 def fingerprint(finding: dict) -> str:
     """Huella estable de un hallazgo: misma amenaza → misma huella entre barridos."""
     basis = finding.get("fp_key") or f"{finding.get('kind', '')}|{finding.get('detail', '')}"
-    return hashlib.sha1(basis.encode()).hexdigest()[:10]
+    return hashlib.sha1(basis.encode("utf-8", "surrogateescape")).hexdigest()[:10]
 
 
 def _now() -> datetime:
@@ -118,7 +118,7 @@ def record(entry: dict) -> None:
 
     entry = {"at": _iso(_now()), **entry}
     fd = os.open(_incidents_path(), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-    with os.fdopen(fd, "a", encoding="utf-8") as f:
+    with os.fdopen(fd, "a", encoding="utf-8", errors="backslashreplace") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
@@ -316,7 +316,8 @@ def _pids_for_exe(exe: str) -> list[int]:
         if not name.isdigit():
             continue
         try:
-            if os.readlink(f"/proc/{name}/exe") == exe:
+            # un dropper que se borra a sí mismo sigue vivo con exe "ruta (deleted)"
+            if os.readlink(f"/proc/{name}/exe").removesuffix(" (deleted)") == exe:
                 out.append(int(name))
         except OSError:
             continue  # murió entre listado y lectura, o sin permiso
@@ -351,7 +352,9 @@ def _apply_revert(revert) -> str | None:
         import pwd
 
         user, uid = revert.get("user"), revert.get("uid")
-        if not (isinstance(user, str) and _USERNAME_RE.match(user) and isinstance(uid, int)):
+        expire = str(revert.get("expire") or "")
+        if not (isinstance(user, str) and _USERNAME_RE.fullmatch(user) and isinstance(uid, int)
+                and (expire == "" or expire.isdigit())):
             return None
         try:
             # anti recreación de cuenta: solo se desbloquea si sigue siendo el mismo uid
@@ -359,11 +362,17 @@ def _apply_revert(revert) -> str | None:
                 return f"cuenta '{user}' recreada con otro uid: no se desbloquea"
         except KeyError:
             return f"cuenta '{user}' ya no existe: nada que desbloquear"
+        # se restaura el estado PREVIO: una cuenta que el admin ya tenía bloqueada sigue así
+        argv = ["usermod", "-e", expire, user]
+        if not revert.get("was_locked"):
+            argv.insert(1, "-U")
         try:
-            subprocess.run(["usermod", "-U", user], capture_output=True, text=True, timeout=15)
+            r = subprocess.run(argv, capture_output=True, text=True, timeout=15)
         except (OSError, subprocess.TimeoutExpired):
-            pass
-        return f"usermod -U {user} (cuenta desbloqueada)"
+            return f"no se pudo restaurar la cuenta '{user}': usermod no respondió"
+        if r.returncode != 0:
+            return f"no se pudo restaurar la cuenta '{user}' ({r.stderr.strip()[:60]})"
+        return f"{' '.join(argv)} (estado previo de la cuenta restaurado)"
     return None
 
 
@@ -537,8 +546,25 @@ def _restore_from_vault(key: str, current_files: list[str] | None = None) -> str
             f"versiones hostiles en cuarentena: {len(quarantined)}")
 
 
+def _shadow_state(user: str) -> tuple[bool, str] | None:
+    """(contraseña ya bloqueada, caducidad en días) de /etc/shadow. None si no se puede leer."""
+    try:
+        with open("/etc/shadow", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                fields = line.rstrip("\n").split(":")
+                if fields[0] == user and len(fields) >= 8:
+                    return fields[1].startswith("!"), fields[7]
+    except OSError:
+        pass
+    return None
+
+
 def _lock_account(user: str, finding: dict) -> str:
-    """Bloquea una cuenta (usermod -L), reversible y auto-expirable.
+    """Bloquea los accesos NUEVOS de una cuenta, reversible y auto-expirable.
+
+    `usermod -L` solo bloquea la contraseña: una llave SSH sigue entrando (comprobado con
+    UsePAM yes). Por eso se caduca también la cuenta (-e 1). Las sesiones ya abiertas no se
+    cierran y el mensaje lo dice. Se guarda el estado previo para restaurarlo tal cual.
 
     Jamás root ni cuentas de sistema (uid < 1000) ni cuentas fuera-de-límites: bloquear
     una de esas dejaría el host sin acceso. El desbloqueo al expirar solo ocurre si sigue
@@ -547,7 +573,7 @@ def _lock_account(user: str, finding: dict) -> str:
     """
     import pwd
 
-    if not _USERNAME_RE.match(user):
+    if not _USERNAME_RE.fullmatch(user):
         return f"nombre de cuenta inválido ({user}): no se bloquea"
     try:
         uid = pwd.getpwnam(user).pw_uid
@@ -559,11 +585,17 @@ def _lock_account(user: str, finding: dict) -> str:
         return f"cuenta '{user}' marcada fuera-de-límites: no se bloquea"
     if not shutil.which("usermod"):
         return "sin usermod en este host: no hay ejecutor seguro de bloqueo de cuenta"
-    r = subprocess.run(["usermod", "-L", user], capture_output=True, text=True, timeout=15)
+    state = _shadow_state(user)
+    if state is None:
+        return f"no pude leer el estado de '{user}' en /etc/shadow: no se bloquea"
+    was_locked, expire = state
+    r = subprocess.run(["usermod", "-L", "-e", "1", user], capture_output=True, text=True, timeout=15)
     if r.returncode != 0:
         return f"no se pudo bloquear la cuenta ({r.stderr.strip()[:48]})"
-    register_block(finding, {"tool": "usermod", "user": user, "uid": uid})
-    return (f"cuenta '{user}' bloqueada (usermod -L) — se desbloquea sola en "
+    register_block(finding, {"tool": "usermod", "user": user, "uid": uid,
+                             "was_locked": was_locked, "expire": expire})
+    return (f"cuenta '{user}' bloqueada para accesos nuevos (contraseña y llave SSH). "
+            f"Las sesiones ya abiertas NO se cierran. Vuelve a su estado previo en "
             f"{DEFAULT_TTL_MIN} min si sigue siendo la misma cuenta (uid {uid})")
 
 
@@ -746,8 +778,8 @@ def _nft_setup() -> bool:
     # TARPIT / estrangulamiento (Core): la IP hostil entra en tarpit4/6 y DOS reglas la
     # limitan POR ORIGEN con meters dinámicos per-IP — pocas conexiones nuevas/s y poco
     # caudal/s. No es un tarpit clásico de RETENCIÓN de conexión (eso exige userspace y es
-    # la vía Pro/Business del honeypot); es rate-limiting agresivo que ahoga a escáneres y
-    # fuerza bruta dejándoles solo un hilillo, reversible y con timeout nativo.
+    # la vía Pro/Business del honeypot); es rate-limiting agresivo que ahoga a un escáner
+    # (medido: 4061 → 2,1 conexiones/s), reversible y con timeout nativo.
     if "tarpit4" not in ruleset:
         cmds += [["nft", "add", "set", "inet", "arx", "tarpit4",
                   "{", "type", "ipv4_addr;", "flags", "timeout;", "}"],
@@ -770,8 +802,10 @@ def _nft_setup() -> bool:
              "}", "drop"]]
     for argv in cmds:
         try:
-            subprocess.run(argv, capture_output=True, text=True, timeout=15)
+            r = subprocess.run(argv, capture_output=True, text=True, timeout=15)
         except (OSError, subprocess.TimeoutExpired):
+            return False
+        if r.returncode != 0:  # sin su regla, meter algo en un set no contiene nada
             return False
     return True
 
@@ -847,10 +881,12 @@ def _execute_tier1(finding: dict, cfg: dict | None = None) -> tuple[str, dict | 
             fam = ipaddress.ip_address(ip).version
         except ValueError:
             return f"IP inválida ({ip}): no se bloquea", None
-        # Política de respuesta (Core): "tarpit" estrangula per-IP en vez de bloquear.
+        # Política de respuesta (Core): "tarpit" estrangula per-IP en vez de bloquear. Solo a
+        # escaneos: 2 conexiones/s apenas frenan una fuerza bruta SSH (medido: de 56 a 34
+        # contraseñas en 20 s), así que esa se sigue bloqueando.
         # Necesita nftables (ufw no limita por IP de origen); sin nft, se informa y se
         # cae a bloqueo honesto en vez de fingir un estrangulamiento que no existe.
-        if (cfg or {}).get("ip_response") == "tarpit":
+        if kind == "port_scan" and (cfg or {}).get("ip_response") == "tarpit":
             if _nft_available():
                 if not _nft_setup():
                     return "nftables presente pero no se pudo preparar la tabla arx", None
@@ -985,6 +1021,8 @@ def handle(finding: dict, enforce: bool = False, authorized: bool = False,
             if revert:
                 outcome["revert"] = revert
                 _note_action(now)
+        elif tier == 2 and (blk := _active_block(fp, now)):
+            status = f"ya autorizado y activo hasta {blk['expires_at'][11:16]} UTC"
         elif authorized:
             status = "autorizada por palabra ✓"
         else:  # tier 2

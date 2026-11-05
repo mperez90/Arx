@@ -16,13 +16,13 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 VERSION="${1:-$(python3 -c "import sys; sys.path.insert(0, '$ROOT/src'); import arx; print(arx.__version__)" 2>/dev/null || echo 0.0.1)}"
-MAINTAINER="${ARX_MAINTAINER:-Advanced Systems Laboratories <hello@arx.local>}"  # fijar en el release
+MAINTAINER="${ARX_MAINTAINER:-Advanced Systems Laboratories <mperez90@users.noreply.github.com>}"
 STAGE="$(mktemp -d)"
 PKG="$STAGE/pkg"
 trap 'rm -rf "$STAGE"' EXIT
 
 # 1) zipapp
-python3 -m zipapp "$ROOT/src" -m "arx.cli:main" -o "$STAGE/arx.pyz" -p "/usr/bin/env python3"
+python3 -m zipapp "$ROOT/src" -m "arx.cli:entry" -o "$STAGE/arx.pyz" -p "/usr/bin/env python3"
 
 # 2) árbol del paquete
 mkdir -p "$PKG/DEBIAN" "$PKG/usr/lib/arx" "$PKG/usr/bin"

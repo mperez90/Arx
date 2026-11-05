@@ -78,11 +78,21 @@ se valida en la fase de red: el atacante escucha con `nc`, la víctima abre el r
 clásico y Arx corta el canal y suspende solo al dueño. Límite honesto: los reverse shell por
 intérprete general (python, perl, php) se dejan para los sensores de comportamiento de F8.
 
-El **tarpit (Core)** se valida en su propia fase (`net-tarpit`): con la política
-`ip_response=tarpit`, reutilizando el escaneo del L1, Arx mete la IP hostil en el set nft
-`tarpit4` con reglas de rate-limit per-IP (no en `block_ipv4`) — estrangula en vez de
-cortar. Es un primer contacto (pizarra limpia), reversible y auto-expira. No es un tarpit
-clásico de retención de conexión: eso es la vía de engaño de Pro/Business (el honeypot).
+El **tarpit (Core)** se valida en su propia fase: con la política `ip_response=tarpit`, Arx
+mete la IP del escáner en el set nft `tarpit4` (no en `block_ipv4`), y el efecto se mide desde
+el atacante: `nmap` debe dejar de ver los puertos abiertos (medido: de 13 a 1 visible, y de
+4061 a 2,1 conexiones/s). Solo se aplica a escaneos: contra una fuerza bruta SSH apenas frena
+(de 56 a 34 contraseñas en 20 s), así que esa se sigue bloqueando. No es un tarpit clásico de
+retención de conexión.
+
+**Ficheros-trampa (`hostile`):** el bucle de guardia lee datos que controla el atacante. Un
+dropper con una cola hostil, un FIFO en su ruta, un dropper que se borra a sí mismo y nombres
+con bytes no UTF-8 o saltos de línea no pueden colgar ni tumbar a Arx, y el dropper debe
+quedar suspendido.
+
+**Identidad (`identity`):** el bloqueo de cuenta se prueba contra `sshd` real: la llave SSH
+debe dejar de entrar, volver a entrar al expirar, y una cuenta que el admin ya había bloqueado
+debe seguir bloqueada.
 
 Dos lecciones del harness: `ncat` con stdin cerrado (`docker exec -d`) cierra cada conexión
 al instante, por eso el C2 usa `nc`; y `ss -K` no sirve para validar nada en Docker Desktop,

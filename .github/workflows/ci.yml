@@ -35,7 +35,7 @@ jobs:
 
       - name: Smoke test — CLI runs
         run: |
-          python -m zipapp src -m "arx.cli:main" -o arx.pyz
+          python -m zipapp src -m "arx.cli:entry" -o arx.pyz
           python arx.pyz --version
           python arx.pyz status
           python arx.pyz license status

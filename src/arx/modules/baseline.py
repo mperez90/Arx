@@ -167,7 +167,7 @@ def snapshot() -> dict:
 
 # ── integridad de arranque ───────────────────────────────────────────────────
 def _h(text: str) -> str:
-    return hashlib.sha256(text.encode()).hexdigest()[:16]
+    return hashlib.sha256(text.encode("utf-8", "surrogateescape")).hexdigest()[:16]
 
 
 def _hash_files(paths: list[str]) -> str | None:

@@ -66,10 +66,14 @@ shown above. Both only need Docker.
 | New SUID binary | Critical alert; the decision is yours | Lab |
 | Persistence planted in cron | On your word: restores from the vault and quarantines the planted file | Lab |
 | Decoy (canary) file read | High-severity alert | Lab |
+| Unknown user logged in | On your word: blocks new password and SSH-key logins; open sessions stay open | Lab (the lock); VM pending (the detection) |
 | Authentication log truncated | High-severity alert | Unit tests |
 
 Levels that need a real VM (weak credentials, ransomware-style destruction) have not been
 run yet. The full test plan and its results are in [`lab/README.md`](lab/README.md).
+
+Two more commands you can use on their own: `arx scan <file>` gives a static verdict on a
+file without ever running it, and `arx forensics` writes a sealed report of what happened.
 
 ## The doctrine: relentless, but reversible
 
@@ -77,7 +81,7 @@ run yet. The full test plan and its results are in [`lab/README.md`](lab/README.
 |------|---------|-----------|
 | **0** | Record evidence and alert | Automatic, always |
 | **1** | Block an IP, a port or a reverse-shell channel; suspend a suspicious process | Automatic with `--enforce`; each action undoes itself after 60 minutes |
-| **2** | Restore critical files, quarantine what was planted | **You**, with your authorization word |
+| **2** | Restore critical files, quarantine what was planted, lock an account | **You**, with your authorization word |
 
 Guardrails against self-inflicted damage:
 
@@ -106,6 +110,10 @@ Read these before you rely on it.
   or by accident, and from then on Arx only observes and alerts.
 - **Blocks need a firewall tool.** Without `ufw` or `nftables` it reports that it can't
   block, and cutting a reverse-shell channel requires `nftables` specifically.
+- **`arx scan` is heuristic.** It uses a small rule set, and "clean" only means no rule
+  matched. On large files it reads the start and the end, and says so.
+- **The forensic seal has a limit.** It detects later edits to a report, but not edits made
+  to the log before the report was generated, and root on the same host can re-sign one.
 - **False-positive rates on real servers haven't been measured.** That's what this testing
   phase is for, and why observe mode comes first.
 - **Linux only, and the CLI is in Spanish for now.** The package targets Debian and Ubuntu.

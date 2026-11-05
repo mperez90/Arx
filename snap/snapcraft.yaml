@@ -27,7 +27,7 @@ parts:
     source: .
     build-packages: [python3]
     override-build: |
-      python3 -m zipapp src -m "arx.cli:main" -o "$CRAFT_PART_INSTALL/arx.pyz"
+      python3 -m zipapp src -m "arx.cli:entry" -o "$CRAFT_PART_INSTALL/arx.pyz"
       mkdir -p "$CRAFT_PART_INSTALL/bin"
       printf '#!/bin/sh\nexec /usr/bin/env python3 "$SNAP/arx.pyz" "$@"\n' > "$CRAFT_PART_INSTALL/bin/arx"
       chmod 0755 "$CRAFT_PART_INSTALL/bin/arx"

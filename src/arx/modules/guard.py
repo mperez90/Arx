@@ -49,6 +49,7 @@ _SEV_RANK = notify.SEV_RANK
 SUID_EVERY_S = 3600          # el recorrido SUID es caro: cada hora, no cada barrido
 LLM_MIN_INTERVAL_S = 300     # agrupa lo nuevo de 5 min en una sola consulta
 LLM_DAILY_BUDGET = 48        # consultas/día por host como máximo
+ENRICH_SWEEP_BUDGET_S = 10   # análisis estático por barrido: nunca retrasa la respuesta
 
 
 # ── integridad ───────────────────────────────────────────────────────────────
@@ -82,12 +83,34 @@ def sweep(base: dict, enforce: bool = False, include_suid: bool = True,
         + canaries.check()
         + sensors.collect_events()
     )
-    # "estático siempre": un ejecutable nuevo en disco se analiza (no se ejecuta) y el
-    # hallazgo lleva su veredicto. Un malicioso sube a severidad alta; lo limpio no hace ruido.
-    findings = [sandbox.enrich_finding(f) for f in findings]
+    deadline = time.monotonic() + ENRICH_SWEEP_BUDGET_S
+    findings = [_prepare(f, enrich=time.monotonic() < deadline) for f in findings]
     findings.sort(key=lambda f: _SEV_RANK.get(f["sev"], 9))
-    outcomes = [response.handle(f, enforce=enforce, cfg=cfg) for f in findings]
+    outcomes = []
+    for f in findings:
+        try:
+            outcomes.append(response.handle(f, enforce=enforce, cfg=cfg))
+        except Exception as e:  # un hallazgo hostil no puede dejar el host sin guardia
+            outcomes.append({"new": False, "tier": 0, "sev": f.get("sev"), "detail": f.get("detail"),
+                             "status": f"error al procesar el hallazgo ({type(e).__name__})"})
     return findings, outcomes
+
+
+def _prepare(finding: dict, enrich: bool = True) -> dict:
+    """Limpia lo que controla el atacante y añade el veredicto estático si aplica.
+
+    "Estático siempre": un ejecutable nuevo en disco se analiza (no se ejecuta). Un malicioso
+    sube a severidad alta, lo que también habilita suspenderlo (sev low no se suspende, B9).
+    """
+    f = dict(finding)
+    f["detail"] = redact.printable(f.get("detail", ""))
+    f["why"] = redact.printable(f.get("why", ""))
+    if not enrich:  # muchos ficheros-trampa en un barrido: primero responder
+        return f
+    try:
+        return sandbox.enrich_finding(f)
+    except Exception:  # el análisis es un extra: su fallo jamás frena la respuesta
+        return f
 
 
 # ── capa lenta: expediente + presupuesto ─────────────────────────────────────
@@ -162,6 +185,7 @@ def _assess_with_engine(new: list[tuple[dict, dict]], base: dict, cfg: dict) -> 
         if not eng.providers_in_order():
             return None
         data = json.dumps(build_dossier(new, base), ensure_ascii=False, indent=1)
+        data = data.encode("utf-8", "backslashreplace").decode("utf-8")  # rutas no UTF-8
         data = data.replace("</telemetria", "<\\/telemetria")  # que nadie cierre el bloque desde dentro
         # redactor de secretos SIEMPRE antes de mandar nada al LLM
         content = redact.scrub(f"<telemetria>\n{data}\n</telemetria>\n\n{ANALYSIS_REQUEST}")
@@ -262,12 +286,11 @@ def run(once: bool = False, interval: int = 30, chat: bool = False, enforce: boo
 
     lic.validate()  # best-effort: refresca la caché; nunca bloquea el arranque (fallar-abierto)
     tier, why = lic.effective_tier()
-    intel = "gestionada (Pro)" if lic.tier_allows("managed_intel", tier) else "comunitaria (Core)"
     sens = sensors.available()
     active = [k for k, v in sens.items() if v] or ["colectores base (/proc)"]
     sensors.ensure_audit_rules([c["path"] for c in canaries._load().get("canaries", [])])
     chans = notify.channels(cfg)
-    print(f"▸ Arx en guardia  ·  tier {tier} ({why})  ·  intel {intel}")
+    print(f"▸ Arx en guardia  ·  tier {tier} ({why})")
     print(f"  sensores: {', '.join(active)}  ·  enforce={'ON' if enforce else 'OFF'}  ·  "
           f"{'un barrido' if once else f'cada {interval}s'}")
     print(f"  alertas: {', '.join(chans) or 'ninguna (configúralas en arx setup)'}  ·  "
@@ -286,7 +309,14 @@ def run(once: bool = False, interval: int = 30, chat: bool = False, enforce: boo
         include_suid = time.monotonic() - last_suid >= SUID_EVERY_S
         if include_suid:
             last_suid = time.monotonic()
-        findings, outcomes = sweep(base, enforce=enforce, include_suid=include_suid, cfg=cfg)
+        try:
+            findings, outcomes = sweep(base, enforce=enforce, include_suid=include_suid, cfg=cfg)
+        except Exception as e:  # con Restart=always, morir aquí sería un bucle de ceguera
+            if once:
+                raise
+            print(f"  ⚠ el barrido falló ({type(e).__name__}: {redact.printable(e)}); sigo en guardia.")
+            time.sleep(interval)
+            continue
         new = [o for o in outcomes if o.get("new")]
         if verbose or new or once:
             print(f"\n— barrido {baseline._now()} —")

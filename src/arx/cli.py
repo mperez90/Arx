@@ -365,5 +365,11 @@ def main(argv: list[str] | None = None) -> int:
     return handlers[args.cmd](args) or 0
 
 
-if __name__ == "__main__":
+def entry() -> None:
+    """Punto de entrada del zipapp: su __main__ ignora lo que devuelve la función llamada, y
+    `arx` terminaría siempre en 0 (un informe alterado "pasaría" para cualquier script)."""
     raise SystemExit(main())
+
+
+if __name__ == "__main__":
+    entry()

@@ -80,10 +80,15 @@ def write_json(path: Path, data) -> None:
     """Escritura atómica: temporal 0600 en el mismo dir → fsync → rename."""
     path = Path(path)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
+    text = json.dumps(data, indent=2, ensure_ascii=False)
+    try:
+        raw = text.encode("utf-8")
+    except UnicodeEncodeError:  # ruta no UTF-8 de un atacante: se escapa (ida y vuelta exacta)
+        raw = json.dumps(data, indent=2).encode("ascii")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+        with os.fdopen(fd, "wb") as f:
+            f.write(raw)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)

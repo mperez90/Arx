@@ -11,6 +11,8 @@ Modos (los orquesta lab/docker-lab.sh con un contenedor atacante separado):
   net-tarpit <ip>   Tarpit (Core): estrangula la IP del escaneo en vez de bloquearla
   sandbox           F6 estático: distingue un fichero malicioso de uno benigno (sin ejecutar)
   forensics         F16: informe forense sellado de los incidentes + detección de manipulación
+  hostile           ficheros-trampa contra el bucle de guardia: no debe colgarse ni morir
+  identity          bloqueo de cuenta real: la llave SSH deja de entrar y se restaura
   levels            L4, L5, L7, L8, L9 en la víctima + scoreboard
   all               prep + levels (modo clásico de contenedor único)
 
@@ -231,7 +233,84 @@ def net_tarpit(ip):
           f"NO bloqueada={not_blocked} · reglas rate-limit per-IP activas={throttled}")
     cfg["ip_response"] = "block"        # restaurar el modo por defecto
     config.save_config(cfg)
-    release()                            # limpiar el estrangulamiento tras la prueba
+    return 0 if ok else 1  # docker-lab.sh mide el efecto desde el atacante y luego libera
+
+
+def _slate():
+    """Pizarra limpia entre escenarios independientes: el freno no debe mezclarlos."""
+    from arx.modules import response
+    for path in (response._findings_path(), response._blocks_path(), response._actions_path()):
+        config.write_json(path, {} if "findings" in path.name else [])
+
+
+def hostile():
+    """El bucle de guardia lee datos que controla el atacante. Cada trampa colgaba o tumbaba
+    a Arx: el barrido debe terminar y el dropper real quedar suspendido."""
+    tail = b"nc -" + b"e" * (3 * 1024 * 1024)
+    ok_all = True
+
+    def trap(name, path, prepare=None, after=None):
+        nonlocal ok_all
+        _slate()
+        sh(["cp", "/usr/bin/yes", path])
+        if prepare:
+            prepare(path)
+        proc = subprocess.Popen([path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(0.5)
+        if after:
+            after(path)
+        try:
+            r = sh([sys.executable, "-m", "arx.cli", "guard", "--once", "--enforce"], timeout=45)
+            finished, rc = True, r.returncode
+        except subprocess.TimeoutExpired:
+            finished, rc = False, None
+        state = _proc_state(proc.pid)
+        ok = finished and rc == 0 and state.startswith("T")
+        ok_all = ok_all and ok
+        print(f"[{'PASS' if ok else 'FAIL'}] trampa {name}: barrido terminó={finished} · rc={rc} · "
+              f"dropper en estado {state}")
+        proc.kill()
+
+    trap("regex (cola de 3 MiB)", "/tmp/t-regex", lambda p: open(p, "ab").write(tail))
+    trap("FIFO en la ruta", "/tmp/t-fifo",
+         after=lambda p: (os.unlink(p), os.mkfifo(p)))
+    trap("se borra a sí mismo", "/tmp/t-borra", after=os.unlink)
+    trap("nombre no UTF-8", os.fsdecode(b"/tmp/t-\xff\xfe"))
+    trap("salto de línea en el nombre", "/tmp/t-\n  [info] todo en orden")
+    _slate()
+    return 0 if ok_all else 1
+
+
+def identity():
+    """Bloqueo de cuenta REAL con sshd: lo que importa es si el acceso entra o no."""
+    from datetime import datetime, timedelta, timezone
+    from arx.modules import response
+    _slate()
+    sh("id bob >/dev/null 2>&1 || useradd -m -s /bin/bash bob; "
+       "ssh-keygen -q -t ed25519 -N '' -f /tmp/bobkey -C lab <<<y >/dev/null 2>&1; "
+       "mkdir -p /home/bob/.ssh; cp /tmp/bobkey.pub /home/bob/.ssh/authorized_keys; "
+       "chown -R bob: /home/bob/.ssh; chmod 700 /home/bob/.ssh; echo bob:clave-bob | chpasswd",
+       executable="/bin/bash")
+
+    def key_enters():
+        return sh(["ssh", "-i", "/tmp/bobkey", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
+                   "-o", "ConnectTimeout=5", "bob@127.0.0.1", "true"]).returncode == 0
+    before = key_enters()
+    msg = response._lock_account("bob", {"kind": "login_users", "detail": "lab bob"})
+    locked = "bloqueada" in msg and not key_enters()
+    later = datetime.now(timezone.utc) + timedelta(minutes=61)
+    response.expire_blocks(now=later)
+    restored = key_enters()
+    # una cuenta que el admin ya tenía bloqueada debe seguir bloqueada al expirar
+    sh("id carol >/dev/null 2>&1 || useradd -m carol; echo carol:x | chpasswd; usermod -L carol")
+    response._lock_account("carol", {"kind": "login_users", "detail": "lab carol"})
+    response.expire_blocks(now=later)
+    admin_lock = sh(["passwd", "-S", "carol"]).stdout.split()[1] == "L"
+    ok = before and locked and restored and admin_lock
+    print(f"[{'PASS' if ok else 'FAIL'}] identidad: llave entra antes={before} · "
+          f"bloqueada de verdad={locked} · restaurada al expirar={restored} · "
+          f"bloqueo previo del admin respetado={admin_lock}")
+    _slate()
     return 0 if ok else 1
 
 
@@ -371,6 +450,10 @@ def main():
         return sandbox_scan()
     if mode == "forensics":
         return forensics_report()
+    if mode == "hostile":
+        return hostile()
+    if mode == "identity":
+        return identity()
     if mode == "levels":
         return levels()
     prep()

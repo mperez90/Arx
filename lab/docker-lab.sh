@@ -64,6 +64,21 @@ step "tarpit (Core): con política 'tarpit' se ESTRANGULA la IP en vez de bloque
 # la IP cae en tarpit4 con reglas de rate-limit per-IP, no en block_ipv4.
 docker exec "$ATT" nmap -sS -p 9000-9020 --max-retries 1 victim >/dev/null 2>&1 || true
 docker exec "$VIC" python3 /src/lab/driver.py net-tarpit "$ATTACKER_IP" || FAILED=1
+# El efecto se mide desde el atacante: que exista la regla no prueba que estrangule.
+SEEN=$(docker exec "$ATT" nmap -sS -p 9001-9012 -T4 --max-retries 0 victim | grep -cE "^[0-9]+/tcp +open" || true)
+if [ "$SEEN" -le 4 ]; then
+  echo "[PASS] tarpit: el escáner ve $SEEN de 12 puertos abiertos"
+else
+  echo "[FAIL] tarpit: el escáner sigue viendo $SEEN de 12 puertos abiertos"
+  FAILED=1
+fi
+docker exec "$VIC" python3 /src/lab/driver.py release
+
+step "ficheros-trampa: el bucle de guardia no debe colgarse, morir ni soltar al dropper"
+docker exec "$VIC" python3 /src/lab/driver.py hostile || FAILED=1
+
+step "identidad: el bloqueo de cuenta detiene de verdad la llave SSH y se restaura"
+docker exec "$VIC" python3 /src/lab/driver.py identity || FAILED=1
 
 step "F6 sandbox estático (Core): ¿este fichero es malicioso? — sin ejecutar nada"
 docker exec "$VIC" python3 /src/lab/driver.py sandbox || FAILED=1

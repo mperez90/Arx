@@ -32,7 +32,7 @@ SEV_LABEL = {"crit": "CRÍTICO", "high": "ALTO", "med": "MEDIO", "low": "BAJO", 
 def _run(args: list[str], timeout: int = TIMEOUT) -> str | None:
     """Ejecuta un comando (sin shell). Devuelve stdout o None ante cualquier fallo."""
     try:
-        r = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run(args, capture_output=True, text=True, errors="replace", timeout=timeout)
     except (FileNotFoundError, subprocess.TimeoutExpired, PermissionError, OSError):
         return None
     return r.stdout.strip() if r.returncode == 0 else None
