@@ -1,6 +1,6 @@
 name: arx
 base: core24
-version: "0.0.2"
+version: "0.0.3"
 summary: Autonomous defensive security agent for servers
 description: |
   Arx learns your server's normal and contains threats automatically with actions

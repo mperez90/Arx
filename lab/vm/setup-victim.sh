@@ -2,8 +2,8 @@
 # Prepara la VM víctima con Arx defendiendo (snapshot "oro" DESPUÉS de esto).
 set -euo pipefail
 
-curl -fsSL https://raw.githubusercontent.com/mperez90/Arx/main/packaging/install.sh | sudo bash
-# (si el release cambia de rama, ajusta la URL; install.sh verifica SHA256SUMS siempre)
+curl -fsSLO https://raw.githubusercontent.com/mperez90/Arx/f1-core-mvp/packaging/install.sh
+sudo sh install.sh    # verifica SHA256SUMS siempre
 
 sudo arx setup        # wizard: alertas Telegram opcionales en el lab
 sudo arx recon

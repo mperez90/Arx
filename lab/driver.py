@@ -14,9 +14,15 @@ Modos (los orquesta lab/docker-lab.sh con un contenedor atacante separado):
   hostile           ficheros-trampa contra el bucle de guardia: no debe colgarse ni morir
   identity          bloqueo de cuenta real: sesiones cerradas, llave fuera, solo `unlock` la abre
   identity-llm <ip> veredicto del modelo sobre un acceso real sin terminal desde el atacante
+  operator <ip> <si|no>  ¿esa IP se considera un operador intocable?
   identity-forged   una línea falsa en auth.log no debe bloquear a nadie
   identity-unlock   levanta el bloqueo de bob (lo decide una persona)
   uid0              alias de root: alerta crítica; bloquearlo no afecta a root
+  proposal-apply    aplica el cierre de contraseñas de SSH propuesto por Arx
+  proposal-revert   lo deshace
+  vaccine-sign      firma un paquete de prueba, otro alterado y otro de otra clave
+  vaccine-apply <pub> <valida|insuficiente>  validación en ESTE host, descargando de otra máquina
+  vaccine-intel     una IP de vacuna conectada: se detecta y se bloquea
   forward-up        un "contenedor" con un servicio publicado por DNAT
   forward-block <ip> bloquea esa IP; el efecto se mide desde el atacante
   levels            L4, L5, L7, L8, L9 en la víctima + scoreboard
@@ -390,6 +396,17 @@ def identity_llm(ip):
     return 0 if ok else 1
 
 
+def operator(ip, expected):
+    """¿Esta IP se considera un operador intocable? Se decide varias veces: la protección pide persistir."""
+    from arx.modules import response
+    config.write_json(config.state_dir() / "ssh-peers.json", {})
+    seen = [ip in response._never_block_ips() for _ in range(3)]
+    ok = seen[-1] == (expected == "si")
+    what = "una sesión autenticada sí protege" if expected == "si" else "una conexión sin autenticar no protege"
+    print(f"[{'PASS' if ok else 'FAIL'}] {what}: intocable={seen[-1]}")
+    return 0 if ok else 1
+
+
 def identity_forged():
     """Un usuario sin privilegios escribe en auth.log: el veredicto no debe tocar a la víctima."""
     from arx.modules import baseline, guard, response
@@ -476,6 +493,112 @@ def forward_block(ip):
     print(f"  {status}")
     print("  " + sh(["nft", "list", "chain", "inet", "arx", "forward"]).stdout.replace("\n", "\n  "))
     return 0 if revert else 1
+
+
+def proposal_apply():
+    from arx.modules import proposals
+    _slate()
+    sh("mkdir -p /root/.ssh; cat /tmp/bobkey.pub >> /root/.ssh/authorized_keys; chmod 700 /root/.ssh")
+    sh("grep -q sshd_config.d /etc/ssh/sshd_config || sed -i '1i Include /etc/ssh/sshd_config.d/*.conf' /etc/ssh/sshd_config")
+    sh("sed -i 's/^#\\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config; pkill -HUP -x sshd || true")
+    offered = [p["id"] for p in proposals.all_proposals()]
+    msg = proposals.apply_ssh("ssh-sin-contrasena")
+    time.sleep(1)
+    key = sh(["ssh", "-i", "/tmp/bobkey", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
+              "-o", "ConnectTimeout=5", "bob@127.0.0.1", "true"]).returncode == 0
+    ok = "ssh-sin-contrasena" in offered and msg.startswith("hecho") and key
+    print(f"[{'PASS' if ok else 'FAIL'}] propuesta: ofrecida={'ssh-sin-contrasena' in offered} · {msg[:60]}… · la llave sigue entrando={key}")
+    return 0 if ok else 1
+
+
+def proposal_revert():
+    from arx.modules import proposals
+    msg = proposals.revert_ssh("ssh-sin-contrasena")
+    time.sleep(1)
+    print(f"── {msg} ──")
+    return 0 if msg.startswith("deshecho") else 1
+
+
+def _lab_feed(serial=1, revoked=()):
+    return {"serial": serial, "issued": "2026-11-05T00:00:00+00:00", "revoked": list(revoked), "vaccines": [
+        {"id": "lab-ip", "version": 1, "description": "IP de prueba del lab", "iocs": {"ips": ["185.220.101.50"]}},
+        {"id": "lab-regla", "version": 1, "description": "minero de prueba", "iocs": {},
+         "rules": [{"id": "minero", "verdict": "malicioso", "regex": "lab-minero-[a-z]{1,8}",
+                    "must_match": ["corre lab-minero-abc"], "must_not_match": ["un texto normal"]}]},
+        {"id": "lab-hostil-red", "version": 1, "description": "bloquea todo", "iocs": {"ips": ["10.0.0.0/8"]}},
+        {"id": "lab-hostil-regex", "version": 1, "description": "cuelga el bucle", "iocs": {},
+         "rules": [{"id": "x", "verdict": "malicioso", "regex": "(a+)+$", "must_match": ["aaa"],
+                    "must_not_match": ["b"]}]},
+    ]}
+
+
+def _tool():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("vaccine_tool", "/src/scripts/vaccine_tool.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def vaccine_sign():
+    """Clave de usar y tirar: esto prueba el protocolo, no es la clave de ASL."""
+    import base64
+    import secrets
+    tool = _tool()
+    secret = secrets.token_bytes(32)
+    signed = tool.signed_feed(_lab_feed(), secret)
+    json.dump(signed, open("/work/feed.signed.json", "w"))
+    evil = base64.b64decode(signed["payload"]).replace(b"185.220.101.50", b"185.220.101.66")
+    json.dump({"payload": base64.b64encode(evil).decode(), "sig": signed["sig"]}, open("/work/feed.tampered.json", "w"))
+    json.dump(tool.signed_feed(_lab_feed(), secrets.token_bytes(32)), open("/work/feed.other-key.json", "w"))
+    open("/work/feed.pub", "w").write(tool.public_key(secret).hex())
+    return 0
+
+
+def vaccine_apply(pub, rule_expected):
+    """En cada host: lo alterado y lo de otra clave no se abre; lo hostil no se aplica aunque esté
+    firmado; y la regla vale o no según lo que haya en ESTE host."""
+    from arx.modules import vaccines
+    url = "http://attacker:8000/"
+    tampered = vaccines.update(pubkey=pub, cfg={"vaccine_feed_url": url + "feed.tampered.json"})
+    other = vaccines.update(pubkey=pub, cfg={"vaccine_feed_url": url + "feed.other-key.json"})
+    refused = "firma" in str(tampered.get("reason")) and "firma" in str(other.get("reason"))
+    untouched = not vaccines._load().get("applied")
+    out = vaccines.update(pubkey=pub, cfg={"vaccine_feed_url": url + "feed.signed.json"})
+    if not out.get("ok"):
+        print(f"[FAIL] vacunas: no se pudo aplicar ({out.get('reason')})")
+        return 1
+    for r in out["rejected"]:
+        print(f"  ✗ {r['id']}: {r['status']} — {r['reason']}")
+    status = {r["id"]: r["status"] for r in out["rejected"]}
+    hostile = status.get("lab-hostil-red") == "hostil" and status.get("lab-hostil-regex") == "hostil"
+    rule_ok = ("lab-regla" in out["applied"]) if rule_expected == "valida" else status.get("lab-regla") == rule_expected
+    ip_ok = "lab-ip" in out["applied"]
+    # repetir un paquete antiguo no debe colar
+    fired = False
+    if rule_expected == "valida":
+        sample = "/work/muestra-vacuna"
+        open(sample, "w").write("#!/bin/sh\n# corre lab-minero-abc\n")
+        fired = "MALICIOSO" in arx("scan", sample)
+        os.unlink(sample)
+    ok = refused and untouched and hostile and rule_ok and ip_ok and (fired or rule_expected != "valida")
+    print(f"[{'PASS' if ok else 'FAIL'}] vacunas en este host: alterado y otra clave rechazados={refused} · "
+          f"nada aplicado antes de la firma buena={untouched} · hostiles rechazadas={hostile} · "
+          f"regla {rule_expected}={rule_ok} · IP aplicada={ip_ok}"
+          + (f" · arx scan la usa={fired}" if rule_expected == "valida" else ""))
+    return 0 if ok else 1
+
+
+def vaccine_intel():
+    from arx.modules import baseline, guard
+    _slate()
+    findings, outcomes = guard.sweep(baseline.load(), enforce=True, include_suid=False, cfg={})
+    pair = next((p for p in zip(findings, outcomes) if p[0].get("kind") == "intel_ip"), None)
+    blocked = "185.220.101.50" in _nft_set("block_ipv4")
+    ok = pair is not None and blocked
+    print(f"[{'PASS' if ok else 'FAIL'}] vacuna con IP: conexión viva detectada={pair is not None} · bloqueada={blocked}"
+          + (f" · {pair[1]['status'][:70]}" if pair else ""))
+    return 0 if ok else 1
 
 
 def sandbox_scan():
@@ -620,12 +743,24 @@ def main():
         return identity()
     if mode == "identity-llm":
         return identity_llm(sys.argv[2])
+    if mode == "operator":
+        return operator(sys.argv[2], sys.argv[3])
     if mode == "identity-forged":
         return identity_forged()
     if mode == "identity-unlock":
         return identity_unlock()
     if mode == "uid0":
         return uid0()
+    if mode == "proposal-apply":
+        return proposal_apply()
+    if mode == "proposal-revert":
+        return proposal_revert()
+    if mode == "vaccine-sign":
+        return vaccine_sign()
+    if mode == "vaccine-apply":
+        return vaccine_apply(sys.argv[2], sys.argv[3])
+    if mode == "vaccine-intel":
+        return vaccine_intel()
     if mode == "forward-up":
         return forward_up()
     if mode == "forward-block":

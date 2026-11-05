@@ -231,6 +231,11 @@ def _analyze(path: str) -> dict:
     entropy = shannon_entropy(head)
     text = data.decode("latin-1")  # 1 byte ↔ 1 char: regex/substr sobre binario también
     hits = _rule_hits(data, text, ftype, entropy)
+    try:
+        from arx.modules import vaccines  # perezoso: vaccines importa este módulo
+        hits += vaccines.static_hits(text, digest.hexdigest())
+    except Exception:  # una vacuna rota no puede dejar a Arx sin análisis
+        pass
     partial = total > len(head) + len(tail)
     verdict = _verdict(hits)
     reasons = [h["why"] for h in hits]
@@ -302,6 +307,9 @@ def enrich_finding(finding: dict) -> dict:
     f["sandbox"] = {k: v for k, v in rep.items() if k != "strings"}  # sale a la consola de flota
     if rep["verdict"] == "malicioso":
         f["sev"] = "high"
+    vaccine = next((h["vaccine"] for h in rep["hits"] if h.get("vaccine")), None)
+    if vaccine:  # si el operador lo desmiente, cuenta contra esa vacuna
+        f["vaccine"] = vaccine
     return f
 
 

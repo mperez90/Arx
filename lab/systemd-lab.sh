@@ -2,93 +2,12 @@
 # Lab con systemd de verdad: instala el .deb, corre Arx como servicio y mide desde el atacante.
 # Cubre lo que el mini-lab no puede: el unit y su endurecimiento, journald, reinicios y ufw activo.
 #   bash lab/systemd-lab.sh
-# Todo es efímero. No sustituye a una VM: comparte kernel con Docker, sin auditd y sin reinicio real
-# del kernel (un `docker restart` borra nftables como un reinicio, pero no el resto).
+# No sustituye a una VM: comparte kernel con Docker, sin auditd y sin reinicio real del kernel
+# (un `docker restart` borra nftables como un reinicio, pero no el resto).
 set -uo pipefail
 cd "$(dirname "$0")/.."
-
-SUF=$$
-NET=arxsd-$SUF
-VIC=arxsdv-$SUF
-ATT=arxsda-$SUF
-WORD=palabra-lab
-FAILED=0
-cleanup() {
-  docker stop -t 2 "$VIC" "$ATT" >/dev/null 2>&1 || true
-  docker network rm "$NET" >/dev/null 2>&1 || true
-}
-trap cleanup EXIT
-
-step() { echo; echo "══ $1 ══"; }
-pass() { echo "[PASS] $1"; }
-fail() { echo "[FAIL] $1"; FAILED=1; }
-v() { docker exec "$VIC" "$@"; }
-a() { docker exec "$ATT" "$@"; }
-# check "<descripción>" <comando...>: PASS si el comando acaba en 0
-check() { local d="$1"; shift; if "$@"; then pass "$d"; else fail "$d"; fi; }
-# wait_for <segundos> <comando...>
-wait_for() { local n="$1"; shift; local i; for i in $(seq "$n"); do "$@" && return 0; sleep 1; done; return 1; }
-# Las autorizaciones reciben la palabra por stdin: es lo que hace getpass sin terminal.
-word() { echo "$WORD" | docker exec -i "$VIC" arx "$@" 2>/dev/null; }
-
-reaches() { a nc -z -w 3 victim "$1" 2>/dev/null; }
-# Arx corre como root con el .deb: un trozo de Python con su mismo código
-vpy() { docker exec -i "$VIC" python3 -c "import sys; sys.path.insert(0, '/usr/lib/arx/arx.pyz'); $1"; }
-# Libera lo que caduca, como si hubiera pasado la hora (la cuenta no caduca)
-release() {
-  vpy "from datetime import datetime, timedelta, timezone as t
-from arx.modules import response as r
-r.expire_blocks(now=datetime.now(t.utc) + timedelta(minutes=61))"
-}
-# Pizarra limpia entre escenarios: si no, el freno y "reaparece → decide tú" los mezclan
-slate() {
-  release
-  vpy "from arx import config
-from arx.modules import response as r
-for path in (r._findings_path(), r._blocks_path(), r._actions_path(), r._pending_path()):
-    config.write_json(path, {} if 'findings' in path.name else [])"
-  v nft flush set inet arx scan4 2>/dev/null || true
-  v nft flush set inet arx block_ipv4 2>/dev/null || true
-}
-in_block_set() { v nft list set inet arx block_ipv4 2>/dev/null | grep -q "$1"; }
-scan_clean() { v nft flush set inet arx scan4 2>/dev/null || true; }
-
-step "contenedores"
-docker build -q -t arx-lab-systemd lab/systemd >/dev/null || exit 1
-docker network create "$NET" >/dev/null
-docker run -d --rm --name "$VIC" --privileged --cgroupns=host --pids-limit 4000 --memory 3g \
-  --network "$NET" --network-alias victim \
-  -v /sys/fs/cgroup:/sys/fs/cgroup:rw --tmpfs /run --tmpfs /run/lock \
-  -v "$PWD":/src:ro arx-lab-systemd >/dev/null
-docker run -d --rm --name "$ATT" --network "$NET" --network-alias attacker ubuntu:22.04 bash -c '
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update -qq >/dev/null 2>&1
-  apt-get install -y -qq nmap netcat-openbsd sshpass curl procps >/dev/null 2>&1
-  mkfifo /tmp/c2in
-  (tail -f /tmp/c2in | nc -lk 4444 >/tmp/c2out 2>&1) &
-  touch /ready; sleep infinity' >/dev/null
-wait_for 180 a test -f /ready || { echo "el atacante no arrancó"; exit 1; }
-wait_for 60 bash -c "docker exec $VIC systemctl is-system-running 2>/dev/null | grep -qE 'running|degraded'"
-ATTACKER_IP=$(v python3 -c "import socket; print(socket.gethostbyname('attacker'))")
-echo "atacante: $ATTACKER_IP · pid 1: $(v cat /proc/1/comm)"
-# sshd admite contraseña y root tiene una: es la "otra cuenta de administración" que debe quedar
-v bash -c 'echo root:arxlab | chpasswd; sed -i "s/^#\?PasswordAuthentication.*/PasswordAuthentication yes/" /etc/ssh/sshd_config; systemctl restart ssh
-  useradd -m -s /bin/bash bob; echo bob:clave-bob | chpasswd
-  for p in 9001 9002 9003 9004 9005 9006 9007 9008 9009 9010; do systemd-run --quiet --unit=senuelo-$p nc -k -l $p; done'
-
-step "instalación real: .deb, setup por consola, recon, learn, seal, servicio"
-v bash -c 'rm -rf /build && mkdir /build && cp -r /src/src /src/packaging /build/ && cd /build && packaging/build-deb.sh 2>&1 | tail -1 && dpkg -i dist/arx_all.deb >/dev/null'
-check "el paquete instala arx" v arx --version
-# Sin proveedores LLM: claves vacías. Respuestas en el orden del asistente.
-printf '%s\n' "" "" "" "$WORD" "$WORD" "" "" "1" "" "core" "" "" "high" "block" \
-  | docker exec -i "$VIC" arx setup >/dev/null 2>&1
-check "arx setup deja la configuración" v test -s /etc/arx/config.json
-v arx recon >/dev/null; v arx learn >/dev/null; v arx learn >/dev/null
-v arx learn --seal | tail -3
-v arx canaries plant >/dev/null
-v arx service install --enforce | tail -1
-check "el servicio queda activo" wait_for 10 v systemctl is-active -q arx
-check "el unit lleva --enforce" v grep -q -- "guard --enforce" /etc/systemd/system/arx.service
+source lab/systemd/lib.sh
+lab_up
 
 step "journald: lo que dice el servicio se puede leer al momento"
 check "el arranque aparece en el journal" wait_for 15 bash -c "docker exec $VIC journalctl -u arx --no-pager -q | grep -q 'en guardia'"
@@ -157,7 +76,11 @@ sleep 35
 for i in 1 2 3 4 5 6 7 8; do
   a sshpass -p "mala-$i" ssh -o StrictHostKeyChecking=no -o PreferredAuthentications=password -o ConnectTimeout=3 root@victim true 2>/dev/null || true
 done
-if wait_for 70 in_block_set "$ATTACKER_IP"; then pass "fuerza bruta detectada solo con journald"; else fail "fuerza bruta detectada solo con journald"; fi
+if wait_for 70 in_block_set "$ATTACKER_IP"; then pass "fuerza bruta detectada solo con journald"; else
+  fail "fuerza bruta detectada solo con journald"
+  v journalctl -q -o cat _COMM=sshd -n 6 --no-pager | sed 's/^/  sshd: /'
+  v journalctl -u arx --no-pager -q -o cat -n 8 | sed 's/^/  arx: /'
+fi
 slate
 v su nobody -s /bin/sh -c "for i in 1 2 3 4 5 6 7 8; do logger -p auth.info -t 'sshd[1]' 'Failed password for root from 198.51.100.9 port 1 ssh2'; done"
 sleep 35
@@ -179,6 +102,7 @@ step "nftables reiniciado: su configuración hace flush de TODO"
 a nmap -sS -p 9000-9020 --max-retries 1 victim >/dev/null 2>&1
 wait_for 70 in_block_set "$ATTACKER_IP" || fail "no se llegó a bloquear antes de reiniciar nftables"
 v systemctl restart nftables
+docker_dns_restore
 if wait_for 45 in_block_set "$ATTACKER_IP"; then pass "el bloqueo se repone tras el flush"; else fail "el bloqueo se repone tras el flush"; fi
 slate
 v systemctl stop arx
@@ -222,6 +146,58 @@ if reaches 4455; then fail "ufw: el puerto nuevo quedó bloqueado"; else pass "u
 release
 check "ufw: al expirar vuelve a responder" wait_for 8 reaches 4455
 v systemctl stop puerto-nuevo 2>/dev/null
+
+step "gobierno desde el chat, desde el servicio real (el Telegram es falso; HTTP y lo demás, de verdad)"
+slate
+v ufw --force disable >/dev/null
+docker exec -d "$ATT" python3 /src/lab/systemd/fake-telegram.py
+sleep 1
+vpy "from arx import config, totp
+cfg = config.load_config()
+cfg['notify'] = {'telegram_chat_id': '4242', 'telegram_interactive': True, 'telegram_api': 'http://$ATTACKER_IP:8081', 'min_sev': 'high'}
+config.save_config(cfg)
+sec = config.load_secrets()
+sec['telegram_bot_token'] = 'T'
+sec['telegram_totp'] = totp.new_secret()
+config.save_secrets(sec)"
+v systemctl start arx
+wait_for 15 v systemctl is-active -q arx
+inject() { a curl -s -X POST -d "{\"chat\": $1, \"text\": \"$2\"}" http://localhost:8081/inject >/dev/null; }
+said() { a curl -s http://localhost:8081/sent | grep -q "$1"; }
+code() { vpy "import base64, time
+from arx import config, totp
+print(totp._code(base64.b32decode(config.load_secrets()['telegram_totp']), int(time.time() // 30)))"; }
+inject 666 "/estado"
+sleep 5
+if said "Esperan"; then fail "a un desconocido no se le contesta"; else pass "a un desconocido no se le contesta"; fi
+inject 4242 "/estado"
+if wait_for 15 said "Esperan"; then pass "el dueño recibe respuesta"; else fail "el dueño recibe respuesta"; fi
+v bash -c 'echo "* * * * * root /bin/true" > /etc/cron.d/persistencia'
+PEND=""
+find_cron() { PEND=$(docker exec "$VIC" arx authorize 2>/dev/null | grep -E '^\s+[0-9a-f]{6}\s' | grep "cron" | awk '{print $1}' | head -1); [ -n "$PEND" ]; }
+if wait_for 70 find_cron; then pass "la persistencia queda pendiente ($PEND)"; else fail "la persistencia queda pendiente"; fi
+if wait_for 15 said "cambió cron"; then pass "la alerta llega al chat"; else fail "la alerta llega al chat"; fi
+inject 4242 "/autorizar $PEND 000000"
+if wait_for 15 said "incorrecto"; then pass "con un código falso no se hace nada"; else fail "con un código falso no se hace nada"; fi
+if v test -f /etc/cron.d/persistencia; then pass "el fichero sigue ahí tras el código falso"; else fail "el fichero sigue ahí tras el código falso"; fi
+inject 4242 "/autorizar $PEND $(code)"
+if wait_for 15 said "Autorizada"; then pass "con el código bueno, se ejecuta"; else fail "con el código bueno, se ejecuta"; fi
+if v test -f /etc/cron.d/persistencia; then fail "la persistencia desapareció del sistema"; else pass "la persistencia desapareció del sistema"; fi
+# Autorizar desde el chat ocurre DENTRO del servicio. Con ProtectHome no podría tocar /root ni /home.
+if v systemd-run --quiet --wait -p ProtectHome=read-only touch /root/.ssh/control 2>/dev/null; then
+  fail "control: ProtectHome debería impedir escribir en /root (la prueba no probaría nada)"
+else
+  pass "control: con ProtectHome no se podría escribir en /root"
+fi
+v bash -c 'echo "ssh-ed25519 AAAAC3Nza intruso" >> /root/.ssh/authorized_keys'
+find_key() { PEND=$(docker exec "$VIC" arx authorize 2>/dev/null | grep -E '^\s+[0-9a-f]{6}\s' | grep "authorized_keys_root" | awk '{print $1}' | head -1); [ -n "$PEND" ]; }
+if wait_for 70 find_key; then pass "la llave plantada queda pendiente ($PEND)"; else fail "la llave plantada queda pendiente"; fi
+sleep 31  # un código por paso de reloj: el anterior ya está usado
+inject 4242 "/autorizar $PEND $(code)"
+gone() { ! docker exec "$VIC" grep -q intruso /root/.ssh/authorized_keys; }
+if wait_for 15 gone; then pass "autorizado desde el chat, la llave plantada ya no está"; else fail "autorizado desde el chat, la llave plantada ya no está"; fi
+check "la legítima sigue" v grep -q legitima /root/.ssh/authorized_keys
+v systemctl stop arx
 
 step "desinstalación"
 v arx service uninstall | tail -1

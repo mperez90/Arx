@@ -15,6 +15,9 @@ Esta VM es desechable por diseño.
    snapshot "oro" ──► restaurar entre niveles
 ```
 
+Lo que se puede sin VM ya está en `lab/systemd-lab.sh` y `lab/level10.sh`. Esta VM añade kernel
+propio, auditd, Falco y un reinicio de verdad.
+
 ## Montaje (Apple Silicon — UTM)
 
 1. **UTM** (gratis, App Store o brew). Nueva VM → Linux → ISO `ubuntu-22.04-live-server-arm64`.

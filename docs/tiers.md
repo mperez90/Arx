@@ -14,9 +14,14 @@ probado antes de abrir su venta.
 | Sensores (osquery·auditd·Falco, si están instalados) | ✅ | ✅ | ✅ |
 | Respuesta Tier 0/1 (automática y reversible) | ✅ | ✅ | ✅ |
 | Respuesta Tier 2 (humano + palabra) | ✅ | ✅ | ✅ |
+| Bloqueo de cuentas: cierra sesiones y accesos, solo una persona lo levanta | ✅ | ✅ | ✅ |
+| El modelo (tu clave) puede confirmar una amenaza y cerrar esa cuenta, con salvaguardas | ✅ | ✅ | ✅ |
+| Gobierno desde Telegram, con código de un solo uso | ✅ | ✅ | ✅ |
+| Propuestas (normalizar, endurecer SSH): Arx propone, tú apruebas | ✅ | + autónomo con rollback | + autónomo con rollback |
+| Vacunas firmadas, validadas en cada host (el canal aún no está abierto) | ✅ | ✅ | ✅ |
 | Análisis estático de ficheros (`arx scan`) | ✅ | ✅ | ✅ |
 | Informe forense sellado (`arx forensics`) | ✅ | ✅ | ✅ |
-| Intel de amenazas | comunitaria (retraso; aún no disponible) | **gestionada, tiempo real** | gestionada + privada |
+| Intel de amenazas | comunitaria, por las vacunas (el canal aún no está abierto) | **gestionada, tiempo real** | gestionada + privada |
 | Detecciones avanzadas por TTP | básicas | ✅ | ✅ |
 | Auto-pentest del propio host | — | ✅ (curado) | ✅ |
 | Evaluación autorizada de los activos propios (Kali/Parrot) | — | — | ✅ |

@@ -1,15 +1,17 @@
 # Contenedores del mini-lab de Arx — los usan docker-lab.sh y demo.sh.
 #   · víctima  (ubuntu:22.04 privilegiada, sin ufw → ejercita nftables; sshd+rsyslog)
 #   · atacante (ubuntu:22.04 con nmap/sshpass/curl/nc y un C2 de laboratorio en 4444)
+#   · segundo receptor de vacunas: otro host, solo con lo justo para validarlas por su cuenta
 # Todo es efímero: la red y los contenedores se destruyen al salir.
 
 SUF=$$
 NET=arxlab-$SUF
 VIC=arxv-$SUF
 ATT=arxa-$SUF
+VIC2=arxb-$SUF
 
 cleanup() {
-  docker rm -f "$VIC" "$ATT" >/dev/null 2>&1 || true
+  docker rm -f "$VIC" "$ATT" "$VIC2" >/dev/null 2>&1 || true
   docker network rm "$NET" >/dev/null 2>&1 || true
 }
 
@@ -36,11 +38,11 @@ lab_up() {
 
   # El C2 usa `nc` y no `ncat`: con stdin cerrado, ncat cierra cada conexión al instante.
   # La FIFO permite enviar órdenes al reverse shell y comprobar si llegan o no.
-  docker run -d --name "$ATT" --network "$NET" --network-alias attacker \
+  docker run -d --name "$ATT" --cap-add NET_ADMIN --network "$NET" --network-alias attacker \
     ubuntu:22.04 bash -c '
       export DEBIAN_FRONTEND=noninteractive
       apt-get update -qq >/dev/null 2>&1
-      apt-get install -y -qq nmap netcat-openbsd sshpass curl >/dev/null 2>&1
+      apt-get install -y -qq nmap netcat-openbsd sshpass curl python3 iproute2 >/dev/null 2>&1
       mkfifo /tmp/c2in
       (tail -f /tmp/c2in | nc -lk 4444 >/tmp/c2out 2>&1) &
       touch /ready

@@ -75,6 +75,8 @@ _PLAN: dict[str, tuple[int, str, bool, str]] = {
                      "puede ser legítima → requiere tu palabra; si lo es, acéptala con arx accept"),
     "canary": (1, "elevar el nivel de alerta y capturar el contexto del acceso al señuelo", True,
                "un señuelo tocado es señal fuerte de intruso; elevar y capturar es reversible"),
+    "intel_ip": (1, "bloquear la IP en el firewall (temporal, auto-expira)", True,
+                 "viene de una vacuna validada en este host: bloquearla es reversible"),
     "port_scan": (1, "bloquear la IP de origen en el firewall (temporal, auto-expira)", True,
                   "cortar el reconocimiento es reversible y no toca nada local"),
     "auth_bruteforce": (1, "bloquear la IP de origen en el firewall (temporal, auto-expira)", True,
@@ -92,12 +94,20 @@ _PLAN: dict[str, tuple[int, str, bool, str]] = {
 _PROTECTED_EXES = {"sshd", "systemd", "init", "dbus-daemon", "journald", "systemd-journald",
                    "auditd", "falco", "osqueryd", "python3", "arx"}
 
+_SSHD_EXES = ("sshd", "sshd-session")
+_SSH_SESSION_RE = re.compile(r"sshd(?:-session)?: [^\s@]+@\S+")
+
 # Nombre de cuenta válido (login POSIX). Clave de seguridad: un valor que empiece por "-"
 # NO casa → imposible colar una opción a `usermod` por el nombre de la cuenta.
 _USERNAME_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
 
 
 def classify(finding: dict) -> dict:
+    # Desde fuera no se llega a un puerto solo en localhost: bloquearlo no protege nada y rompe
+    # lo que lo use (una base de datos local, un panel detrás de un proxy).
+    if finding.get("kind") == "listen_ports" and (finding.get("target") or {}).get("exposed") == "local":
+        return {"tier": 0, "action": "registrar y vigilar (puerto solo local)", "reversible": True,
+                "why": "no está expuesto a la red: un bloqueo no contendría nada"}
     # Un binario de sistema no visto al aprender es lo normal (un admin, una actualización).
     # Suspenderlo congelaría TODOS sus procesos, incluida la shell del operador (B9).
     if finding.get("kind") in ("executables", "processes") and finding.get("sev") == "low":
@@ -179,16 +189,17 @@ def _never_block_ips() -> set[str]:
     """IPs que JAMÁS reciben un bloqueo automático.
 
     · Las propias del host (bloquear tu interfaz es un auto-daño absurdo).
-    · Las del OPERADOR: una sesión SSH ESTABLECIDA y PERSISTENTE (vista en ≥2
-      decisiones). Un atacante a mitad de fuerza bruta también tiene sockets
-      ESTABLISHED efímeros hacia sshd: proteger "cualquiera conectado al 22" sería
-      un interruptor de evasión — el atacante solo tendría que mantener una conexión
-      abierta para volverse intocable.
+    · Las del OPERADOR: una sesión SSH AUTENTICADA y PERSISTENTE (vista en ≥2 decisiones).
+      Proteger "cualquiera conectado al 22" sería un interruptor de evasión: bastaba un
+      `nc host 22` sin autenticar, que sshd mantiene vivo 2 minutos, para volverse intocable
+      y seguir con la fuerza bruta (B29). Solo cuenta el proceso de una sesión ya abierta.
     """
     out = set(recon.local_ips())
     ssh = ssh_ports()
-    current = {c["remote_ip"] for c in recon.collect_connections()
-               if c.get("state") == "ESTABLISHED" and c.get("local_port") in ssh}
+    current = {c["remote_ip"] for c in recon.connection_owners()
+               if c.get("state") == "ESTABLISHED" and c.get("local_port") in ssh
+               and (c.get("exe") or "").rsplit("/", 1)[-1] in _SSHD_EXES
+               and isinstance(c.get("pid"), int) and _is_ssh_session(c["pid"])}
     path = config.state_dir() / "ssh-peers.json"
     peers = config.read_json(path, {})
     now = _now().timestamp()
@@ -199,6 +210,20 @@ def _never_block_ips() -> set[str]:
         p["last"] = now
     config.write_json(path, peers)
     return out | {ip for ip, p in peers.items() if ip in current and p["seen"] >= 2}
+
+
+def _proc_title(pid: int) -> str:
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return f.read(200).replace(b"\0", b" ").decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def _is_ssh_session(pid: int) -> bool:
+    """`sshd: ana@pts/0`, `sshd: ana@notty`: sshd solo se pone ese título tras autenticar. Antes
+    es `sshd: [accepted]`, `sshd: unknown [net]` o `sshd: root [priv]`."""
+    return _SSH_SESSION_RE.match(_proc_title(pid)) is not None
 
 
 def protected_reason(finding: dict, cfg: dict | None = None) -> str | None:
@@ -212,7 +237,7 @@ def protected_reason(finding: dict, cfg: dict | None = None) -> str | None:
             return "puerto SSH: bloquearlo te dejaría fuera del servidor"
         if str(port) in oob:
             return "puerto marcado fuera-de-límites"
-    if kind in ("port_scan", "auth_bruteforce") and target.get("ip"):
+    if kind in ("port_scan", "auth_bruteforce", "intel_ip") and target.get("ip"):
         ip = str(target["ip"])
         if ip in _never_block_ips():
             return "IP intocable (propia del host o con sesión de operador activa)"
@@ -962,7 +987,7 @@ def has_live_session(user: str, origin: str = "") -> bool:
         return False
     return bool(origin) and any(
         c.get("remote_ip") == origin and c.get("state") == "ESTABLISHED"
-        and (c.get("exe") or "").rsplit("/", 1)[-1] in ("sshd", "sshd-session")
+        and (c.get("exe") or "").rsplit("/", 1)[-1] in _SSHD_EXES
         and isinstance(c.get("pid"), int) and _sshd_serves(c["pid"], user, uid)
         for c in recon.connection_owners())
 
@@ -975,12 +1000,7 @@ def _sshd_serves(pid: int, user: str, uid: int) -> bool:
         return True
     if owner != 0:
         return False
-    try:
-        with open(f"/proc/{pid}/cmdline", "rb") as f:
-            title = f.read(200).decode("utf-8", "replace")
-    except OSError:
-        return False
-    return re.match(rf"sshd(?:-session)?: {re.escape(user)} \[priv\]", title) is not None
+    return re.match(rf"sshd(?:-session)?: {re.escape(user)} \[priv\]", _proc_title(pid)) is not None
 
 
 def _llm_locks_path():
@@ -1101,7 +1121,7 @@ def _execute_tier2(finding: dict) -> str:
         return _restore_from_vault(str(target["file"]))
     if kind == "login_users" and target.get("user"):
         return contain_identity(finding, "tú, con tu palabra de autorización")["summary"]
-    if kind in ("listen_ports", "port_scan", "auth_bruteforce", "reverse_shell"):
+    if kind in ("listen_ports", "port_scan", "auth_bruteforce", "reverse_shell", "intel_ip"):
         # reapareció tras expirar y decidiste tú: la misma contención, otra hora
         cfg = config.load_config()
         reason = protected_reason(finding, cfg)
@@ -1175,8 +1195,31 @@ def authorize_pending(pid: str) -> dict | None:
     return item
 
 
+def accept(fp: str) -> str | None:
+    """Incorpora a la base un cambio legítimo y levanta lo que lo contenía. Devuelve qué pasó, o
+    None si no hay un hallazgo aceptable con ese id. La autorización, si hace falta, es del llamador."""
+    from arx.modules import baseline, vaccines  # perezoso: ambos importan este módulo
+
+    e = load_findings().get(fp)
+    if not e or not e.get("set"):
+        return None
+    if not baseline.accept(e["set"], e["item"]):
+        return "No se pudo actualizar la línea base (¿existe y contiene ese conjunto?)."
+    contained = _active_block(fp)
+    forget(fp)
+    record({"kind": "accepted", "detail": e.get("detail")})
+    out = [f"✓ Aceptado como normal: {e['item']}" + ("  ·  su bloqueo se ha levantado" if contained else "")]
+    if e.get("vaccine") and vaccines.note_false_positive(e["vaccine"]):  # a la tercera se retira sola
+        out.append(f"⚠ Vacuna {e['vaccine']} retirada: la has desmentido varias veces.")
+    if str(e["item"]).partition("@")[0] in {a["user"] for a in locked_accounts()}:
+        out.append("⚠ Esa cuenta sigue bloqueada: aceptar no la desbloquea. Usa:  arx unlock")
+    return "\n".join(out)
+
+
 def forget(fp: str) -> dict | None:
-    """Olvida un hallazgo aceptado (y su pendiente Tier 2). Devuelve la entrada o None."""
+    """Olvida un hallazgo aceptado, su pendiente Tier 2 y lo que lo contenía: si dices que es
+    normal, tu servicio no puede seguir caído una hora más. Devuelve la entrada o None.
+    Un bloqueo de cuenta no se levanta por aquí: eso es `arx unlock`, con tu palabra."""
     with config.locked():
         st = load_findings()
         entry = st.pop(fp, None)
@@ -1184,6 +1227,13 @@ def forget(fp: str) -> dict | None:
             return None
         _save_findings(st)
         _save_pending([p for p in _load_pending() if p["id"] != fp[:6]])
+        blocks = _load_blocks()
+        lifted = [b for b in blocks if b.get("fp") == fp and not _holds_until_human(b)]
+        for b in lifted:
+            if _is_linux_root():
+                _apply_revert(b.get("revert"))
+        if lifted:
+            _save_blocks([b for b in blocks if b not in lifted])
     return entry
 
 
@@ -1472,7 +1522,7 @@ def _execute_tier1(finding: dict, cfg: dict | None = None) -> tuple[str, dict | 
                 f"({DEFAULT_TTL_MIN} min)"), revert
     if kind == "canary":
         return "nivel de alerta elevado y contexto capturado", None
-    if kind in ("port_scan", "auth_bruteforce") and target.get("ip"):
+    if kind in ("port_scan", "auth_bruteforce", "intel_ip") and target.get("ip"):
         ip = str(target["ip"])
         try:
             fam = ipaddress.ip_address(ip).version
@@ -1594,7 +1644,7 @@ def handle(finding: dict, enforce: bool = False, authorized: bool = False,
         outcome["new"] = entry is None
         entry = entry or {"first_seen": _iso(now), "seen": 0, "kind": finding.get("kind"),
                           "detail": finding.get("detail"), "set": finding.get("set"),
-                          "item": finding.get("item")}
+                          "item": finding.get("item"), "vaccine": finding.get("vaccine")}
         entry["seen"] += 1
         entry["last_seen"] = _iso(now)
 
@@ -1621,6 +1671,8 @@ def handle(finding: dict, enforce: bool = False, authorized: bool = False,
             if revert:
                 outcome["revert"] = revert
                 _note_action(now)
+                if finding.get("set"):  # lo primero que quiere saber quien acaba de instalar algo
+                    status += f" · si es legítimo:  arx accept {fp}"
         elif tier == 2 and (blk := _active_block(fp, now) or _lock_of(finding)):
             status = f"ya autorizado y activo {_until(blk)}"
         elif tier == 2 and entry.get("human_cleared"):

@@ -17,15 +17,22 @@ tranquilo no gasta tokens. La telemetría se le entrega marcada como dato no con
 Regla: si la capa rápida puede decidir sola y es reversible, actúa ya; el razonamiento
 explica y refina después. Nunca es requisito para contener.
 
+Tiene un único poder, y acotado: con `--enforce`, su veredicto sobre un acceso que la capa rápida
+ya señaló puede cerrar esa cuenta (ver Tier 2). No elige a quién, y su respuesta se valida por código.
+
 ## 2. Respuesta por niveles
 
 | Tier | Ejemplos | Autoridad |
 |------|----------|-----------|
 | **0** | registrar evidencia y alertar | automático, siempre |
 | **1** | bloquear IP, puerto o canal de reverse shell; suspender un proceso sospechoso | automático con `--enforce`, **se deshace solo a los 60 min** |
-| **2** | restaurar ficheros críticos, poner en cuarentena lo plantado | **humano + palabra** |
+| **2** | restaurar ficheros críticos, poner en cuarentena lo plantado, bloquear una cuenta y cerrar sus sesiones, terminar un proceso que reapareció, quitar un bit SUID | **humano + palabra** |
 
-"Voluntad de acero" = Tier 0/1 implacables y sin fatiga. Lo irreversible es del humano.
+"Voluntad de acero" = Tier 0/1 implacables y sin fatiga. Lo irreversible es del humano, con una
+excepción: si el modelo confirma como amenaza un acceso ya señalado, se cierra esa cuenta sin esperar
+y se informa con todo el contexto. Nunca sobre root, cuentas de sistema o la última cuenta de
+administración, ni sin una sesión viva comprobada, ni más de dos veces por hora. Una cuenta bloqueada
+no se desbloquea sola: lo decide una persona con `arx unlock`.
 
 Un binario nuevo en un directorio de sistema es señal de baja confianza y solo se registra
 (Tier 0): suspenderlo congelaría todos sus procesos. Un canal de reverse shell se corta con

@@ -103,11 +103,35 @@ else
   echo "[FAIL] tras arx unlock la cuenta no entra"; FAILED=1
 fi
 
+step "evasión: una conexión sin autenticar no vuelve intocable al atacante; una sesión real sí protege"
+docker exec -d "$ATT" bash -c 'sleep 60 | nc victim 22'
+sleep 1
+docker exec "$VIC" python3 /src/lab/driver.py operator "$ATTACKER_IP" no || FAILED=1
+docker exec "$ATT" pkill -f "[n]c victim 22" || true
+docker exec -d "$ATT" sshpass -p clave-bob ssh -o StrictHostKeyChecking=no bob@victim "sleep 60"
+sleep 3
+docker exec "$VIC" python3 /src/lab/driver.py operator "$ATTACKER_IP" si || FAILED=1
+docker exec "$ATT" pkill -f "[b]ob@victim" || true
+
 step "línea falsificada: cualquier usuario escribe en auth.log; eso no basta para bloquear"
 docker exec "$VIC" python3 /src/lab/driver.py identity-forged || FAILED=1
 
 step "alias de root: alerta crítica y bloqueo que no afecta a root"
 docker exec "$VIC" python3 /src/lab/driver.py uid0 || FAILED=1
+
+step "propuestas: tras la fuerza bruta, Arx propone cerrar las contraseñas; se prueba contra sshd real"
+docker exec "$VIC" python3 /src/lab/driver.py proposal-apply || FAILED=1
+if docker exec "$ATT" sshpass -p clave-bob ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o PreferredAuthentications=password bob@victim true 2>/dev/null; then
+  echo "[FAIL] con la propuesta aplicada, la contraseña sigue entrando"; FAILED=1
+else
+  echo "[PASS] con la propuesta aplicada, la contraseña ya no entra"
+fi
+docker exec "$VIC" python3 /src/lab/driver.py proposal-revert || FAILED=1
+if docker exec "$ATT" sshpass -p clave-bob ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o PreferredAuthentications=password bob@victim true 2>/dev/null; then
+  echo "[PASS] deshecha, la contraseña vuelve a entrar"
+else
+  echo "[FAIL] deshecha, la contraseña no entra"; FAILED=1
+fi
 
 step "contenedores del host: una IP bloqueada tampoco llega a un puerto publicado (FORWARD)"
 docker exec "$VIC" python3 /src/lab/driver.py forward-up
@@ -121,6 +145,45 @@ if docker exec "$ATT" nc -z -w 3 victim 8088 2>/dev/null; then
   echo "[FAIL] la IP bloqueada sigue entrando al contenedor"; FAILED=1
 else
   echo "[PASS] la IP bloqueada ya no llega al contenedor"
+fi
+docker exec "$VIC" python3 /src/lab/driver.py release
+
+step "F17 vacunas: canal servido desde otra máquina; la firma manda, y cada host valida por su cuenta"
+docker run -d --name "$VIC2" --network "$NET" -v "$PWD":/src:ro ubuntu:22.04 bash -c '
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq >/dev/null 2>&1
+  apt-get install -y -qq python3 >/dev/null 2>&1
+  mkdir -p /work/labcfg /work/labstate
+  # solo este host tiene este binario: una regla que case con él no puede valer aquí
+  printf "binario legitimo del host B: lab-minero-legit\n" > /usr/bin/aa-herramienta-b
+  touch /ready; sleep infinity' >/dev/null
+docker exec "$VIC2" bash -c 'for i in $(seq 180); do [ -f /ready ] && exit 0; sleep 1; done; exit 1'
+docker exec "$VIC" python3 /src/lab/driver.py vaccine-sign
+# El "canal" es un servidor cualquiera, aquí incluso el del atacante: sin la clave no puede colar nada
+docker exec "$ATT" mkdir -p /srv/canal
+for f in feed.signed.json feed.tampered.json feed.other-key.json; do
+  docker exec "$VIC" cat "/work/$f" | docker exec -i "$ATT" sh -c "cat > /srv/canal/$f"
+done
+PUB=$(docker exec "$VIC" cat /work/feed.pub)
+docker exec -d "$ATT" python3 -m http.server 8000 --directory /srv/canal
+sleep 1
+docker exec "$VIC" python3 /src/lab/driver.py vaccine-apply "$PUB" valida || FAILED=1
+docker exec "$VIC2" python3 /src/lab/driver.py vaccine-apply "$PUB" insuficiente || FAILED=1
+# Una IP pública de verdad en el atacante: una vacuna no admite redes privadas
+docker exec "$ATT" ip addr add 185.220.101.50/32 dev eth0
+docker exec "$VIC" ip route add 185.220.101.50/32 via "$ATTACKER_IP"
+docker exec -d "$ATT" bash -c 'sleep 90 | nc -s 185.220.101.50 victim 9001'
+sleep 2
+docker exec "$VIC" python3 /src/lab/driver.py vaccine-intel || FAILED=1
+if docker exec "$ATT" nc -z -w 3 -s 185.220.101.50 victim 9001 2>/dev/null; then
+  echo "[FAIL] la IP de la vacuna sigue llegando"; FAILED=1
+else
+  echo "[PASS] la IP de la vacuna ya no llega, medido desde ella"
+fi
+if docker exec "$ATT" nc -z -w 3 victim 9001 2>/dev/null; then
+  echo "[PASS] una IP que la vacuna no señala sigue llegando"
+else
+  echo "[FAIL] se ha bloqueado también a quien la vacuna no señala"; FAILED=1
 fi
 docker exec "$VIC" python3 /src/lab/driver.py release
 

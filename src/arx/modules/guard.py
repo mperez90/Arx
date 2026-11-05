@@ -21,12 +21,13 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 
 from arx import config, engine, notify, redact
 from arx import license as lic
-from arx.modules import baseline, canaries, fleet, recon, response, sandbox, sensors
+from arx.modules import baseline, canaries, fleet, recon, response, sandbox, sensors, telegram, vaccines
 
 SYSTEM_PROMPT = (
     "Eres Arx, guardián defensivo de este servidor. Respondes breve y en español, "
@@ -83,7 +84,7 @@ def _integrity_drift(base: dict, include_suid: bool) -> list[dict]:
                     "kind": "integrity",
                     "detail": f"cambió {k} desde el sellado de la línea base",
                     "why": "fichero crítico alterado → posible manipulación o persistencia",
-                    "target": {"file": k},
+                    "target": {"file": k}, "set": "integrity", "item": k,
                 }
             )
     return findings
@@ -98,9 +99,18 @@ def _new_suid(known) -> list[dict]:
             for p in current if p not in known]
 
 
+def _quietly(fn, default):
+    """Un sensor roto se queda sin ver lo suyo; no deja al host sin guardia."""
+    try:
+        return fn()
+    except Exception as e:
+        print(f"  ⚠ {getattr(fn, '__name__', 'sensor')} falló ({type(e).__name__}); el resto sigue.")
+        return default
+
+
 def sweep(base: dict, enforce: bool = False, include_suid: bool = True,
           cfg: dict | None = None) -> tuple[list[dict], list[dict]]:
-    reset = response.restore_kernel_blocks()  # antes de nada: lo que se creía contenido, lo esté
+    reset = _quietly(response.restore_kernel_blocks, None)  # antes de nada: lo que se creía contenido, lo esté
     response.ensure_nft_tracking()  # la pista de escaneo debe existir ANTES del ataque
     snap = baseline.snapshot()
     findings = (
@@ -109,7 +119,9 @@ def sweep(base: dict, enforce: bool = False, include_suid: bool = True,
         + canaries.check()
         + sensors.collect_events()
     )
-    findings += sensors.detect_uid0_accounts(known=(base.get("sets") or {}).get("uid0_accounts") or ())
+    sets = base.get("sets") or {}
+    findings += _quietly(lambda: sensors.detect_uid0_accounts(known=sets.get("uid0_accounts") or ()), [])
+    findings += _quietly(lambda: vaccines.findings(known=sets.get("intel_allow") or ()), [])
     if reset:
         findings.append(reset)
     findings = _new_logins_only(findings, base)
@@ -320,6 +332,30 @@ def _chat(cfg: dict) -> int:
     return 0
 
 
+def _mode_seen_path():
+    return config.state_dir() / "guard_mode.json"
+
+
+def mode_seen() -> bool | None:
+    """Con qué modo corrió el último barrido; None si guard no ha corrido nunca aquí."""
+    return config.read_json(_mode_seen_path(), {}).get("enforce")
+
+
+def _daily_report(cfg: dict, now: float | None = None) -> bool:
+    """Una vez al día, lo que espera tu decisión y cómo va el ruido. Sin canales, nada."""
+    if not notify.channels(cfg) or (cfg.get("notify") or {}).get("daily_report") is False:
+        return False
+    now = time.time() if now is None else now
+    path = config.state_dir() / "daily_report.json"
+    last = config.read_json(path, {}).get("at")
+    if last is None or now - last >= 86400:
+        config.write_json(path, {"at": now})
+        if last is not None:  # el primer día no hay nada que resumir
+            notify.send(telegram.daily_text(), cfg)
+            return True
+    return False
+
+
 class SlowLayer:
     """Acumula lo nuevo y decide cuándo despertar al LLM y cuándo alertar."""
 
@@ -336,7 +372,9 @@ class SlowLayer:
             return None
         # con un acceso desconocido dentro no se esperan 5 minutos a agrupar
         urgent = any(f.get("sev") == "crit" or f.get("kind") == "login_users" for f, _ in self.queue)
-        due = (flush or urgent or self.last_llm is None
+        # la ventana es para no gastar consultas al modelo: sin modelo, avisar no tiene por qué esperar
+        no_model = not engine.Engine(self.cfg).providers_in_order()
+        due = (flush or urgent or no_model or self.last_llm is None
                or time.monotonic() - self.last_llm >= self.min_interval)
         if not due:
             return None
@@ -377,6 +415,7 @@ def run(once: bool = False, interval: int = 30, chat: bool = False, enforce: boo
 
     lic.validate()  # best-effort: refresca la caché; nunca bloquea el arranque (fallar-abierto)
     tier, why = lic.effective_tier()
+    enforce = telegram.effective_enforce(enforce)  # lo último que dijo el dueño desde el chat
     sens = sensors.available()
     active = [k for k, v in sens.items() if v] or ["colectores base (/proc)"]
     sensors.ensure_audit_rules([c["path"] for c in canaries._load().get("canaries", [])])
@@ -389,14 +428,25 @@ def run(once: bool = False, interval: int = 30, chat: bool = False, enforce: boo
     last_val = time.monotonic()
     last_suid = -SUID_EVERY_S  # primer barrido sí revisa SUID
     slow = SlowLayer(cfg, base, enforce)
+    if not once and telegram.enabled(cfg):  # en un hilo: el chat nunca retrasa la defensa
+        threading.Thread(target=telegram.loop, args=(cfg,), daemon=True).start()
+    started_with = enforce
+    config.write_json(_mode_seen_path(), {"enforce": enforce})
     reported: set = set()  # dedup de eventos ya enviados a la consola en esta sesión
     while True:
         if time.monotonic() - last_val >= 86400:  # re-validar licencia cada 24 h
             lic.validate()
             last_val = time.monotonic()
+        if not once and vaccines.due():  # en un hilo: la capa rápida no espera a la red
+            threading.Thread(target=vaccines.update_safely, daemon=True).start()
         expired = response.expire_blocks()  # auto-expira bloqueos Tier 1 vencidos
         if expired:
             print(f"  ⏱ {len(expired)} bloqueo(s) Tier 1 expiraron y se revirtieron.")
+        base = baseline.load() or base  # `arx accept` debe valer sin reiniciar el servicio
+        slow.base = base
+        enforce = slow.enforce = telegram.effective_enforce(started_with)  # /modo desde el chat
+        config.write_json(_mode_seen_path(), {"enforce": enforce})
+        _quietly(lambda: _daily_report(cfg), None)
         include_suid = time.monotonic() - last_suid >= SUID_EVERY_S
         if include_suid:
             last_suid = time.monotonic()

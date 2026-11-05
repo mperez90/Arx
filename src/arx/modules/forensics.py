@@ -23,18 +23,23 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import ipaddress
 import json
+import re
 import secrets
 from datetime import datetime, timezone
 
 from arx import config
-from arx.modules import fleet, response
+from arx.modules import fleet, recon, response
 from arx.redact import printable
 
 # Campos estables que entran en la cronología (orden canónico lo da _canonical).
 _TIMELINE_FIELDS = ("at", "kind", "sev", "detail", "tier", "status", "remediation",
-                    "result", "reverted", "revert", "decided_by", "verdict", "closed", "survivors")
+                    "result", "reverted", "revert", "decided_by", "verdict", "closed", "survivors",
+                    "finding_kind")
 _SEV_RANK = {"crit": 0, "high": 1, "med": 2, "low": 3, "info": 4}
+# solo lo que señala a alguien de fuera; un login dice demasiado sobre este host
+_SHAREABLE_KINDS = ("port_scan", "auth_bruteforce", "reverse_shell", "intel_ip")
 
 
 def _now() -> str:
@@ -127,6 +132,34 @@ def _summary(timeline: list[dict], blocks: list, quarantine: list) -> dict:
         "ventana": {"desde": timeline[0]["at"] if timeline else None,
                     "hasta": timeline[-1]["at"] if timeline else None},
     }
+
+
+def indicators(since: str | None = None) -> dict:
+    """Lo que puede salir de este host si el dueño quiere compartirlo (§12.3): IPs públicas de los
+    atacantes, hashes de lo que quedó en cuarentena y tipos de ataque. Nada de rutas, cuentas ni
+    nombres de host. Nada sale solo: esto se imprime y lo envía una persona, si quiere."""
+    timeline = _incidents(since)
+    ips, kinds = set(), set()
+    ip_re = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b|\b[0-9a-fA-F]{0,4}(?::[0-9a-fA-F]{0,4}){2,7}\b")
+    own = recon.local_ips()
+    for e in timeline:
+        if e.get("sev") not in ("high", "crit") or e.get("finding_kind") not in _SHAREABLE_KINDS:
+            continue
+        kinds.add(e["finding_kind"])
+        for raw in ip_re.findall(str(e.get("detail") or "")):
+            try:
+                addr = ipaddress.ip_address(raw)
+            except ValueError:
+                continue
+            if addr.is_global and raw not in own:
+                ips.add(raw)
+    return {"arx_indicators": 1, "attack_kinds": sorted(kinds), "ips": sorted(ips),
+            "sha256": sorted({q["sha256"] for q in _quarantined() if q.get("sha256")})}
+
+
+def print_indicators(since: str | None = None) -> int:
+    print(json.dumps(indicators(since), ensure_ascii=False, indent=1))
+    return 0
 
 
 # ── informe + sellado ──────────────────────────────────────────────────────────

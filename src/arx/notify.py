@@ -3,8 +3,9 @@
 Sin alertas, "Arx te avisa a las 3 a.m." sería un print en un log. Este módulo manda los
 hallazgos NUEVOS (no cada barrido) por los canales que el operador configuró en el setup:
 
-  · Telegram: bot token (secrets.json → `telegram_bot_token`) + chat_id (config). Puede ser
-    el mismo bot que ya usas: enviar mensajes no interfiere con quien lee sus updates.
+  · Telegram: bot token (secrets.json → `telegram_bot_token`) + chat_id (config). Para gobernar
+    Arx desde el chat (modules/telegram.py) el bot debe ser solo suyo: Telegram solo deja a un
+    programa leer sus mensajes.
   · Webhook: POST JSON {"source": "arx", "host", "text"} a la URL configurada
     (Slack/Discord/n8n/lo que sea detrás).
 
@@ -15,6 +16,7 @@ from __future__ import annotations
 
 import json
 import socket
+import time
 import urllib.error
 import urllib.request
 
@@ -52,6 +54,20 @@ def channels(cfg: dict | None = None) -> list[str]:
     return out
 
 
+def _mute_path():
+    return config.state_dir() / "notify_mute.json"
+
+
+def mute(hours: int, now: float | None = None) -> None:
+    now = time.time() if now is None else now
+    config.write_json(_mute_path(), {"until": now + hours * 3600})
+
+
+def muted(now: float | None = None) -> bool:
+    now = time.time() if now is None else now
+    return now < config.read_json(_mute_path(), {}).get("until", 0)
+
+
 def send(text: str, cfg: dict | None = None, post=_post) -> dict:
     """Envía `text` (redactado) por todos los canales. Devuelve {canal: ok|error}."""
     n = settings(cfg)
@@ -62,7 +78,7 @@ def send(text: str, cfg: dict | None = None, post=_post) -> dict:
         try:
             if ch == "telegram":
                 token = config.load_secrets()["telegram_bot_token"]
-                post(f"https://api.telegram.org/bot{token}/sendMessage",
+                post(f"{n.get('telegram_api') or 'https://api.telegram.org'}/bot{token}/sendMessage",
                      {"chat_id": n["telegram_chat_id"], "text": f"🛡 Arx · {host}\n{text}",
                       "disable_web_page_preview": True})
             else:
@@ -79,6 +95,8 @@ def min_sev(cfg: dict | None = None) -> str:
 
 
 def worth_alerting(sev: str | None, cfg: dict | None = None) -> bool:
+    if muted() and sev != "crit":  # /callar: lo crítico llega siempre
+        return False
     return SEV_RANK.get(sev or "info", 9) <= SEV_RANK.get(min_sev(cfg), 1)
 
 

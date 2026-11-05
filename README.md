@@ -9,7 +9,7 @@ actions it can undo. Anything irreversible waits for you.
 <sub>Real output of [`lab/demo.sh`](lab/demo.sh), with long waits shortened. Arx's CLI
 currently speaks Spanish, so the captions explain each step.</sub>
 
-> **Status:** v0.0.2, early public testing. **Arx Core is free and available now.** The paid
+> **Status:** v0.0.3, early public testing. **Arx Core is free and available now.** The paid
 > tiers open after Core completes its public testing phase, **Pro first, Business last**.
 > Founding pricing (half price, first 500 purchases of each plan) is reserved for that
 > opening: [get notified](https://github.com/mperez90/Arx/discussions/1).
@@ -63,17 +63,38 @@ shown above. Both only need Docker.
 | New listening port | Blocks the port | Lab |
 | Dropper running from `/tmp` | Suspends the process | Lab |
 | Reverse shell from `bash`, `sh`, `nc` or `socat` | Cuts the channel and suspends only that process | Lab |
-| New SUID binary | Critical alert; the decision is yours | Lab |
+| New SUID binary | Critical alert naming it; on your word, drops the bit | Lab |
 | Persistence planted in cron | On your word: restores from the vault and quarantines the planted file | Lab |
 | Decoy (canary) file read | High-severity alert | Lab |
-| Unknown user logged in | On your word: blocks new password and SSH-key logins; open sessions stay open | Lab (the lock); VM pending (the detection) |
+| Unknown or new-origin login, with or without a terminal | On your word, or the model's (see below): closes password and SSH-key access, its open sessions and whatever they started, and blocks its source IP. Only you lift it | Lab |
+| A second root account (uid 0) | Critical alert; on your word, locks it without touching root | Lab |
 | Authentication log truncated | High-severity alert | Unit tests |
 
-Levels that need a real VM (weak credentials, ransomware-style destruction) have not been
-run yet. The full test plan and its results are in [`lab/README.md`](lab/README.md).
+Real systemd, real `ufw` and a simulated day of normal admin work have their own labs. None of
+this has run on a real VM yet, only in containers. The full test plan and its results are in
+[`lab/README.md`](lab/README.md).
 
-Two more commands you can use on their own: `arx scan <file>` gives a static verdict on a
-file without ever running it, and `arx forensics` writes a sealed report of what happened.
+## Everything from the console
+
+There is no web UI, on purpose. An agent that defends a server shouldn't add another login page to
+it. These are the ones you'll use most; `arx --help` lists them all:
+
+| Command | What it's for |
+|---|---|
+| `arx status` | How things stand. `--json` for scripts |
+| `arx authorize` | What's waiting for your decision |
+| `arx unlock` | Accounts Arx has locked. They stay locked until you say so |
+| `arx accept` | "This is normal": it stops flagging it and lifts its block right away |
+| `arx restore` | Files in quarantine, back to where they were |
+| `arx proposals` | What Arx suggests changing, like closing SSH passwords. Nothing applies by itself |
+| `arx metrics` | How much noise it makes on this host. `--json` has only numbers, safe to share |
+| `arx scan <file>` | Static verdict on a file, without ever running it |
+| `arx forensics` | A sealed report of what happened |
+| `arx vaccines` | Signed updates with what other Arx hosts learned (the channel isn't open yet) |
+
+If you want to hear from it, or decide from your phone, give it your own Telegram bot in `arx setup`.
+Acting from the chat takes a one-time code from an authenticator app: your authorization word never
+travels through a chat. It only makes outbound connections and opens no port.
 
 ## The doctrine: relentless, but reversible
 
@@ -81,15 +102,25 @@ file without ever running it, and `arx forensics` writes a sealed report of what
 |------|---------|-----------|
 | **0** | Record evidence and alert | Automatic, always |
 | **1** | Block an IP, a port or a reverse-shell channel; suspend a suspicious process | Automatic with `--enforce`; each action undoes itself after 60 minutes |
-| **2** | Restore critical files, quarantine what was planted, lock an account | **You**, with your authorization word |
+| **2** | Restore critical files, quarantine what was planted, lock an account and close its sessions, end a process that came back | **You**, with your authorization word |
+
+**One exception, on purpose.** With a model configured and `--enforce`, if the model confirms as a
+threat, or as a serious suspicion (70% or more), a login the rules already flagged, Arx closes that
+account's access without waiting and tells you with the full context. A closed session can't be
+reopened, so this is the one irreversible thing that doesn't wait for you. The model can't choose
+who: its verdict only counts on a login already flagged in the same batch, and code validates the
+rest. It never applies to root, system accounts or the last account that can administer the host,
+without a live session Arx can verify, or more than twice an hour. Turn it off in `arx setup`.
 
 Guardrails against self-inflicted damage:
 
-- It never acts on your SSH port, PID 1, itself, the host's own IPs or an SSH session it has
-  seen persist across checks.
+- It never acts on your SSH port, PID 1, itself, the host's own IPs or an authenticated SSH
+  session it has seen persist across checks. A connection that never logged in protects nobody.
 - A new binary in a system directory is only logged. A new binary elsewhere can be
   suspended, and only with `--enforce`.
-- After 5 automatic actions in an hour it stops acting and only observes.
+- After 5 automatic actions in an hour it stops acting and only observes. Critical findings keep a
+  small reserve, so exhausting the brake on purpose doesn't leave a reverse shell unanswered.
+- An account can't be locked if it would leave nobody able to administer the server.
 - If a threat comes back after its block expires, Arx doesn't re-block in a loop. It asks you.
 
 Losing contact with our servers doesn't disarm Arx. Licensing fails open, degrading at
@@ -104,12 +135,30 @@ Read these before you rely on it.
 - **Reverse shells written in Python, Perl or PHP aren't caught yet.** Those interpreters
   are common in legitimate servers, so this detection is limited to shells and `nc`/`socat`.
   A legitimate long-lived `nc` client would be flagged; mark its IP out of bounds in setup.
-- **Containment expires by design.** After 60 minutes a suspended process resumes and its
-  channel reopens. If the threat is still there, it is escalated to you, not re-blocked.
-- **An attacker can exhaust the safety brake.** Five actions in an hour trips it on purpose
-  or by accident, and from then on Arx only observes and alerts.
-- **Blocks need a firewall tool.** Without `ufw` or `nftables` it reports that it can't
-  block, and cutting a reverse-shell channel requires `nftables` specifically.
+- **Containment expires by design, except accounts.** After 60 minutes a suspended process
+  resumes and its channel reopens. If the threat is still there, it is escalated to you, not
+  re-blocked. A locked account stays locked until you run `arx unlock`.
+- **An attacker can exhaust the safety brake for non-critical findings.** Five actions in an hour
+  trips it on purpose or by accident, and from then on Arx only alerts on those.
+- **Installing something new under `--enforce` gets it contained.** Arx can't tell your new app
+  from a planted one: a new exposed port is blocked and a new binary outside system directories is
+  suspended, until you run `arx accept`. Use observe mode while you're changing the server.
+- **Blocks work best with `nftables`.** The package recommends it. With only `ufw`, a block doesn't
+  cut connections already open and won't touch a port you already have a rule for. With neither,
+  it reports that it can't block. Cutting a reverse-shell channel always needs `nftables`.
+- **The model reads data an attacker can write.** At worst, a successful prompt injection could get
+  a flagged login locked. It can't pick another account, reach root or lock you out of the host,
+  and `arx unlock` undoes the lock, but not the closed sessions.
+- **Without journald, `auth.log` can be forged.** Any local user can write to it with `logger`, and
+  that could get an IP blocked for an hour. Hosts with journald, which is nearly all of them, read
+  from it instead, where that doesn't work.
+- **Root can stop Arx.** An attacker who is already root can disable the service, and nothing warns
+  you when that happens. A silent Arx isn't proof of a quiet server.
+- **Ransomware is only seen through its decoys.** Plant them with `arx canaries plant`. Arx doesn't
+  recognize mass encryption itself, and doesn't prevent it.
+- **Locking an account ends everything running under it,** services included, and lists it for you.
+  It doesn't cover what doesn't go through that account: API tokens, keys stolen for other services,
+  or persistence already installed as root.
 - **`arx scan` is heuristic.** It uses a small rule set, and "clean" only means no rule
   matched. On large files it reads the start and the end, and says so.
 - **The forensic seal has a limit.** It detects later edits to a report, but not edits made
@@ -123,8 +172,9 @@ Read these before you rely on it.
 Two layers, on purpose. A **fast, deterministic** layer of sensors and rules contains
 threats, with no network and no model involved. An optional **slow** layer, a model using
 **your own API keys**, reads new findings and explains them. It's off the hot path, receives
-telemetry marked as untrusted with secrets redacted, and can't execute anything. Everything
-in the table above works without any API key.
+telemetry marked as untrusted with secrets redacted, and has one narrow, validated say: the
+exception above. Everything in the table works without any API key: without a model, those
+decisions wait for you.
 
 Python standard library only, no pip dependencies. It uses osquery, auditd and Falco if you
 already have them, and falls back to `/proc` if you don't. The lifecycle is four words:
@@ -137,6 +187,8 @@ setup  →  recon  →  learn  →  guard
 
 ```bash
 sudo arx canaries list       # note any decoys you planted, then delete them
+sudo arx unlock              # unlock any account you left locked
+sudo arx proposals           # undo any applied change: arx proposals revert <id>
 sudo arx service uninstall
 sudo apt remove arx
 sudo nft delete table inet arx

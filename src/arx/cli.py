@@ -60,6 +60,8 @@ def cmd_scan(args: argparse.Namespace) -> int:
 
 def cmd_forensics(args: argparse.Namespace) -> int:
     from arx.modules import forensics
+    if args.indicators:
+        return forensics.print_indicators(since=args.since)
     return forensics.run(verify_path=args.verify, since=args.since)
 
 
@@ -70,7 +72,7 @@ def cmd_service(args: argparse.Namespace) -> int:
 
 
 def cmd_accept(args: argparse.Namespace) -> int:
-    from arx.modules import baseline, response
+    from arx.modules import response
 
     st = response.load_findings()
     if args.fp is None:
@@ -83,19 +85,12 @@ def cmd_accept(args: argparse.Namespace) -> int:
             print(f"  {fp}  {e.get('detail')}   (visto {e.get('seen')}×, últ. {e.get('last_seen', '')[:16]})")
         print("\nAcepta uno con:  arx accept <id>")
         return 0
-    e = st.get(args.fp)
-    if not e or not e.get("set"):
+    msg = response.accept(args.fp)
+    if msg is None:
         print(f"No hay un hallazgo aceptable con id '{args.fp}'. Lista:  arx accept")
         return 1
-    if not baseline.accept(e["set"], e["item"]):
-        print("No se pudo actualizar la línea base (¿existe y contiene ese conjunto?).")
-        return 1
-    response.forget(args.fp)
-    response.record({"kind": "accepted", "detail": e.get("detail")})
-    if str(e["item"]).partition("@")[0] in {a["user"] for a in response.locked_accounts()}:
-        print("  ⚠ Esa cuenta sigue bloqueada: aceptar no la desbloquea. Usa:  arx unlock")
-    print(f"✓ Aceptado como normal: {e['item']}  (reinicia el servicio para que guard lo recargue)")
-    return 0
+    print(msg)
+    return 0 if msg.startswith("✓") else 1
 
 
 def cmd_notify(args: argparse.Namespace) -> int:
@@ -117,7 +112,7 @@ def _status_data() -> dict:
 
     from arx import config, notify
     from arx import license as lic
-    from arx.modules import baseline, canaries, response, service
+    from arx.modules import baseline, canaries, guard, proposals, response, service, vaccines
 
     cfg = config.load_config()
     base = baseline.load()
@@ -131,7 +126,8 @@ def _status_data() -> dict:
             "service": svc, "alerts": notify.channels(cfg),
             "canaries": {"active": len(canaries._load().get("canaries", [])), "fired": len(canaries.check())},
             "blocks": len(response._load_blocks()), "breaker_tripped": response.breaker_tripped(),
-            "findings": len(response.load_findings()),
+            "findings": len(response.load_findings()), "enforce": guard.mode_seen(),
+            "vaccines": len(vaccines._load().get("applied") or {}), "proposals": len(proposals.all_proposals()),
             "pending": [{"id": p["id"], "sev": p.get("sev"), "detail": p.get("detail")}
                         for p in response.list_pending()],
             "locked_accounts": response.locked_accounts(), "quarantine": len(response.list_quarantine())}
@@ -173,7 +169,14 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(f"  bloqueos T1    {len(response._load_blocks())} activos"
           + ("   ⚠ FRENO DE SEGURIDAD activo" if response.breaker_tripped() else ""))
     from arx import notify
+    from arx.modules import guard, proposals, vaccines
+    seen = guard.mode_seen()
+    print(f"  modo           {'aún no ha corrido' if seen is None else 'proteger (--enforce)' if seen else 'observar'}")
     print(f"  alertas        {', '.join(notify.channels(cfg)) or 'ninguna  (arx setup)'}")
+    print(f"  vacunas        {len(vaccines._load().get('applied') or {})} aplicadas")
+    props = proposals.all_proposals()
+    if props:
+        print(f"  propuestas     {len(props)}   ·  míralas: arx proposals")
     print(f"  hallazgos      {len(response.load_findings())} conocidos  ·  aceptar cambios legítimos: arx accept")
     pend = response.list_pending()
     print(f"  Tier 2 pend.   {len(pend)}" + ("   ⚠ usa: arx authorize" if pend else ""))
@@ -303,6 +306,16 @@ def cmd_restore(args: argparse.Namespace) -> int:
     return 0 if done and done.startswith("restaurado") else 1
 
 
+def cmd_vaccines(args: argparse.Namespace) -> int:
+    from arx.modules import vaccines
+    return vaccines.run(args.vaction or "list", getattr(args, "vid", None))
+
+
+def cmd_proposals(args: argparse.Namespace) -> int:
+    from arx.modules import proposals
+    return proposals.run(args.paction or "list", getattr(args, "pid", None))
+
+
 def cmd_metrics(args: argparse.Namespace) -> int:
     from arx.modules import metrics
     return metrics.run(days=args.days, as_json=args.json)
@@ -409,6 +422,8 @@ def main(argv: list[str] | None = None) -> int:
     p_for = sub.add_parser("forensics", help="informe forense post-incidente (firmado)")
     p_for.add_argument("--since", help="solo incidentes desde esta marca ISO (UTC)")
     p_for.add_argument("--verify", help="verifica el sellado de un informe guardado")
+    p_for.add_argument("--indicators", action="store_true",
+                       help="solo IPs públicas, hashes y tipos de ataque, sin nada de este host: para compartir")
     p_st = sub.add_parser("status", help="estado general de Arx (un vistazo)")
     p_st.add_argument("--json", action="store_true", help="en JSON, para scripts")
     p_auth = sub.add_parser("authorize", help="ver/aprobar acciones Tier 2 pendientes")
@@ -417,6 +432,19 @@ def main(argv: list[str] | None = None) -> int:
     p_unl.add_argument("user", nargs="?", help="cuenta a desbloquear (sin cuenta: lista las bloqueadas)")
     p_res = sub.add_parser("restore", help="ver/devolver a su sitio ficheros en cuarentena")
     p_res.add_argument("qid", nargs="?", help="id del fichero (sin id: lista la cuarentena)")
+    p_vac = sub.add_parser("vaccines", help="vacunas firmadas: lo que otros Arx aprendieron")
+    vsub = p_vac.add_subparsers(dest="vaction")
+    vsub.add_parser("list", help="ver las aplicadas y las rechazadas")
+    vsub.add_parser("update", help="comprobar ahora si hay vacunas nuevas")
+    p_vr = vsub.add_parser("remove", help="retirar una vacuna de este host")
+    p_vr.add_argument("vid", help="id de la vacuna")
+    p_pro = sub.add_parser("proposals", help="lo que Arx te propone cambiar (nada se aplica solo)")
+    psub = p_pro.add_subparsers(dest="paction")
+    psub.add_parser("list", help="ver las propuestas")
+    p_pa = psub.add_parser("apply", help="aplicar una propuesta (pide tu palabra)")
+    p_pa.add_argument("pid", help="id de la propuesta")
+    p_pr = psub.add_parser("revert", help="deshacer una propuesta aplicada (pide tu palabra)")
+    p_pr.add_argument("pid", help="id de la propuesta")
     p_met = sub.add_parser("metrics", help="cuánto ruido hace Arx en este host (falsos positivos)")
     p_met.add_argument("--days", type=int, default=7, help="días a contar (por defecto 7)")
     p_met.add_argument("--json", action="store_true", help="solo cifras, sin rutas ni nombres: se puede compartir")
@@ -465,7 +493,8 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
     handlers = {"setup": cmd_setup, "recon": cmd_recon, "learn": cmd_learn,
                 "guard": cmd_guard, "status": cmd_status, "authorize": cmd_authorize, "unlock": cmd_unlock,
-                "restore": cmd_restore, "metrics": cmd_metrics,
+                "restore": cmd_restore, "metrics": cmd_metrics, "vaccines": cmd_vaccines,
+                "proposals": cmd_proposals,
                 "canaries": cmd_canaries, "scan": cmd_scan, "forensics": cmd_forensics,
                 "service": cmd_service, "fleet": cmd_fleet, "license": cmd_license,
                 "accept": cmd_accept, "notify": cmd_notify}

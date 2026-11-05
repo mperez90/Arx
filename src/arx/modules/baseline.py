@@ -117,16 +117,20 @@ def _login_users() -> list[str]:
             continue
         src = ""
         if line.rstrip().endswith(")") and "(" in line:
-            src = "@" + _login_origin(line[line.rfind("(") + 1 : line.rfind(")")])
+            # el primer paréntesis: el origen de tmux lleva otro dentro, `(tmux(451).%0)`
+            origin = _login_origin(line[line.find("(") + 1 : line.rfind(")")])
+            if origin is None:
+                continue
+            src = "@" + origin
         users.add(f[0] + src)
     return sorted(users)
 
 
-def _login_origin(origin: str) -> str:
-    """tmux, screen y mosh ponen un pid o un panel en el origen: cada ventana nueva parecería
-    un acceso nuevo. Se conserva lo estable (la IP o el nombre), nunca lo que cambia."""
-    if origin.startswith("tmux("):
-        return "tmux"
+def _login_origin(origin: str) -> str | None:
+    """Lo estable del origen, nunca lo que cambia: mosh pone un pid. Una ventana de tmux o screen no
+    es un acceso (None): es alguien que ya entró, y ese acceso se vio cuando ocurrió."""
+    if origin.startswith("tmux(") or (origin.startswith(":") and ":S." in origin):
+        return None
     if origin.startswith("mosh"):
         return "mosh"
     if origin.startswith(":"):
@@ -367,7 +371,17 @@ def accept(key: str, item: str) -> bool:
     """Incorpora a la base un cambio legítimo (p. ej. instalaste nginx → 'tcp 80 all')."""
     with config.locked("baseline"):
         b = load()
-        if key == "uid0_accounts" and b:  # jamás se aprende sola: nace con la primera aceptación
+        if key == "integrity" and b:  # un cambio legítimo: la nueva huella y la nueva copia buena
+            current = integrity_fingerprint().get(item)
+            if current is None:
+                return False
+            b.setdefault("integrity", {})[item] = current
+            b["meta"]["updated"] = _now()
+            save(b)
+            from arx.modules import response
+            response.backup_critical({item: integrity_paths().get(item, [])})
+            return True
+        if key in ("uid0_accounts", "intel_allow") and b:  # jamás se aprenden solas: nacen al aceptar
             b.setdefault("sets", {}).setdefault(key, {})
         if not b or key not in b.get("sets", {}):
             return False

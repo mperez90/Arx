@@ -60,6 +60,10 @@ def compute(days: int = 7, now: datetime | None = None) -> dict:
     unlocked = sum(e.get("kind") == "identity_unlocked" for e in window)
     false_positives = fp + unlocked
     rate = false_positives / covered if covered else 0.0
+    unreviewed = max(0, len(high) - fp)
+    # con alertas sin revisar, el objetivo solo se cumple si se cumpliría aunque todas fueran falsas
+    worst = (false_positives + unreviewed) / covered if covered else 0.0
+    within = True if worst < TARGET_FP_PER_DAY else (False if rate >= TARGET_FP_PER_DAY else None)
     return {
         "version": __version__,
         "days_covered": round(covered, 2),
@@ -68,13 +72,13 @@ def compute(days: int = 7, now: datetime | None = None) -> dict:
         "alerts_high_per_day": round(len(high) / covered, 3) if covered else 0.0,
         "false_positives": false_positives,
         "false_positives_per_day": round(rate, 3),
-        "unreviewed_high": max(0, len(high) - fp),
+        "unreviewed_high": unreviewed,
         "automatic_actions": sum(1 for e in new if e.get("revert")),
         "accounts_locked_by_model": sum(e.get("kind") == "identity_contained" and bool(e.get("verdict"))
                                         for e in window),
         "high_by_kind": dict(sorted(by_kind.items())),
         "target_fp_per_day": TARGET_FP_PER_DAY,
-        "within_target": rate < TARGET_FP_PER_DAY,
+        "within_target": within,  # None: depende de las alertas que aún no ha revisado nadie
     }
 
 
@@ -92,6 +96,8 @@ def run(days: int = 7, as_json: bool = False) -> int:
     print(f"  falsos positivos      {m['false_positives']}  ({m['false_positives_per_day']}/día · "
           f"objetivo < {TARGET_FP_PER_DAY}/día)")
     print(f"  altos sin revisar     {m['unreviewed_high']}")
+    verdict = {True: "sí", False: "no", None: "aún no se puede saber: revisa las alertas"}[m["within_target"]]
+    print(f"  dentro del objetivo   {verdict}")
     print(f"  acciones automáticas  {m['automatic_actions']}")
     if m["accounts_locked_by_model"]:
         print(f"  cuentas que bloqueó el modelo  {m['accounts_locked_by_model']}")

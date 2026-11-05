@@ -63,6 +63,18 @@ honesto de lo que falta construir (y cada gap ya tiene fase en el roadmap).
 
 ---
 
+## Los otros tres labs
+
+| Lab | Qué añade | Comando |
+|---|---|---|
+| **systemd** | `.deb` real, `arx setup` por consola, el unit y su endurecimiento, journald, `kill -9`, reinicio y `flush` de nftables, `ufw` con reglas `allow` previas, el modelo desde el servicio (su respuesta se simula), gobierno desde el chat con un Telegram falso | `bash lab/systemd-lab.sh` |
+| **Día normal** | Nada de ataques: apt, servicios, logrotate, tmux, useradd, una app propia, scp, todo con `--enforce`. Mide si Arx estorba y cuánto ruido hace. Es sintético: da una primera cifra, no la métrica | `bash lab/normal-day.sh` |
+| **Nivel 10** | Señuelos cifrados, tormenta contra el freno, fork bomb acotada, borrado de logs, `kill -9`. Lo que se mide: sigue en pie, avisa y no hace nada irreversible | `bash lab/level10.sh` |
+
+Usan una imagen propia, `lab/systemd/Dockerfile`, hecha solo con la `ubuntu:22.04` oficial y paquetes
+de Ubuntu. Con systemd como PID 1 en un contenedor privilegiado, comparten kernel con Docker: no hay
+auditd ni reinicio real del kernel. No sustituyen a la VM (`lab/vm/`), que sigue sin correrse.
+
 ## Ejecución
 
 ```bash
@@ -72,8 +84,8 @@ lab/docker-lab.sh        # mini-lab DOS contenedores: L1, L2 y L6 reales (nmap/s
 lab/demo.sh              # versión corta de tres ataques, con la salida real de Arx (GIF del README)
 ```
 
-El scoreboard imprime PASS/FAIL por nivel. Los niveles 3 y 10 necesitan VM (L3 toca
-credenciales reales; L10 es destructivo — ver `lab/vm/`) y aún no se han corrido. El nivel 6
+El scoreboard imprime PASS/FAIL por nivel. Los niveles 3 y 10 se corren en contenedor (L3 con sshd
+real aquí y en el lab systemd; L10 en `lab/level10.sh`); la VM de `lab/vm/` sigue pendiente. El nivel 6
 se valida en la fase de red: el atacante escucha con `nc`, la víctima abre el reverse shell
 clásico y Arx corta el canal y suspende solo al dueño. Límite honesto: los reverse shell por
 intérprete general (python, perl, php) se dejan para los sensores de comportamiento de F8.
@@ -90,9 +102,21 @@ dropper con una cola hostil, un FIFO en su ruta, un dropper que se borra a sí m
 con bytes no UTF-8 o saltos de línea no pueden colgar ni tumbar a Arx, y el dropper debe
 quedar suspendido.
 
-**Identidad (`identity`):** el bloqueo de cuenta se prueba contra `sshd` real: la llave SSH
-debe dejar de entrar, volver a entrar al expirar, y una cuenta que el admin ya había bloqueado
-debe seguir bloqueada.
+**Identidad (`identity`):** el bloqueo de cuenta se prueba contra `sshd` real. Sesiones con y sin
+terminal, un proceso desligado y un root nacido de la sesión deben morir; la llave y la contraseña
+deben dejar de entrar, seguir así un mes después y volver con `arx unlock`; y una cuenta que el admin
+ya había bloqueado debe seguir bloqueada. `identity-llm` hace lo mismo con el veredicto del modelo
+sobre un acceso real desde el atacante (solo su respuesta se simula), e `identity-forged` comprueba
+que una línea falsa en auth.log no bloquea a nadie.
+
+**FORWARD:** un servicio publicado por DNAT, como hace Docker. La IP bloqueada no debe llegar a él.
+
+**Propuestas:** cerrar las contraseñas de SSH contra `sshd` real, medido desde el atacante, con la
+llave todavía dentro, y deshacerlo.
+
+**Vacunas (F17):** el canal se sirve desde el contenedor del atacante, para que quede claro que la
+firma es lo que manda: lo alterado y lo de otra clave se descarta sin abrir. Dos hosts validan el
+mismo paquete por su cuenta, y una regla que casa con un binario de uno solo se rechaza solo allí.
 
 Dos lecciones del harness: `ncat` con stdin cerrado (`docker exec -d`) cierra cada conexión
 al instante, por eso el C2 usa `nc`; y `ss -K` no sirve para validar nada en Docker Desktop,

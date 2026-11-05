@@ -12,16 +12,30 @@ jobs:
     strategy:
       matrix:
         # 3.10 = Ubuntu 22.04 LTS (mínimo soportado) · 3.12 = 24.04 · 3.13 = actual
-        python-version: ["3.10", "3.12", "3.13"]
+        python-version: ["3.10", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
       - name: Lint (errores reales, no estilo)
-        run: pipx run ruff check src tests --select F,E9
+        run: pipx run ruff check src tests scripts/vaccine_tool.py --select F,E9
       - name: Unit tests
         run: python -m unittest discover -s tests -v
+
+  # Ataques reales en contenedores desechables, y lo que se instala de verdad. Solo donde importa:
+  # tardan más que toda la suite.
+  lab:
+    needs: test
+    if: github.ref_type == 'tag' || github.ref_name == 'f1-core-mvp' || startsWith(github.ref_name, 'feat/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Mini-lab (L1-L9, identidad, vacunas, propuestas)
+        run: bash lab/docker-lab.sh
+      - name: Lab systemd (servicio, ufw, reinicio, chat)
+        run: bash lab/systemd-lab.sh
 
   build-package:
     needs: test

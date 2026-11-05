@@ -53,8 +53,8 @@ ExecStart={exec_start} guard{' --enforce' if enforce else ''}
 Restart=always
 RestartSec=10
 # Corre como root: contiene amenazas (firewall, señales, ficheros del sistema).
-# Endurecido sin bloquear su función:
-ProtectHome=read-only
+# Endurecido sin bloquear su función. Sin ProtectHome: autorizar desde el chat ocurre dentro de este
+# servicio, y restaurar un authorized_keys o retirar un dropper de /home fallaría.
 ProtectClock=true
 ProtectKernelTunables=true
 RestrictSUIDSGID=true

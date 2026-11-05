@@ -15,8 +15,10 @@ muestra la configuración actual con los secretos redactados.
 from __future__ import annotations
 
 import getpass
+import socket
 
-from arx import config
+from arx import config, totp
+from arx.modules import telegram
 
 # (proveedor, modelo por defecto). El orden es también el orden de fallback base.
 PROVIDERS = [
@@ -54,6 +56,7 @@ def show() -> int:
     tg = "sí" if n.get("telegram_chat_id") and config.load_secrets().get("telegram_bot_token") else "no"
     print(f"  alertas        telegram {tg} · webhook {'sí' if n.get('webhook_url') else 'no'} "
           f"· desde sev {n.get('min_sev', 'high')}")
+    print(f"  gobierno chat  {'sí, con código de un solo uso' if n.get('telegram_interactive') else 'no'}")
     print(f"  ante escaneo   {cfg.get('ip_response', 'block')}")
     print(f"  modelo bloquea {'no' if cfg.get('llm_identity_actions') is False else 'sí, con --enforce'}"
           f" · desde {cfg.get('llm_lock_min_confidence', 70)}% de confianza")
@@ -109,7 +112,6 @@ def run(show_only: bool = False) -> int:
         key = _ask_secret("   Clave de licencia (Enter para activar más tarde)")
         if key:
             import platform
-            import socket
 
             from arx import __version__
             from arx import license as lic_mod
@@ -131,12 +133,34 @@ def run(show_only: bool = False) -> int:
 
     print("\n6) Alertas  (Enter = omitir)")
     notify_cfg = dict(cfg.get("notify") or {})
+    print("   Telegram: en la app, habla con @BotFather, envíale /newbot y sigue sus pasos. Te dará un token.\n"
+          "   Crea un bot solo para Arx: es tuyo, y nadie más que tú pasa por él.")
     tg_token = _ask_secret("   Token del bot de Telegram (vacío = mantener/omitir)")
     if tg_token:
         store["telegram_bot_token"] = tg_token
+        name = telegram.bot_name(tg_token)
+        if name:
+            print(f"   ✓ Bot @{name}. Envíale ahora cualquier mensaje desde tu móvil (espero 90 s)…")
+            chat = telegram.detect_chat_id(tg_token)
+            if chat:
+                notify_cfg["telegram_chat_id"] = chat
+                print(f"   ✓ Tu chat es el {chat}. Solo este chat podrá hablar con Arx.")
+            else:
+                print("   No llegó ningún mensaje: escribe el chat_id a mano.")
+        else:
+            print("   ⚠ No pude comprobar ese token ahora (¿es correcto? ¿hay conexión?). Se guarda igualmente.")
     if tg_token or store.get("telegram_bot_token"):
         notify_cfg["telegram_chat_id"] = _ask("   chat_id de Telegram al que avisar",
                                               notify_cfg.get("telegram_chat_id"))
+        interactive = _ask("   ¿Gobernar Arx desde ese chat? (consultar, y autorizar con código de un solo uso) (s/n)",
+                           "s" if notify_cfg.get("telegram_interactive") else "n").lower() == "s"
+        notify_cfg["telegram_interactive"] = interactive
+        if interactive and not store.get("telegram_totp"):
+            store["telegram_totp"] = totp.new_secret()
+            print("   Añade esta clave a tu app de autenticación (Google Authenticator, Aegis, 1Password…):")
+            print(f"     {store['telegram_totp']}")
+            print(f"     {totp.uri(store['telegram_totp'], socket.gethostname())}")
+            print("   Es lo que te pedirá Arx para actuar desde el chat: tu palabra nunca viaja por él.")
     notify_cfg["webhook_url"] = _ask("   URL de webhook (Slack/Discord/n8n…)", notify_cfg.get("webhook_url"))
     notify_cfg["min_sev"] = _ask("   Avisar desde severidad (crit/high/med)", notify_cfg.get("min_sev", "high"))
 
