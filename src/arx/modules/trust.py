@@ -22,7 +22,6 @@ que no se pudieron hacer (un host sin conexión). Una sola prueba obligatoria fa
 from __future__ import annotations
 
 import hashlib
-import io
 import itertools
 import json
 import os
@@ -172,32 +171,52 @@ def check_repository_copy(f: dict) -> dict:
             deb = os.path.join(tmp, debs[0])
         if os.path.getsize(deb) > MAX_DEB_BYTES:
             return _check("matches_repository", "unknown", tr("package too large to compare"))
-        try:
-            data = subprocess.run(["dpkg-deb", "--fsys-tarfile", deb], capture_output=True, timeout=180).stdout
-        except (OSError, subprocess.TimeoutExpired):
-            return _check("matches_repository", "unknown", tr("could not open the official package"))
         conf, differ, compared = _conffiles(f["package"]), [], 0
-        with tarfile.open(fileobj=io.BytesIO(data)) as tar:
-            for member in tar:
-                if not member.isreg():
-                    continue
-                path = "/" + member.name.lstrip("./")
-                if path in conf or not os.path.isfile(path) or os.path.islink(path):
-                    continue
-                expected = hashlib.sha256(tar.extractfile(member).read()).hexdigest()
-                try:
-                    with open(path, "rb") as fh:
-                        actual = hashlib.sha256(fh.read()).hexdigest()
-                except OSError:
-                    continue
-                compared += 1
-                if actual != expected:
-                    differ.append(path)
+        deadline = time.monotonic() + COMPARE_BUDGET_S
+        try:  # en streaming: un paquete grande no puede llevar a Arx a su tope de memoria
+            proc = subprocess.Popen(["dpkg-deb", "--fsys-tarfile", deb], stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL)
+        except OSError:
+            return _check("matches_repository", "unknown", tr("could not open the official package"))
+        try:
+            with tarfile.open(fileobj=proc.stdout, mode="r|") as tar:
+                for member in tar:
+                    if time.monotonic() > deadline:
+                        return _check("matches_repository", "unknown", tr("could not open the official package"))
+                    if not member.isreg():
+                        continue
+                    path = "/" + member.name.lstrip("./")
+                    if path in conf or not os.path.isfile(path) or os.path.islink(path):
+                        continue
+                    expected = _sha256_of(tar.extractfile(member))
+                    try:
+                        with open(path, "rb") as fh:
+                            actual = _sha256_of(fh)
+                    except OSError:
+                        continue
+                    compared += 1
+                    if actual != expected:
+                        differ.append(path)
+        except (tarfile.TarError, OSError):
+            return _check("matches_repository", "unknown", tr("could not open the official package"))
+        finally:
+            proc.kill()
+            proc.wait()
         if differ:
             return _check("matches_repository", "fail",
                           tr("differs from the official package: {files}", files=", ".join(differ[:3])))
         return _check("matches_repository", "pass",
                       tr("{n} files identical to the official package", n=compared))
+
+
+COMPARE_BUDGET_S = 240
+
+
+def _sha256_of(fh) -> str:
+    h = hashlib.sha256()
+    while chunk := fh.read(1 << 20):
+        h.update(chunk)
+    return h.hexdigest()
 
 
 APT_ARCHIVES = "/var/cache/apt/archives"
@@ -222,7 +241,7 @@ def _cached_deb(f: dict) -> str | None:
             if os.path.getsize(path) > MAX_DEB_BYTES:
                 continue
             with open(path, "rb") as fh:
-                if hashlib.sha256(fh.read()).hexdigest() in expected:
+                if _sha256_of(fh) in expected:
                     return path
         except OSError:
             continue

@@ -48,12 +48,23 @@ def unit_text(exec_start: str, enforce: bool = False) -> str:
 Description=Arx - autonomous defensive agent
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=10
 
 [Service]
 Type=simple
 ExecStart={exec_start} guard{' --enforce' if enforce else ''}
 Restart=always
 RestartSec=10
+# Arx never takes the host down: capped, low priority, and the first the kernel kills if memory runs out.
+MemoryHigh=384M
+MemoryMax=512M
+CPUQuota=50%
+TasksMax=256
+Nice=5
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+OOMScoreAdjust=500
 # Runs as root: it contains threats (firewall, signals, system files).
 # Hardened without blocking its job. No ProtectHome: authorizing from the chat happens inside this
 # service, and restoring an authorized_keys or removing a dropper from /home would fail.
@@ -82,6 +93,9 @@ Wants=network-pre.target
 Type=oneshot
 RemainAfterExit=yes
 ExecStart={exec_start} service restore
+# runs before the network: a hang must never hold the host's boot
+TimeoutStartSec=30
+MemoryMax=256M
 
 [Install]
 WantedBy=sysinit.target
