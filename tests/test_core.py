@@ -3762,6 +3762,173 @@ class ConsensusServerTests(unittest.TestCase):
         self.assertEqual(self.srv.network_of("nope"), "")
 
 
+class ExecWatchTests(unittest.TestCase):
+    """F18.2 (DEC#8): lo que lanzan los servicios, al instante; el patrón de xz en sshd, desde el día 1."""
+
+    def setUp(self):
+        _isolate()
+        from arx import i18n
+        from arx.modules import execwatch, profile, response
+        self.x, self.p, self.r = execwatch, profile, response
+        i18n.set_lang("en")
+        self.addCleanup(i18n.set_lang, "es")
+
+    def _ev(self, **over):
+        return {"pid": 4242, "start": 777, "exe": "/usr/bin/dash", "unit": "system.slice/ssh.service", "ppid": 900,
+                "parent_exe": "/usr/sbin/sshd", "parent_title": "sshd: [accepted]", "parent_user": "root", **over}
+
+    def test_exec_events_are_read_from_the_kernel_connector(self):
+        import struct
+
+        def msg(what, tgid):
+            body = struct.pack("=IIIIHH", 1, 1, 0, 0, 24, 0) + struct.pack("=IIQ", what, 0, 0) + struct.pack("=II", tgid, tgid)
+            return struct.pack("=IHHII", 16 + len(body), 3, 0, 0, 0) + body
+        self.assertEqual(self.x.parse(msg(2, 4242) + msg(1, 5000) + msg(2, 4343)), [4242, 4343])  # 1 = fork: no
+        self.assertEqual(self.x.parse(b"\x05\x00"), [])
+
+    def test_the_xz_pattern_in_sshd(self):
+        allowed = {"/usr/local/bin/akc"}
+        self.assertTrue(self.x.sshd_preauth(self._ev(), allowed, sessions=True))
+        for ev in (self._ev(exe="/usr/lib/openssh/sshd-session"), self._ev(exe="/usr/local/bin/akc"),
+                   self._ev(parent_title="sshd: ana@pts/0"), self._ev(unit="system.slice/nginx.service"),
+                   self._ev(parent_exe="/usr/lib/systemd/systemd-executor")):
+            self.assertFalse(self.x.sshd_preauth(ev, allowed, sessions=True), ev)
+        # sin logind, solo con un título de antes de autenticar: lo de después (pam_motd en [priv]) no
+        self.assertFalse(self.x.sshd_preauth(self._ev(parent_title="sshd: ana [priv]"), allowed, sessions=False))
+        self.assertTrue(self.x.sshd_preauth(self._ev(parent_title="sshd: unknown [net]"), allowed, sessions=False))
+
+    def test_what_sshd_and_pam_declare_is_allowed(self):
+        class R:
+            stdout = "port 22\nauthorizedkeyscommand /usr/local/bin/akc %u\nauthorizedprincipalscommand none\n"
+        pam = {"/etc/pam.d/sshd": "auth required pam_exec.so quiet /usr/local/sbin/otp-check\n@include common-auth\n",
+               "/etc/pam.d/common-auth": "auth optional pam_exec.so expose_authtok /opt/hooks/notify # aviso\n"}
+        with mock.patch.object(self.x.subprocess, "run", lambda *a, **k: R()), \
+                mock.patch.object(self.x, "_read", lambda path, limit=4096: pam.get(path, "")), \
+                mock.patch.object(self.p, "load", lambda: {"sshd_allowed": ["/opt/accepted"]}):
+            allowed = self.x.sshd_allowed(refresh=True)
+        for path in ("/usr/local/bin/akc", "/usr/local/sbin/otp-check", "/opt/hooks/notify", "/opt/accepted",
+                     "/usr/sbin/unix_chkpwd"):
+            self.assertIn(path, allowed)
+        self.assertNotIn("none", allowed)
+
+    def test_a_web_or_database_service_starting_a_shell_from_day_one(self):
+        web = dict(unit="system.slice/nginx.service", parent_exe="/usr/sbin/nginx", parent_user="www-data")
+        self.assertTrue(self.x.webshell(self._ev(**web)))
+        self.assertFalse(self.x.webshell(self._ev(**{**web, "parent_user": "root"})))  # logs por tubería al arrancar
+        self.assertFalse(self.x.webshell(self._ev(**web, exe="/usr/bin/php8.3")))
+
+    def test_sshd_is_frozen_on_the_spot_only_in_enforce(self):
+        kills = []
+        for enforce in (True, False):
+            with mock.patch.object(self.x, "describe", lambda pid, root: self._ev()), \
+                    mock.patch.object(self.x, "sshd_allowed", lambda refresh=False: set()), \
+                    mock.patch.object(self.x, "same_process", lambda pid, exe, start: True), \
+                    mock.patch.object(self.x.os, "kill", lambda pid, sig: kills.append((pid, sig))):
+                ev = self.x.handle_pid(4242, "", lambda: enforce)
+            self.assertEqual(bool(ev.get("stopped")), enforce)
+        self.assertEqual(len(kills), 1)
+        self.x.drain()
+
+    def _subjects(self, status="watching", until="2026-11-01T00:00:00+00:00", unit="app.service", execs=()):
+        return {f"system.slice/{unit}": {"unit": unit, "status": status, "dest": {}, "extensions": [],
+                                         "execs": list(execs), "exec_until": until}}
+
+    def _events(self, subjects, *evs, now=None):
+        with mock.patch.object(self.x, "drain", lambda: list(evs)), \
+                mock.patch.object(self.p, "_unit_execs", lambda unit: {"/usr/sbin/app"}):
+            return self.p._exec_events(subjects, now or datetime(2026, 11, 6, tzinfo=timezone.utc), {})
+
+    def test_services_learn_what_they_start_and_then_a_new_child_is_reported(self):
+        child = dict(unit="system.slice/app.service", parent_exe="/usr/sbin/app", exe="/usr/bin/convert", parent_user="app")
+        learning = self._subjects(status="observing")
+        self.assertEqual(self._events(learning, self._ev(**child)), [])
+        self.assertEqual(learning["system.slice/app.service"]["execs"], ["/usr/bin/convert"])
+        watching = self._subjects(execs=["/usr/bin/convert"])
+        self.assertEqual(self._events(watching, self._ev(**child), self._ev(**{**child, "exe": "/usr/sbin/app"})), [])
+        found = self._events(watching, self._ev(**{**child, "exe": "/tmp/.x/k"}))
+        self.assertEqual([(f["kind"], f["sev"]) for f in found], [("unexpected_exec", "high")])
+        self.assertIn("app.service started /tmp/.x/k, which it never ran while Arx observed it", found[0]["detail"])
+        self.assertTrue(found[0]["harm"])  # ruta temporal y oculta: se congelará
+        self.assertEqual(found[0]["target"]["pid"], 4242)
+
+    def test_job_runners_are_not_profiled_and_a_service_watched_before_this_learns_first(self):
+        cron = self._subjects(unit="cron.service")
+        self.assertEqual(self._events(cron, self._ev(unit="system.slice/cron.service", parent_exe="/usr/sbin/cron",
+                                                     exe="/home/ana/job.sh")), [])
+        old = self._subjects(until=None)
+        child = self._ev(unit="system.slice/app.service", parent_exe="/usr/sbin/app", exe="/usr/bin/new")
+        self.assertEqual(self._events(old, child), [])  # estrena su propia ventana: aprende
+        self.assertEqual(old["system.slice/app.service"]["execs"], ["/usr/bin/new"])
+
+    def test_the_sshd_finding_is_critical_and_keeps_the_freeze(self):
+        found = self._events({}, self._ev(preauth=True, stopped=True))
+        self.assertEqual((found[0]["sev"], found[0]["target"]["stopped"]), ("crit", True))
+        self.assertIn("sshd, before authenticating anyone, ran /usr/bin/dash", found[0]["detail"])
+        self.assertEqual(found[0]["item"], "system.slice/ssh.service|/usr/bin/dash")
+
+    def test_the_response_is_for_that_process_only(self):
+        import signal
+        kills, scopes = [], []
+        for name, value in [("_is_linux_root", lambda: True), ("_can_confine", lambda: True),
+                            ("_cgroup_of", lambda pid: "system.slice/app.service"),
+                            ("_adopt_into_scope", lambda pid: scopes.append(pid) or {
+                                "scope": f"arxconfine-{pid}.scope", "path": f"arxconfine.slice/arxconfine-{pid}.scope",
+                                "set": "confined2", "pid": pid})]:
+            p = mock.patch.object(self.r, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+        for obj, name, value in [(self.x, "same_process", lambda pid, exe, start: True),
+                                 (self.r.os, "kill", lambda pid, sig: kills.append((pid, sig)))]:
+            p = mock.patch.object(obj, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+        f = self._events(self._subjects(), self._ev(unit="system.slice/app.service", parent_exe="/usr/sbin/app",
+                                                    exe="/usr/bin/new", parent_user="app"))[0]
+        o = self.r.handle(f, enforce=True, cfg={})
+        self.assertEqual((scopes, kills), ([4242], []))  # sin señales de daño: sin red, sigue corriendo
+        self.assertIn("pid 4242 (/usr/bin/new) without network", o["status"])
+        blk = self.r._load_blocks()[0]
+        self.assertTrue(blk["revert"]["pid_only"])
+        self.assertEqual(self.r._extend_containment(blk), 0)  # nunca «todos los /usr/bin/new del host»
+        again = self._events(self._subjects(), self._ev(unit="system.slice/app.service", pid=4444, start=900,
+                                                        parent_exe="/usr/sbin/app", exe="/usr/bin/new", parent_user="app"))[0]
+        o2 = self.r.handle(again, enforce=True, cfg={})
+        self.assertFalse(o2["new"])  # el mismo aviso, sin repetirse
+        self.assertEqual(scopes, [4242, 4444])  # pero el proceso nuevo también queda sin red
+        self.r.handle(again, enforce=True, cfg={})
+        self.assertEqual(scopes, [4242, 4444])  # y no dos veces
+        harmful = self._events(self._subjects(), self._ev(unit="system.slice/app.service", pid=4343,
+                                                          parent_exe="/usr/sbin/app", exe="/tmp/x", parent_user="app"))[0]
+        self.r.handle(harmful, enforce=True, cfg={})
+        self.assertIn((4343, signal.SIGSTOP), kills)
+        with mock.patch.object(self.x, "same_process", lambda pid, exe, start: False):
+            gone = {**f, "fp_key": "otro", "target": {**f["target"], "pid": 5000}}
+            self.assertIn("no longer alive", self.r.handle(gone, enforce=True, cfg={})["status"])
+
+    def test_what_the_watcher_froze_is_registered_even_with_the_brake_on(self):
+        for name, value in [("_is_linux_root", lambda: True), ("_can_confine", lambda: False),
+                            ("_cgroup_of", lambda pid: "system.slice/ssh.service"),
+                            ("breaker_tripped", lambda now=None, sev=None: True)]:
+            p = mock.patch.object(self.r, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+        with mock.patch.object(self.x, "same_process", lambda pid, exe, start: True), \
+                mock.patch.object(self.r.os, "kill", lambda pid, sig: None):
+            o = self.r.handle(self._events({}, self._ev(preauth=True, stopped=True))[0], enforce=True, cfg={})
+        self.assertIn("pid 4242 suspended", o["status"])
+        self.assertEqual(self.r._load_blocks()[0]["revert"]["stopped"], [4242])
+
+    def test_accepting_teaches_the_service_or_sshd(self):
+        from arx import config
+        config.write_json(self.p._state_path(), {"subjects": self._subjects()})
+        self.assertTrue(self.p.accept_exec("system.slice/app.service|/usr/bin/new"))
+        self.assertTrue(self.p.accept_exec("system.slice/ssh.service|/usr/local/bin/akc"))
+        st = self.p.load()
+        self.assertIn("/usr/bin/new", st["subjects"]["system.slice/app.service"]["execs"])
+        self.assertEqual(st["sshd_allowed"], ["/usr/local/bin/akc"])
+        self.assertFalse(self.p.accept_exec("../etc|/x"))
+
+
 class TotpTests(unittest.TestCase):
     def setUp(self):
         from arx import totp
@@ -5433,6 +5600,14 @@ class BehaviorWatchTests(unittest.TestCase):
 
     def _sweep(self, days, enforce=False):
         return self.p.sweep(enforce=enforce, cfg=self._cfg(), now=self.now + timedelta(days=days))
+
+    def test_what_it_starts_is_learned_in_the_same_observation(self):
+        """Lab: al pasar a vigilado no se abre otra ventana para los hijos (ahí se aprendía lo nuevo)."""
+        self._sweep(0)
+        self._sweep(11)
+        s = self.p.load()["subjects"]["system.slice/app.service"]
+        self.assertEqual(s["status"], "watching")
+        self.assertEqual(self.p._exec_phase(s, self.now + timedelta(days=11, seconds=1), {}), "watch")
 
     def test_it_learns_then_watches_and_a_service_that_never_went_out_cannot(self):
         self._sweep(0)

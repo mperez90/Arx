@@ -97,6 +97,8 @@ _PLAN: dict[str, tuple[int, str, bool, str]] = {
     "gauge": (0, tr("log and watch the trend"), True, tr("weak signal; observe first")),
     "egress_profile": (0, tr("cut in the kernel at its first packet; the service keeps running"), True,
                        tr("outside the behavior Arx observed for it; if it is legitimate, accept it")),
+    "unexpected_exec": (1, tr("isolate that process: no network, and suspended if there are signs of harm"), True,
+                        tr("a program its service never started: the service keeps running")),
     "update_check": (0, tr("log and alert"), True,
                      tr("an update many services load: checked first, cut only with an untrusted verdict")),
     "untrusted_update": (1, tr("confine the service: no outbound network, it keeps running (until you decide)"),
@@ -1280,6 +1282,7 @@ def accept(fp: str) -> str | None:
         return None
     from arx.modules import trust
     accepted = (profile.accept(e["item"]) if e["set"] == "egress_profile"
+                else profile.accept_exec(e["item"]) if e["set"] == "unexpected_exec"
                 else trust.accept(e["item"]) if e["set"] == "untrusted_update"
                 else baseline.accept(e["set"], e["item"]))
     if not accepted:
@@ -1721,6 +1724,11 @@ def _confine_pid(pid: int) -> dict | None:
             return None
         _pin_confinement(name, path, set_name)
         return {"unit": name, "path": path, "set": set_name}
+    return _adopt_into_scope(pid)
+
+
+def _adopt_into_scope(pid: int) -> dict | None:
+    """Mueve el proceso a un scope propio y lo deja sin red: solo él, no su servicio."""
     scope = f"arxconfine-{pid}.scope"
     try:
         r = subprocess.run(["busctl", "call", "org.freedesktop.systemd1", "/org/freedesktop/systemd1",
@@ -1816,7 +1824,8 @@ def _extend_containment(blk: dict) -> int:
     """Un proceso nuevo del mismo programa (cron, un reinicio) no se escapa de lo ya decidido."""
     revert = blk.get("revert") if isinstance(blk.get("revert"), dict) else {}
     exe, tool = revert.get("exe"), revert.get("tool")
-    if tool not in ("sigstop", "confine") or not isinstance(exe, str) or not _is_linux_root():
+    if tool not in ("sigstop", "confine") or not isinstance(exe, str) or revert.get("pid_only") \
+            or not _is_linux_root():
         return 0
     pids = [p for p in _pids_for_exe(exe) if p > 1 and p != os.getpid()]
     new = []
@@ -1895,6 +1904,48 @@ def _confine_unit(unit: str, cgroup: str, finding: dict) -> tuple[str, dict | No
               "you decide", what=unit), revert
 
 
+def _contained_pids(fp: str) -> set:
+    pids = set()
+    for b in _load_blocks():
+        revert = b.get("revert") if b.get("fp") == fp and isinstance(b.get("revert"), dict) else {}
+        pids |= set(revert.get("stopped") or []) | {sc.get("pid") for sc in revert.get("scopes") or []}
+    return pids
+
+
+def _contain_process(target: dict, finding: dict) -> tuple[str, dict | None]:
+    """Un proceso concreto (pid + inicio + ejecutable): a un scope sin red y, con señales de daño, congelado.
+    Nunca «todos los de ese programa»: /bin/sh es de todos."""
+    from arx.modules import execwatch  # perezoso
+    pid, start, exe = target.get("pid"), target.get("start"), str(target.get("exe") or "")
+    if not (isinstance(pid, int) and pid > 1 and pid != os.getpid() and isinstance(start, int) and exe.startswith("/")):
+        return tr("invalid process: nothing contained"), None
+    if not execwatch.same_process(pid, exe, start):
+        return tr("the process is no longer alive: nothing to suspend"), None
+    if "arx.service" in (_cgroup_of(pid) or ""):
+        return tr("critical process ({base})", base="arx"), None
+    stopped = bool(target.get("stopped"))
+    if finding.get("harm") and not stopped:
+        try:
+            os.kill(pid, signal.SIGSTOP)
+            stopped = True
+        except OSError:
+            pass
+    scope = _adopt_into_scope(pid) if _can_confine() else None
+    if not scope and not stopped:  # lo que no se puede aislar se congela: nunca libre y con red
+        try:
+            os.kill(pid, signal.SIGSTOP)
+            stopped = True
+        except OSError:
+            return tr("could not suspend (race or permissions)"), None
+    revert = {"tool": "confine", "exe": exe, "pid_only": True, "units": [], "scopes": [scope] if scope else [],
+              "stopped": [pid] if stopped else []}
+    register_block(finding, revert, ttl_min=None)
+    parts = [tr("pid {pid} ({exe}) without network", pid=pid, exe=exe)] if scope else []
+    if stopped:
+        parts.append(tr("pid {pid} suspended", pid=pid))
+    return " · ".join(parts) + tr(" · it does not expire, you decide"), revert
+
+
 def _execute_tier1(finding: dict, cfg: dict | None = None) -> tuple[str, dict | None]:
     """Ejecuta una remediación Tier 1 reversible SOLO en Linux+root.
 
@@ -1943,6 +1994,8 @@ def _execute_tier1(finding: dict, cfg: dict | None = None) -> tuple[str, dict | 
         return tr("no ufw or nftables: no safe block executor on this host"), None
     if kind == "untrusted_update":
         return _confine_unit(str(target.get("unit") or ""), str(target.get("cgroup") or ""), finding)
+    if kind == "unexpected_exec":
+        return _contain_process(target, finding)
     if kind in ("executables", "processes"):
         exe = str(target.get("exe") or target.get("process") or "")
         if not exe.startswith("/"):
@@ -2123,6 +2176,12 @@ def handle(finding: dict, enforce: bool = False, authorized: bool = False,
             status = tr("already contained (active block {blk})", blk=_until(blk))
             if enforce and (n := _extend_containment(blk)):
                 status += tr(" · and {n} new process(es) of the same program", n=n)
+            pid = (finding.get("target") or {}).get("pid")
+            if enforce and finding.get("kind") == "unexpected_exec" and \
+                    pid not in _contained_pids(fp):  # otro proceso del mismo hijo: también, bajo el mismo aviso
+                more, revert = _contain_process(finding.get("target") or {}, finding)
+                if revert:
+                    status += f" · {more}"
         elif tier == 1 and entry.get("blocked_before"):
             outcome["tier"] = 2
             pid = _add_pending(finding, {"action": tr("{action}: REAPPEARED after the block expired",
@@ -2132,7 +2191,8 @@ def handle(finding: dict, enforce: bool = False, authorized: bool = False,
                         "or accept: arx accept {fp}", pid=pid, fp=fp)
         elif tier == 1 and not enforce:
             status = tr("automatic proposal: enable --enforce to apply")
-        elif tier == 1 and breaker_tripped(now, finding.get("sev")):
+        elif tier == 1 and breaker_tripped(now, finding.get("sev")) and not (finding.get("target") or {}).get("stopped"):
+            # lo que el vigilante ya congeló se registra igual: si no, quedaría congelado sin forma de soltarlo
             status = (tr("SAFETY BRAKE: already {MAX_TIER1_PER_HOUR} automatic actions in the last "
                          "hour → observing only", MAX_TIER1_PER_HOUR=MAX_TIER1_PER_HOUR))
         elif tier == 1:

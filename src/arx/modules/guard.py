@@ -28,7 +28,7 @@ from datetime import datetime, timezone
 from arx import config, consensus, engine, notify, redact
 from arx import license as lic
 from arx.i18n import lang, tr
-from arx.modules import (baseline, canaries, fleet, profile, provenance, recon, response, sandbox,
+from arx.modules import (baseline, canaries, execwatch, fleet, profile, provenance, recon, response, sandbox,
                          sensors, telegram, vaccines)
 
 SYSTEM_PROMPT = (
@@ -470,6 +470,10 @@ def run(once: bool = False, interval: int = 30, chat: bool = False, enforce: boo
     last_val = time.monotonic()
     last_suid = -SUID_EVERY_S  # primer barrido sí revisa SUID
     slow = SlowLayer(cfg, base, enforce)
+    if not once and response._is_linux_root():  # cada exec, al instante (F18.2)
+        mode = execwatch.start(lambda: slow.enforce)
+        print(tr("  process watch: {mode}", mode=tr("in the kernel, in real time") if mode == "netlink"
+                 else tr("each sweep (no kernel connector here)")))
     if not once and telegram.enabled(cfg):  # en un hilo: el chat nunca retrasa la defensa
         threading.Thread(target=telegram.loop, args=(cfg,), daemon=True).start()
     started_with = enforce

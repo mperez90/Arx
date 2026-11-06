@@ -103,6 +103,36 @@ ES = {
         "servicio crítico ({unit}): no se confina solo",
     "invalid service: nothing confined":
         "servicio no válido: no se confina nada",
+    "  process watch: {mode}":
+        "  vigilancia de procesos: {mode}",
+    "in the kernel, in real time":
+        "en el kernel, en tiempo real",
+    "each sweep (no kernel connector here)":
+        "en cada barrido (aquí no hay conector del kernel)",
+    "sshd ran a program before authentication (the xz backdoor pattern)":
+        "sshd lanzó un programa antes de autenticar (el patrón de la puerta trasera de xz)",
+    "{unit}: sshd, before authenticating anyone, ran {exe}":
+        "{unit}: sshd, antes de autenticar a nadie, ejecutó {exe}",
+    "a web or database service started a shell or a downloader":
+        "un servicio web o de base de datos lanzó una shell o un descargador",
+    "{unit} started {exe} as {user}":
+        "{unit} lanzó {exe} como {user}",
+    "{unit} started {exe}, which it never ran while Arx observed it":
+        "{unit} lanzó {exe}, que nunca lanzó mientras Arx lo observaba",
+    "a compromised program shows itself by what it starts":
+        "un programa comprometido se delata por lo que lanza",
+    "isolate that process: no network, and suspended if there are signs of harm":
+        "aislar ese proceso: sin red, y congelado si hay señales de daño",
+    "a program its service never started: the service keeps running":
+        "un programa que su servicio nunca lanzaba: el servicio sigue funcionando",
+    "invalid process: nothing contained":
+        "proceso no válido: no se contiene nada",
+    "pid {pid} ({exe}) without network":
+        "pid {pid} ({exe}) sin red",
+    "pid {pid} suspended":
+        "pid {pid} congelado",
+    " · it does not expire, you decide":
+        " · no caduca, decides tú",
     "{unit}: {pkg} {version} was just updated; no outbound network while its trust is checked":
         "{unit}: {pkg} {version} se acaba de actualizar; sin red de salida mientras se prueba su confianza",
     "{unit}: {pkg} {version} passed the trust checks; its network is back":

@@ -33,6 +33,7 @@ import random
 import re
 import shutil
 import subprocess
+import time
 from datetime import datetime, timedelta, timezone
 
 from arx import config
@@ -48,6 +49,8 @@ ID_HISTORY = 8        # cgroups recientes de cada servicio, para nombrarlo aunqu
 MAX_LIBS = 200
 LIBS_PER_SWEEP = 4    # servicios cuyas librerías se aprenden por barrido (dpkg -S por fichero cuesta)
 PREVENTIVE_MAX = 3    # servicios afectados por una actualización hasta los que se corta mientras se prueba
+MAX_EXECS = 64        # programas distintos que lanza un servicio; más, y no hay perfil de hijos que valga
+MAX_EXEC_FINDINGS = 20
 SYSTEMD_DIR = "/etc/systemd/system"
 DROPIN = "90-arx-profile.conf"
 # Se observan, pero no se les corta nada: dejar sin parches a un servidor porque su actualizador estrena
@@ -58,6 +61,9 @@ _OBSERVE_ONLY = re.compile(r"^(?:apt-daily(?:-upgrade)?|apt-news|esm-cache|unatt
                            r"arx-firewall|ubuntu-advantage|ua-[\w-]+|landscape-[\w-]+|cloud-init[\w-]*|"
                            r"cloud-config|cloud-final|apport[\w-]*|update-notifier[\w-]*|chrony|chronyd|ntp|"
                            r"ntpsec|openntpd|docker|containerd)\.service$")
+_SERVICE_PATH_RE = re.compile(r"^(?:[A-Za-z0-9@_.:\\-]+/)*system\.slice/[A-Za-z0-9@_.:\\-]{1,200}\.service$")
+# Lanzan lo que se les pida por diseño (tareas programadas) o tienen su propia regla (sshd)
+_EXEC_FREE = re.compile(r"^(?:cron|crond|anacron|atd|ssh|sshd|getty@[\w-]*|serial-getty@[\w-]*)\.service$")
 _PATH_RE = re.compile(r"^system\.slice/[A-Za-z0-9@_.:\\-]{1,200}\.service$")
 _ELEMENT_RE = re.compile(r'(?:"([^"]+)"|(\d+)) \. (tcp|udp) \. ([0-9a-fA-F.:/]+) \. (\d+)')
 _rng = random.SystemRandom()
@@ -666,6 +672,7 @@ def sweep(enforce: bool = False, cfg: dict | None = None, now: datetime | None =
                 subjects[path] = _new_subject(path, now, cfg)
         # versiones solo si dpkg cambió; lo ya actualizado se re-evalúa una hora (el modelo llega después)
         findings += _updates(subjects, cfg, now, check_versions=_dpkg_changed(st), enforce=enforce)
+        findings += _exec_events(subjects, now, cfg)
         active = vaccines._active()
         for fam in ("4", "6"):
             for cg, proto, ip, port in _elements(f"seen{fam}"):
@@ -704,6 +711,7 @@ def sweep(enforce: bool = False, cfg: dict | None = None, now: datetime | None =
             if s["dest"] and s.get("package"):
                 _doc_review_later(path, s, cfg)
             s["status"], s["watching_since"] = "watching", _iso(now)
+            s.setdefault("exec_until", _iso(now))  # lo que lanza se aprendió en la misma observación
             response.record({"kind": "profile_watching", "detail": s["unit"], "result": s["mode"]})
         for path, s in subjects.items():
             pending = s.pop("doc_pending", None)
@@ -740,6 +748,81 @@ def sweep(enforce: bool = False, cfg: dict | None = None, now: datetime | None =
     return findings
 
 
+# ── lo que lanzan los servicios (F18.2) ───────────────────────────────────────
+_unit_exec_cache: dict = {}
+
+
+def _unit_execs(unit: str) -> set[str]:
+    """Lo que su propio unit declara que ejecuta (arranque, recarga, parada) y las piezas de systemd."""
+    hit = _unit_exec_cache.get(unit)
+    if hit and time.monotonic() - hit[0] < 600:
+        return hit[1]
+    out = provenance_q(["systemctl", "show", unit, "-p", "ExecStartPre,ExecStart,ExecStartPost,ExecReload,"
+                        "ExecStop,ExecStopPost,ExecCondition"]) or ""
+    paths = set(re.findall(r"\bpath=(/\S+)", out))
+    paths |= {"/usr/lib/systemd/systemd-executor", "/lib/systemd/systemd-executor",
+              shutil.which("nft") or "/usr/sbin/nft"}  # el drop-in de Arx recarga su lista con nft
+    paths |= {os.path.realpath(p) for p in paths}
+    _unit_exec_cache[unit] = (time.monotonic(), paths)
+    return paths
+
+
+def _exec_phase(s: dict, now: datetime, cfg: dict) -> str:
+    """learn mientras se observa (o, en un servicio ya vigilado, durante su propia ventana), luego watch."""
+    if s.get("exec_open"):
+        return "open"
+    if s["status"] == "observing":
+        return "learn"
+    if not s.get("exec_until"):  # vigilado antes de existir esto: su propia ventana, con su azar
+        days = float(cfg.get("profile_observe_days", OBSERVE_DAYS))
+        jitter = float(cfg.get("profile_jitter_days", JITTER_DAYS))
+        s["exec_until"] = _iso(now + timedelta(days=days) + timedelta(seconds=_share(s["unit"], "exec") * jitter * 86400))
+    return "learn" if now < _parse(s["exec_until"]) else "watch"
+
+
+def _exec_finding(ev: dict, why: str) -> dict:
+    from arx.modules import provenance
+    unit = ev["unit"].rsplit("/", 1)[-1]
+    exe = ev["exe"]
+    if why == "sshd":
+        sev, harm = "crit", [tr("sshd ran a program before authentication (the xz backdoor pattern)")]
+        detail = tr("{unit}: sshd, before authenticating anyone, ran {exe}", unit=unit, exe=exe)
+    elif why == "webshell":
+        sev, harm = "high", [tr("a web or database service started a shell or a downloader")]
+        detail = tr("{unit} started {exe} as {user}", unit=unit, exe=exe, user=ev.get("parent_user") or "?")
+    else:
+        sev, harm = "high", provenance.harm_signals(exe, [ev["pid"]], {})
+        detail = tr("{unit} started {exe}, which it never ran while Arx observed it", unit=unit, exe=exe)
+    return {"sev": sev, "kind": "unexpected_exec", "detail": detail, "harm": harm,
+            "why": tr("a compromised program shows itself by what it starts"),
+            "target": {"pid": ev["pid"], "start": ev["start"], "exe": exe, "unit": unit,
+                       "stopped": bool(ev.get("stopped"))},
+            "set": "unexpected_exec", "item": f"{ev['unit']}|{exe}",
+            # uno por servicio y programa: los procesos siguientes se contienen bajo el mismo aviso
+            "fp_key": f"unexpected_exec|{ev['unit']}|{exe}"}
+
+
+def _exec_events(subjects: dict, now: datetime, cfg: dict) -> list[dict]:
+    """Aprende lo que lanza cada servicio mientras se le observa; después, lo nuevo se aísla y se avisa."""
+    from arx.modules import execwatch
+    findings = []
+    for ev in execwatch.drain():
+        s = subjects.get(ev["unit"])
+        why = "sshd" if ev.get("preauth") else "webshell" if execwatch.webshell(ev) else None
+        if not why and s and not (_EXEC_FREE.match(s["unit"]) or _OBSERVE_ONLY.match(s["unit"])):
+            phase = _exec_phase(s, now, cfg)
+            known = set(s.setdefault("execs", []))
+            if phase == "learn" and ev["exe"] not in known:
+                s["execs"].append(ev["exe"])
+                if len(s["execs"]) > MAX_EXECS:
+                    s["exec_open"] = True
+            elif phase == "watch" and ev["exe"] not in known | _unit_execs(s["unit"]):
+                why = "unexpected"
+        if why and (len(findings) < MAX_EXEC_FINDINGS or why == "sshd"):
+            findings.append(_exec_finding(ev, why))  # cada pid cuenta: el aviso, uno por servicio y programa
+    return findings
+
+
 def _cleanup_dead() -> None:
     """Lo cargado para un cgroup que ya no existe (el servicio se reinició) sobra: fuera."""
     for name in ("ok4", "ok6"):
@@ -748,6 +831,23 @@ def _cleanup_dead() -> None:
                 _nft("delete", "element", "inet", "arx", name, f"{{ {cg} . {proto} . {net} . {port} }}")
     for m in re.finditer(r"(?<![\w\"/.])(\d+)(?=\s*[,}])", _nft_out("list", "set", "inet", "arx", "watched2")):
         _nft("delete", "element", "inet", "arx", "watched2", f"{{ {m.group(1)} }}")
+
+
+def accept_exec(item: str) -> bool:
+    """«Que lance esto es normal»: entra en lo aprendido del servicio (en sshd, en lo que puede lanzar
+    antes de autenticar). Lo decide una persona."""
+    path, sep, exe = str(item).partition("|")
+    if not (sep and _SERVICE_PATH_RE.match(path) and exe.startswith("/") and "|" not in exe):
+        return False
+    with config.locked("profiles"):
+        st = load()
+        s = (st.get("subjects") or {}).get(path)
+        if s is not None and exe not in s.setdefault("execs", []):
+            s["execs"].append(exe)
+        if re.search(r"/sshd?\.service$", path):
+            st["sshd_allowed"] = sorted(set(st.get("sshd_allowed") or []) | {exe})
+        _save(st)
+    return True
 
 
 def accept(item: str) -> bool:
