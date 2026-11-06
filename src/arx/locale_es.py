@@ -103,6 +103,16 @@ ES = {
         "servicio crítico ({unit}): no se confina solo",
     "invalid service: nothing confined":
         "servicio no válido: no se confina nada",
+    "{unit}: {pkg} {version} was just updated; no outbound network while its trust is checked":
+        "{unit}: {pkg} {version} se acaba de actualizar; sin red de salida mientras se prueba su confianza",
+    "{unit}: {pkg} {version} passed the trust checks; its network is back":
+        "{unit}: {pkg} {version} pasó las pruebas de confianza; vuelve a tener red",
+    "updater, clock or container service ({unit}): alert only":
+        "servicio de actualización, hora o contenedores ({unit}): solo se avisa",
+    "the trust checks did not finish in {s} s":
+        "las pruebas de confianza no terminaron en {s} s",
+    "too many trust checks waiting":
+        "demasiadas pruebas de confianza en espera",
     "  {n} confined service(s) or program(s) got their network back.":
         "  {n} servicio(s) o programa(s) confinado(s) recuperaron la red.",
     "service marked out-of-bounds":

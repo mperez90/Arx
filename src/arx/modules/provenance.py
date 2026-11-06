@@ -341,10 +341,12 @@ def verify_file(path: str, deep: bool = False) -> dict:
     if not signed:
         return {"verified": False, "package": pkg, "reason": where}
     from arx.modules import trust  # perezoso: trust importa este módulo
-    t = trust.assess(pkg, deep=deep)
-    if not t["trusted"]:  # firmado pero envenenado: la procedencia sola no lo ve
+    # sin esperar: si las pruebas de confianza aún no están, manda la procedencia, y el resultado llega
+    # por la vigilancia del servicio (que confina lo que no pase)
+    t = trust.assess_async(pkg, deep=deep)
+    if t["state"] == "done" and not t["trusted"]:  # firmado pero envenenado: la procedencia sola no lo ve
         return {"verified": False, "package": pkg, "origin": where, "trust": t["score"], "reason": t["reason"]}
-    return {"verified": True, "package": pkg, "origin": where, "trust": t["score"],
+    return {"verified": True, "package": pkg, "origin": where, "trust": t.get("score"),
             "reason": tr("package {pkg} from a signed repository, intact", pkg=pkg)}
 
 

@@ -25,11 +25,13 @@ import hashlib
 import io
 import json
 import os
+import queue
 import re
 import shutil
 import subprocess
 import tarfile
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -357,6 +359,77 @@ def assess(pkg: str, deep: bool = False, now: datetime | None = None) -> dict:
         reason += f": {worst.get('detail') or worst.get('why', '')}"
     return {"score": s, "trusted": s >= TRUST_MIN, "checks": checks, "concerns": concerns, "reason": reason,
             "facts": f}
+
+
+# ── sin frenar la guardia: las pruebas lentas van a un hilo ───────────────────
+ASSESS_TIMEOUT_S = 1200  # sin veredicto en este tiempo, lo contenido sigue contenido y se avisa
+MAX_QUEUE = 16
+_queue: queue.Queue = queue.Queue(maxsize=MAX_QUEUE)
+_jobs: dict[str, float] = {}  # "paquete=versión|modo" → cuándo se pidió
+_jobs_lock = threading.Lock()
+_worker: list = []
+
+
+def cached(pkg: str, deep: bool = False) -> dict | None:
+    """El veredicto si sus pruebas ya están hechas (o lo decidió una persona); None si no. Nunca sale a la
+    red: con la caché, `assess` solo vuelve a sumar, con los reparos del modelo más recientes."""
+    f = package_facts(pkg)
+    if not f:
+        return {"score": 0.0, "trusted": False, "checks": [], "reason": tr("unknown package")}
+    with config.locked("trust"):
+        cache = config.read_json(_cache_path(), {}) or {}
+    hit = cache.get(f"{f['package']}={f['version']}|{'deep' if deep else 'quick'}")
+    if f"{f['package']}={f['version']}|accepted" in cache or \
+            (hit and time.time() - hit.get("t", 0) < CACHE_DAYS * 86400):
+        return assess(pkg, deep=deep)
+    return None
+
+
+def assess_async(pkg: str, deep: bool = True) -> dict:
+    """Como `assess`, sin esperar: {"state": "done", ...} con el veredicto, {"state": "pending"} mientras un
+    hilo prueba (una vez por versión), o "timeout"/"full" — sin veredicto a tiempo: no es de fiar."""
+    done = cached(pkg, deep)
+    if done is not None:
+        return {"state": "done", **done}
+    f = package_facts(pkg) or {}
+    key = f"{f.get('package')}={f.get('version')}|{'deep' if deep else 'quick'}"
+    with _jobs_lock:
+        since = _jobs.get(key)
+        if since is not None:
+            if time.monotonic() - since > ASSESS_TIMEOUT_S:
+                return {"state": "timeout", "trusted": False, "score": 0.0,
+                        "reason": tr("the trust checks did not finish in {s} s", s=ASSESS_TIMEOUT_S)}
+            return {"state": "pending"}
+        try:
+            _queue.put_nowait((pkg, deep, key))
+        except queue.Full:
+            return {"state": "full", "trusted": False, "score": 0.0,
+                    "reason": tr("too many trust checks waiting")}
+        _jobs[key] = time.monotonic()
+        if not (_worker and _worker[0].is_alive()):
+            _worker[:] = [threading.Thread(target=_work, name="arx-trust", daemon=True)]
+            _worker[0].start()
+    return {"state": "pending"}
+
+
+def _work_once(block: bool = True) -> bool:
+    try:
+        pkg, deep, key = _queue.get(block=block)
+    except queue.Empty:
+        return False
+    try:
+        assess(pkg, deep=deep)  # deja el veredicto en la caché
+    except Exception:  # sin caché, la próxima petición lo vuelve a intentar
+        pass
+    finally:
+        with _jobs_lock:
+            _jobs.pop(key, None)
+    return True
+
+
+def _work() -> None:
+    while True:
+        _work_once()
 
 
 def accept(item: str) -> bool:

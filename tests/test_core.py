@@ -5134,7 +5134,8 @@ class ConfinementTests(unittest.TestCase):
         from arx.modules import trust
         f = self._update()
         o = self.r.handle(f, enforce=True, cfg={})
-        self.assertTrue(self.r._load_blocks())
+        self.r.handle({**f, "fp_key": f["fp_key"] + "|verdict"}, enforce=True, cfg={})  # preventivo + veredicto
+        self.assertEqual(len(self.r._load_blocks()), 2)
         self.assertIn("✓", self.r.accept(o["fp"]))
         self.assertEqual(self.r._load_blocks(), [])
         with mock.patch.object(trust, "package_facts", lambda pkg: {"package": "app", "version": "2.0"}):
@@ -5370,7 +5371,7 @@ class BehaviorWatchTests(unittest.TestCase):
             self.addCleanup(p.stop)
         from arx.modules import trust
         self.trust = {"trusted": True, "score": 1.0, "reason": "ok"}
-        self.trust_of, self.installed, self.libs = {}, {}, {}
+        self.trust_of, self.installed, self.libs, self.state_of = {}, {}, {}, {}
         self.investigated = []
         for obj, name, value in [(profile, "_cgroup_exists", lambda path: True),
                                  (profile, "_cgroup_id", lambda path: None),
@@ -5378,7 +5379,8 @@ class BehaviorWatchTests(unittest.TestCase):
                                  (profile, "_installed_versions", lambda: dict(self.installed)),
                                  (profile, "_library_packages", lambda unit, own: {
                                      p: v for p, v in self.installed.items() if p in self.libs.get(unit, ())}),
-                                 (trust, "assess", lambda pkg, deep=False: dict(self.trust_of.get(pkg, self.trust))),
+                                 (trust, "assess_async", lambda pkg, deep=True: {
+                                     "state": self.state_of.get(pkg, "done"), **self.trust_of.get(pkg, self.trust)}),
                                  (profile, "_investigate_later", lambda pkg, why, cfg: self.investigated.append(why)),
                                  (profile, "_dpkg_changed", lambda st: True)]:
             p = mock.patch.object(obj, name, value)
@@ -5485,7 +5487,39 @@ class BehaviorWatchTests(unittest.TestCase):
         # a la unidad, no a un ejecutable: su proceso principal puede ser un `sh` que comparten todos
         self.assertEqual(found[0]["target"], {"unit": "app.service", "cgroup": "system.slice/app.service"})
         self.assertEqual(found[0]["item"], "pkg=2.0")
+        self.assertTrue(found[0]["fp_key"].endswith("|verdict"))
         self.assertEqual(self.r.classify(found[0])["tier"], 1)
+
+    def test_while_its_trust_is_checked_the_service_has_no_outbound_network(self):
+        """A#2: las pruebas lentas van en un hilo; mientras, confinamiento preventivo (solo salida)."""
+        self._sweep(0)
+        self._sweep(11, enforce=True)
+        self.state_of["pkg"] = "pending"
+        with mock.patch.object(self.p, "_package_version", lambda unit: ("pkg", "2.0")):
+            found = [f for f in self._sweep(12, enforce=True) if f["kind"] == "untrusted_update"]
+            self.assertEqual(len(found), 1)  # app; sshd es crítico: solo se avisará con el veredicto
+            self.assertIn("no outbound network while its trust is checked", found[0]["detail"])
+            self.assertEqual(found[0]["fp_key"], "untrusted_update|system.slice/app.service|pkg=2.0")
+            self.assertEqual(self.r.classify(found[0])["tier"], 1)
+            self.assertEqual(self._sweep(12.001, enforce=True), [])  # una vez
+            del self.state_of["pkg"]  # llegó el veredicto: de fiar
+            released = []
+            with mock.patch.object(self.r, "forget", lambda fp: released.append(fp) or {"fp": fp}):
+                self.assertEqual(self._sweep(12.002, enforce=True), [])
+        self.assertEqual(released, [self.r.fingerprint({"fp_key": "untrusted_update|system.slice/app.service|pkg=2.0"})])
+        self.assertEqual(self.p.load()["subjects"]["system.slice/app.service"]["held"], {})
+
+    def test_without_enforce_nothing_is_held_and_critical_or_updater_services_only_alert(self):
+        self._sweep(0)
+        self._sweep(11)
+        self.state_of["pkg"] = "pending"
+        with mock.patch.object(self.p, "_package_version", lambda unit: ("pkg", "2.0")):
+            self.assertEqual([f for f in self._sweep(12) if f["kind"] == "untrusted_update"], [])
+            self.state_of["pkg"] = "done"
+            self.trust = {"trusted": False, "score": 0.0, "reason": "trust 0.00 of 0.98: x"}
+            found = {f["target"]["unit"]: f for f in self._sweep(12.01, enforce=True) if f["kind"] == "untrusted_update"}
+        self.assertIsNone(self.r.protected_reason(found["app.service"], {}))
+        self.assertIn("sshd.service", self.r.protected_reason(found["sshd.service"], {}))
 
     def test_an_untrusted_update_of_a_library_the_service_loads_counts_too(self):
         """xz: sshd no cambió; cambió liblzma, que sshd cargaba. Se confina a quien la carga."""
@@ -5749,6 +5783,43 @@ class TrustTests(unittest.TestCase):
     def _c(self, name, result, required=False):
         return {"name": name, "result": result, "detail": name, "required": required}
 
+    def test_slow_checks_never_hold_the_sweep(self):
+        """A#2: una descarga colgada no retrasa al llamador; una vez por versión; sin veredicto a tiempo,
+        no es de fiar; y con la cola llena, tampoco."""
+        import queue
+        import threading
+        gate, calls = threading.Event(), []
+        f = {"package": "nginx", "version": "1.24", "arch": "all", "source": "nginx", "source_version": "1.24"}
+
+        def slow(pkg, deep=False, now=None):
+            calls.append(pkg)
+            gate.wait(10)
+            self.t.note_concerns  # noqa: B018 (nada: solo esperar)
+        q = queue.Queue(maxsize=2)
+        for obj, name, value in [(self.t, "package_facts", lambda pkg: dict(f, package=pkg)),
+                                 (self.t, "cached", lambda pkg, deep=False: None), (self.t, "assess", slow),
+                                 (self.t, "_queue", q), (self.t, "_jobs", {}), (self.t, "_worker", [])]:
+            p = mock.patch.object(obj, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+        self.addCleanup(gate.set)
+        start = time.monotonic()
+        self.assertEqual(self.t.assess_async("nginx")["state"], "pending")
+        self.assertEqual(self.t.assess_async("nginx")["state"], "pending")  # la misma versión no se repite
+        self.assertLess(time.monotonic() - start, 1.0)
+        for _ in range(50):
+            if calls:
+                break
+            time.sleep(0.02)
+        self.assertEqual(calls, ["nginx"])
+        self.assertEqual(self.t.assess_async("a")["state"], "pending")
+        self.assertEqual(self.t.assess_async("b")["state"], "pending")
+        full = self.t.assess_async("c")
+        self.assertEqual((full["state"], full["trusted"]), ("full", False))
+        with mock.patch.object(self.t, "ASSESS_TIMEOUT_S", -1):
+            late = self.t.assess_async("nginx")
+        self.assertEqual((late["state"], late["trusted"]), ("timeout", False))
+
     def test_the_threshold(self):
         ok = [self._c("signed_repository", "pass", True), self._c("files_intact", "pass", True),
               self._c("install_scripts", "pass", True), self._c("known_malicious", "pass"),
@@ -5821,11 +5892,21 @@ class TrustTests(unittest.TestCase):
                 mock.patch.object(provenance, "package_of", lambda p: "xz-utils"), \
                 mock.patch.object(provenance, "intact", lambda p, pkg: True), \
                 mock.patch.object(provenance, "signed_origin", lambda pkg: (True, "http://deb")), \
-                mock.patch.object(self.t, "assess", lambda pkg, deep=False: {
-                    "score": 0.0, "trusted": False, "reason": "trust 0.00 of 0.98: known as malicious"}):
+                mock.patch.object(self.t, "assess_async", lambda pkg, deep=True: {
+                    "state": "done", "score": 0.0, "trusted": False, "reason": "trust 0.00 of 0.98: known as malicious"}):
             r = provenance.verify_file("/usr/bin/xz")
         self.assertFalse(r["verified"])
         self.assertIn("malicious", r["reason"])
+
+    def test_provenance_never_waits_for_the_slow_checks(self):
+        """Pendiente: manda la procedencia (como antes de las capas) y el veredicto llega por la vigilancia."""
+        from arx.modules import provenance
+        with mock.patch.object(provenance, "available", lambda: True), \
+                mock.patch.object(provenance, "package_of", lambda p: "nginx"), \
+                mock.patch.object(provenance, "intact", lambda p, pkg: True), \
+                mock.patch.object(provenance, "signed_origin", lambda pkg: (True, "http://deb")), \
+                mock.patch.object(self.t, "assess_async", lambda pkg, deep=True: {"state": "pending"}):
+            self.assertTrue(provenance.verify_file("/usr/sbin/nginx", deep=True)["verified"])
 
     def test_model_concerns_lower_it_until_a_person_decides(self):
         checks = [self._c("signed_repository", "pass", True), self._c("files_intact", "pass", True),

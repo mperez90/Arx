@@ -288,6 +288,8 @@ def protected_reason(finding: dict, cfg: dict | None = None) -> str | None:
         unit = str(target.get("unit") or "")
         if _PROTECTED_UNITS.match(unit):
             return tr("critical service ({unit}): it is not confined on its own", unit=unit)
+        if target.get("alert_only"):
+            return tr("updater, clock or container service ({unit}): alert only", unit=unit)
         if any(t and t in unit for t in oob):
             return tr("service marked out-of-bounds")
     if kind in ("executables", "processes"):
@@ -1282,6 +1284,11 @@ def accept(fp: str) -> str | None:
         return tr("Could not update the baseline (does it exist and contain that set?).")
     contained = _active_block(fp)
     forget(fp)
+    if e["set"] == "untrusted_update":  # el preventivo y el veredicto de esa versión: los dos se levantan
+        for other, oe in list(load_findings().items()):
+            if oe.get("set") == "untrusted_update" and oe.get("item") == e["item"]:
+                contained = _active_block(other) or contained
+                forget(other)
     record({"kind": "accepted", "detail": e.get("detail")})
     out = [tr("✓ Accepted as normal: {item}", item=e['item']) + (tr("  ·  its block has been lifted") if contained else "")]
     if e.get("vaccine") and vaccines.note_false_positive(e["vaccine"]):  # a la tercera se retira sola

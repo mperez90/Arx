@@ -451,12 +451,13 @@ def _investigate_later(pkg: str, why: str, cfg: dict) -> None:
     threading.Thread(target=run, name=f"arx-investigate-{pkg}", daemon=True).start()
 
 
-def _updates(subjects: dict, cfg: dict, now: datetime, check_versions: bool = True) -> list[dict]:
+def _updates(subjects: dict, cfg: dict, now: datetime, check_versions: bool = True,
+             enforce: bool = False) -> list[dict]:
     """Una actualización es justo cuando llegaría una versión firmada con código malicioso: se evalúa con
     todas las capas, el modelo investiga si lo hay, y lo que no llegue a la confianza mínima queda
     confinado sin red (sigue atendiendo) hasta que una persona decida. Cuenta igual una actualización
     de las librerías que el servicio carga."""
-    from arx.modules import trust
+    from arx.modules import response, trust
     findings = []
     installed = _installed_versions() if check_versions else {}
     learned = 0
@@ -493,22 +494,35 @@ def _updates(subjects: dict, cfg: dict, now: datetime, check_versions: bool = Tr
         if (now - since).total_seconds() > RECHECK_S:
             s.pop("recheck", None)
             s.pop("recheck_libs", None)
+        held = s.setdefault("held", {})
+        alert_only = bool(_OBSERVE_ONLY.match(s["unit"]) or response._PROTECTED_UNITS.match(s["unit"]))
         for p in [pkg, *(s.get("recheck_libs") or [])]:
-            t = trust.assess(p, deep=True)
-            if t["trusted"]:
+            t = trust.assess_async(p, deep=True)  # las pruebas lentas, en un hilo: el barrido no espera
+            pv = version if p == pkg else (s.get("libs") or {}).get(p)
+            key = f"untrusted_update|{path}|{p}={pv}"
+            base = {"sev": "high", "kind": "untrusted_update", "set": "untrusted_update", "item": f"{p}={pv}",
+                    "why": tr("an update is when a signed but poisoned version arrives"),
+                    # a la unidad, no a un ejecutable: el proceso principal puede ser un intérprete
+                    # compartido (sh, python) y confinar por ejecutable tocaría todos sus procesos
+                    "target": {"unit": s["unit"], "cgroup": path, **({"alert_only": True} if alert_only else {})}}
+            if t["state"] == "pending":
+                if enforce and not alert_only and key not in held:  # mientras se prueba, sin salida
+                    held[key] = _iso(now)
+                    findings.append({**base, "fp_key": key, "detail": tr(
+                        "{unit}: {pkg} {version} was just updated; no outbound network while its trust is checked",
+                        unit=s["unit"], pkg=p, version=pv)})
                 continue
-            pv = (t.get("facts") or {}).get("version") or version
+            if t["trusted"]:
+                if held.pop(key, None) and response.forget(response.fingerprint({"fp_key": key})):
+                    response.record({"kind": "trust_confirmed", "detail": tr(
+                        "{unit}: {pkg} {version} passed the trust checks; its network is back",
+                        unit=s["unit"], pkg=p, version=pv)})
+                continue
             detail = (tr("{unit} was updated to {new} and cannot be trusted: {reason}",
-                         unit=s["unit"], new=version, reason=t["reason"]) if p == pkg else
+                         unit=s["unit"], new=pv, reason=t["reason"]) if p == pkg else
                       tr("{unit} loads {lib} {new}, just updated, which cannot be trusted: {reason}",
                          unit=s["unit"], lib=p, new=pv, reason=t["reason"]))
-            # a la unidad, no a un ejecutable: el proceso principal puede ser un intérprete compartido
-            # (sh, python) y confinar por ejecutable tocaría todos sus procesos del host
-            findings.append({"sev": "high", "kind": "untrusted_update", "set": "untrusted_update",
-                             "item": f"{p}={pv}", "detail": detail,
-                             "why": tr("an update is when a signed but poisoned version arrives"),
-                             "target": {"unit": s["unit"], "cgroup": path},
-                             "fp_key": f"untrusted_update|{path}|{p}={pv}"})
+            findings.append({**base, "fp_key": f"{key}|verdict", "detail": detail})
     return findings
 
 
@@ -622,7 +636,7 @@ def sweep(enforce: bool = False, cfg: dict | None = None, now: datetime | None =
             if path not in subjects and path not in confined and _PATH_RE.match(path):
                 subjects[path] = _new_subject(path, now, cfg)
         # versiones solo si dpkg cambió; lo ya actualizado se re-evalúa una hora (el modelo llega después)
-        findings += _updates(subjects, cfg, now, check_versions=_dpkg_changed(st))
+        findings += _updates(subjects, cfg, now, check_versions=_dpkg_changed(st), enforce=enforce)
         active = vaccines._active()
         for fam in ("4", "6"):
             for cg, proto, ip, port in _elements(f"seen{fam}"):
