@@ -1888,13 +1888,14 @@ def _confine_pid(pid: int) -> dict | None:
     return _adopt_into_scope(pid)
 
 
-def _adopt_into_scope(pid: int) -> dict | None:
-    """Mueve el proceso a un scope propio y lo deja sin red: solo él, no su servicio."""
+def _adopt_into_scope(pid: int, also: list[int] | None = None) -> dict | None:
+    """Mueve el proceso (y `also`, su familia) a un scope propio y lo deja sin red: solo ellos, no su servicio."""
     scope = f"arxconfine-{pid}.scope"
+    pids = [pid] + [p for p in also or [] if isinstance(p, int) and p > 1 and p != pid]
     try:
         r = subprocess.run(["busctl", "call", "org.freedesktop.systemd1", "/org/freedesktop/systemd1",
                             "org.freedesktop.systemd1.Manager", "StartTransientUnit",
-                            "ssa(sv)a(sa(sv))", scope, "fail", "2", "PIDs", "au", "1", str(pid),
+                            "ssa(sv)a(sa(sv))", scope, "fail", "2", "PIDs", "au", str(len(pids)), *map(str, pids),
                             "Slice", "s", _CONFINE_SLICE, "0"],
                            capture_output=True, text=True, timeout=15)
     except (OSError, subprocess.TimeoutExpired):
@@ -1972,10 +1973,12 @@ def _release_confinement(revert: dict) -> str:
         _nft_cgroup("delete", str(sc.get("set")), str(sc.get("path", "")))
         done.append(f"pid {sc.get('pid')}")
     exe = revert.get("exe")
+    exes = revert.get("stopped_exes") if isinstance(revert.get("stopped_exes"), dict) else {}
     for pid in revert.get("stopped") or []:
         try:  # anti reutilización de PID: solo si sigue siendo el mismo programa
-            if isinstance(pid, int) and pid > 1 and isinstance(exe, str) and \
-                    os.readlink(f"/proc/{pid}/exe").removesuffix(" (deleted)") == exe:
+            mine = exes.get(str(pid), exe)  # cada miembro de la familia, con su propio programa
+            if isinstance(pid, int) and pid > 1 and isinstance(mine, str) and \
+                    os.readlink(f"/proc/{pid}/exe").removesuffix(" (deleted)") == mine:
                 os.kill(pid, signal.SIGCONT)
                 done.append(f"pid {pid}")
         except OSError:
@@ -2093,13 +2096,16 @@ def _contain_process(target: dict, finding: dict) -> tuple[str, dict | None]:
     if "arx.service" in (_cgroup_of(pid) or ""):
         return tr("critical process ({base})", base="arx"), None
     stopped = bool(target.get("stopped"))
+    family = [m for m in target.get("family") or [] if isinstance(m, dict) and isinstance(m.get("pid"), int)
+              and execwatch.same_process(m["pid"], str(m.get("exe") or ""), m.get("start"))]
     if finding.get("harm") and not stopped:
         try:
             os.kill(pid, signal.SIGSTOP)
             stopped = True
         except OSError:
             pass
-    scope = _adopt_into_scope(pid) if _can_confine() else None
+        family += execwatch.freeze_family(pid)  # lo que ya lanzó, también
+    scope = _adopt_into_scope(pid, [m["pid"] for m in family]) if _can_confine() else None
     if not scope and not stopped:  # lo que no se puede aislar se congela: nunca libre y con red
         try:
             os.kill(pid, signal.SIGSTOP)
@@ -2107,7 +2113,8 @@ def _contain_process(target: dict, finding: dict) -> tuple[str, dict | None]:
         except OSError:
             return tr("could not suspend (race or permissions)"), None
     revert = {"tool": "confine", "exe": exe, "pid_only": True, "units": [], "scopes": [scope] if scope else [],
-              "stopped": [pid] if stopped else []}
+              "stopped": ([pid] + [m["pid"] for m in family]) if stopped else [],
+              "stopped_exes": {str(m["pid"]): m["exe"] for m in family}}
     register_block(finding, revert, ttl_min=None)
     parts = [tr("pid {pid} ({exe}) without network", pid=pid, exe=exe)] if scope else []
     if stopped:
