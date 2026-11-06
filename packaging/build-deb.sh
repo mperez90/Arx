@@ -71,14 +71,26 @@ chmod 0755 "$PKG/DEBIAN/postinst"
 cat > "$PKG/DEBIAN/prerm" <<'EOF'
 #!/bin/sh
 set -e
+# Sin Arx no queda nada suyo: lo que confinó recupera la red, y sus units, drop-ins y tabla nft se van.
 if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
   if [ -d /run/systemd/system ]; then
-    systemctl disable --now arx 2>/dev/null || true
+    arx service uninstall >/dev/null 2>&1 || systemctl disable --now arx arx-firewall 2>/dev/null || true
   fi
 fi
 exit 0
 EOF
 chmod 0755 "$PKG/DEBIAN/prerm"
+
+cat > "$PKG/DEBIAN/postrm" <<'EOF'
+#!/bin/sh
+set -e
+# purge: también la configuración (claves de API, la palabra) y el estado
+if [ "$1" = "purge" ]; then
+  rm -rf /etc/arx /var/lib/arx
+fi
+exit 0
+EOF
+chmod 0755 "$PKG/DEBIAN/postrm"
 
 # 3) empaquetar
 mkdir -p "$ROOT/dist"

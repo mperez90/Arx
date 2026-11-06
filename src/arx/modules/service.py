@@ -147,6 +147,8 @@ def uninstall() -> int:
     released = response.release_all_confinements()
     if released:
         print(tr("  {n} confined service(s) or program(s) got their network back.", n=released))
+    if shutil.which("nft"):  # bloqueos, sets y reglas: sin Arx, nadie los gestionaría
+        subprocess.run(["nft", "delete", "table", "inet", "arx"], capture_output=True, check=False)
     for unit in (UNIT_PATH, EARLY_UNIT_PATH):
         try:
             Path(unit).unlink()
