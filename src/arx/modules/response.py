@@ -180,9 +180,11 @@ def _incidents_path():
 
 
 def record(entry: dict) -> None:
+    """Al registro de incidentes, nunca un secreto: claves de API, licencia, token del bot (DoD-9)."""
     import json
 
-    entry = {"at": _iso(_now()), **entry}
+    from arx import redact
+    entry = {"at": _iso(_now()), **{k: redact.scrub(v) if isinstance(v, str) else v for k, v in entry.items()}}
     fd = os.open(_incidents_path(), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
     with os.fdopen(fd, "a", encoding="utf-8", errors="backslashreplace") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")

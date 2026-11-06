@@ -3944,6 +3944,47 @@ class ExecWatchTests(unittest.TestCase):
         self.assertFalse(self.p.accept_exec("../etc|/x"))
 
 
+class RedactionTests(unittest.TestCase):
+    """DoD-9: claves de API, licencias y tokens jamás en logs: incidentes, journal ni errores del motor."""
+
+    KEY, TOKEN = "sk-ant-api03-SECRETOSECRETO1234", "123456789:AAH-bot-secret-token-xyz"
+    LIC, ACT = "ARX-LIC-ABCDEF-123456", "act-9f8e7d6c5b"
+
+    def setUp(self):
+        self.d = _isolate()
+        from arx import config, license
+        config.save_secrets({"anthropic": self.KEY, "telegram_token": self.TOKEN})
+        license.save({"key": self.LIC, "activation_id": self.ACT})
+        self.secrets = (self.KEY, self.TOKEN, self.LIC, self.ACT)
+
+    def test_nothing_secret_reaches_any_log(self):
+        import contextlib
+        import urllib.error
+        from arx import config, engine
+        from arx.modules import guard, response
+        leak = " ".join(self.secrets)
+        response.record({"kind": "incident", "detail": f"cmdline: curl -H 'x-api-key: {leak}'", "result": leak})
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            guard._print_sweep([{"sev": "high", "detail": f"proceso con {leak}"}],
+                               [{"new": True, "tier": 0, "status": leak}], verbose=False)
+
+        def post(url, headers, payload):
+            raise urllib.error.URLError(f"http://user:{self.KEY}@proxy.local refused")
+        eng = engine.Engine({"providers": {"anthropic": "claude-x"}, "fallback_order": ["anthropic"]}, post=post)
+        with self.assertRaises(engine.ProviderError) as err:
+            eng.ask([{"role": "user", "content": "hola"}])
+        texts = [out.getvalue(), str(err.exception)]
+        for root, _, files in os.walk(config.state_dir()):
+            for name in files:
+                if name not in ("license.json",):  # su almacén legítimo (0600)
+                    texts.append(open(os.path.join(root, name), encoding="utf-8", errors="replace").read())
+        for text in texts:
+            for secret in self.secrets:
+                self.assertNotIn(secret, text)
+        self.assertIn("redact", texts[0] + texts[1])
+
+
 class TotpTests(unittest.TestCase):
     def setUp(self):
         from arx import totp
@@ -5501,7 +5542,11 @@ class ConfinementTests(unittest.TestCase):
 
     def test_the_boot_unit_runs_after_the_nftables_flush_and_before_the_network(self):
         from arx.modules import service
+        unit = service.unit_text("/usr/bin/arx")
+        for line in ("MemoryMax=", "CPUQuota=", "TasksMax=", "OOMScoreAdjust=", "StartLimitBurst="):
+            self.assertIn(line, unit)  # DoD-8: Arx nunca tumba el host
         text = service.early_unit_text("/usr/bin/arx")
+        self.assertIn("TimeoutStartSec=30", text)  # antes de la red: nunca retiene el arranque
         for line in ("DefaultDependencies=no", "After=local-fs.target nftables.service",
                      "Before=network-pre.target arx.service", "ExecStart=/usr/bin/arx service restore",
                      "WantedBy=sysinit.target"):
@@ -6051,6 +6096,40 @@ class TrustTests(unittest.TestCase):
 
     def _c(self, name, result, required=False):
         return {"name": name, "result": result, "detail": name, "required": required}
+
+    def test_the_repository_copy_is_compared_streaming_file_by_file(self):
+        """DoD-8: un paquete grande no puede llevar a Arx a su tope de memoria: tar y hashes en streaming."""
+        import io
+        import tarfile
+        root = tempfile.mkdtemp()
+        for name, data in (("same", b"oficial"), ("changed", b"alterado")):
+            with open(os.path.join(root, name), "wb") as f:
+                f.write(data)
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w") as tar:
+            for name, data in (("same", b"oficial"), ("changed", b"oficial")):
+                info = tarfile.TarInfo("." + os.path.join(root, name))
+                info.size = len(data)
+                tar.addfile(info, io.BytesIO(data))
+        deb = os.path.join(root, "pkg.deb")
+        open(deb, "wb").write(b"x")
+
+        class Proc:
+            stdout = io.BytesIO(buf.getvalue())
+
+            def kill(self):
+                pass
+
+            def wait(self):
+                pass
+        with mock.patch.object(self.t, "_cached_deb", lambda f: deb), \
+                mock.patch.object(self.t.shutil, "which", lambda name: "/usr/bin/" + name), \
+                mock.patch.object(self.t, "_conffiles", lambda pkg: set()), \
+                mock.patch.object(self.t.subprocess, "Popen", lambda *a, **k: Proc()):
+            c = self.t.check_repository_copy({"package": "acme", "version": "1.0"})
+        self.assertEqual(c["result"], "fail")
+        self.assertIn(os.path.join(root, "changed"), c["detail"])
+        self.assertNotIn(os.path.join(root, "same"), c["detail"])
 
     def test_the_deb_apt_just_installed_is_used_only_if_the_signed_index_vouches_for_it(self):
         import hashlib

@@ -336,8 +336,8 @@ def _print_sweep(findings: list[dict], outcomes: list[dict], verbose: bool) -> N
     shown = 0
     for f, o in zip(findings, outcomes):
         if verbose or o.get("new"):
-            print(f"  [{f['sev']:>4}] {f['detail']}")
-            print(f"         → Tier {o['tier']}: {o['status']}")
+            print(redact.scrub(f"  [{f['sev']:>4}] {f['detail']}"))  # el journal también es un log
+            print(redact.scrub(f"         → Tier {o['tier']}: {o['status']}"))
             shown += 1
     if shown < len(findings):
         print(tr("  ({v} finding(s) already known, unchanged; see: arx status)",

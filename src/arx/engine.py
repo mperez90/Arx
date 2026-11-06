@@ -17,7 +17,7 @@ import json
 import urllib.error
 import urllib.request
 
-from arx import __version__, config
+from arx import __version__, config, redact
 from arx.i18n import tr
 
 # Endpoints compatibles con el esquema OpenAI (chat/completions).
@@ -106,6 +106,6 @@ class Engine:
                 url, headers, payload = _build(prov, key, model, system, messages, self.max_tokens, self.cfg)
                 return _parse(prov, self._post(url, headers, payload)), prov
             except (urllib.error.URLError, KeyError, IndexError, ProviderError, TimeoutError, OSError) as e:
-                errors.append(f"{prov}: {e}")
+                errors.append(f"{prov}: {redact.scrub(str(e))}")  # una URL con credenciales no sale en el error
                 continue
         raise ProviderError(tr("no provider responded: ") + "; ".join(errors))
