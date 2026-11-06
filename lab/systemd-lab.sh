@@ -32,7 +32,9 @@ if wait_for 70 bash -c "docker exec $VIC sh -c 'ps -o stat= -p \$(pgrep -f ^/tmp
 # confinar por cgroup (el de Docker Desktop no deja), lo seguro es suspenderlo y decirlo. Ninguna otra
 # salida vale. El confinamiento real se mide en lab/lima-lab.sh, en un kernel de verdad.
 home_contained() {
-  if docker exec "$VIC" nft list set inet arx confined2 2>/dev/null | grep -q dropper2.service; then
+  # cualquier set de confinamiento: en un contenedor que comparte el árbol del host el servicio cuelga
+  # más hondo (confined4), y anclado a la raíz del PID 1 Arx ya puede confinarlo
+  if docker exec "$VIC" nft list table inet arx 2>/dev/null | grep -q dropper2.service; then
     ! docker exec "$VIC" sh -c 'ps -o stat= -p $(pgrep -f ^/home/bob/minero | head -1)' 2>/dev/null | grep -q T
   else
     docker exec "$VIC" sh -c 'ps -o stat= -p $(pgrep -f ^/home/bob/minero | head -1)' 2>/dev/null | grep -q T \
