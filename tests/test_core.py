@@ -4141,6 +4141,13 @@ class SelfProtectionTests(unittest.TestCase):
             self.s.stopped(env, notify_send=sent.append)
         self.assertEqual(len(sent), 2)  # no se traga una parada de verdad
         self.assertFalse(os.path.exists(self.s.PLANNED_STOP))
+        open(self.s.PLANNED_STOP, "w").close()
+        old = time.time() - 3600
+        os.utime(self.s.PLANNED_STOP, (old, old))  # una marca vieja (de una desinstalación con Arx ya parado)
+        with mock.patch.object(self.s.subprocess, "run", lambda *a, **k: R()):
+            self.s.stopped(env, notify_send=sent.append)
+        self.assertEqual(len(sent), 2)  # no se traga una parada de verdad
+        self.assertFalse(os.path.exists(self.s.PLANNED_STOP))
         open(self.s.PLANNED_STOP, "w").close()  # su propia desinstalación
         with mock.patch.object(self.s.subprocess, "run", lambda *a, **k: R()):
             self.s.stopped(env, notify_send=sent.append)

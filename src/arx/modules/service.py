@@ -13,6 +13,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from arx import config
@@ -154,6 +155,7 @@ def install(exec_start: str | None = None, enforce: bool = False) -> int:
 
 # ── autoprotección (DoD-6): parar o tocar a Arx se avisa fuera del host ───────
 PLANNED_STOP = "/run/arx/planned-stop"
+PLANNED_STOP_S = 300
 DROPIN_DIRS = ("/etc/systemd/system/arx.service.d", "/etc/systemd/system/arx-firewall.service.d")
 
 
@@ -207,8 +209,12 @@ def stopped(env=None, notify_send=None) -> int:
     """ExecStopPost: Arx se ha parado. Fuera de su desinstalación o de un apagado, se avisa fuera del host."""
     import socket
     env = os.environ if env is None else env
-    if os.path.exists(PLANNED_STOP):
+    try:
+        planned = time.time() - os.stat(PLANNED_STOP).st_mtime < PLANNED_STOP_S
         os.unlink(PLANNED_STOP)
+    except OSError:
+        planned = False
+    if planned:  # una marca vieja no se traga una parada de verdad
         return 0
     try:
         state = subprocess.run(["systemctl", "is-system-running"], capture_output=True, text=True, timeout=5).stdout.strip()
@@ -237,6 +243,10 @@ def uninstall() -> int:
     except OSError:
         pass
     subprocess.run(["systemctl", "disable", "--now", "arx", "arx-firewall"], check=False)
+    try:  # la marca vale solo para esta parada: si Arx ya estaba parado, no puede tragarse la siguiente
+        os.unlink(PLANNED_STOP)
+    except OSError:
+        pass
     from arx.modules import profile, response
     profile.release_all()  # sin Arx, los drop-ins de vigilancia no tienen sentido
     released = response.release_all_confinements()
