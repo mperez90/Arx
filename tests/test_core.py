@@ -5379,7 +5379,7 @@ class BehaviorWatchTests(unittest.TestCase):
                                  (profile, "_installed_versions", lambda: dict(self.installed)),
                                  (profile, "_library_packages", lambda unit, own: {
                                      p: v for p, v in self.installed.items() if p in self.libs.get(unit, ())}),
-                                 (trust, "assess_async", lambda pkg, deep=True: {
+                                 (trust, "assess_async", lambda pkg, deep=True, urgent=False: {
                                      "state": self.state_of.get(pkg, "done"), **self.trust_of.get(pkg, self.trust)}),
                                  (profile, "_investigate_later", lambda pkg, why, cfg: self.investigated.append(why)),
                                  (profile, "_dpkg_changed", lambda st: True)]:
@@ -5492,22 +5492,62 @@ class BehaviorWatchTests(unittest.TestCase):
 
     def test_while_its_trust_is_checked_the_service_has_no_outbound_network(self):
         """A#2: las pruebas lentas van en un hilo; mientras, confinamiento preventivo (solo salida)."""
-        self._sweep(0)
-        self._sweep(11, enforce=True)
-        self.state_of["pkg"] = "pending"
-        with mock.patch.object(self.p, "_package_version", lambda unit: ("pkg", "2.0")):
+        version = {"app.service": "1.0"}
+        own = lambda unit: ("app-pkg", version["app.service"]) if unit == "app.service" else ("ssh-pkg", "1.0")  # noqa: E731
+        with mock.patch.object(self.p, "_package_version", own):
+            self._sweep(0)
+            self._sweep(11, enforce=True)
+            self.state_of["app-pkg"] = "pending"
+            version["app.service"] = "2.0"
             found = [f for f in self._sweep(12, enforce=True) if f["kind"] == "untrusted_update"]
-            self.assertEqual(len(found), 1)  # app; sshd es crítico: solo se avisará con el veredicto
+            self.assertEqual(len(found), 1)
             self.assertIn("no outbound network while its trust is checked", found[0]["detail"])
-            self.assertEqual(found[0]["fp_key"], "untrusted_update|system.slice/app.service|pkg=2.0")
+            self.assertEqual(found[0]["fp_key"], "untrusted_update|system.slice/app.service|app-pkg=2.0")
             self.assertEqual(self.r.classify(found[0])["tier"], 1)
             self.assertEqual(self._sweep(12.001, enforce=True), [])  # una vez
-            del self.state_of["pkg"]  # llegó el veredicto: de fiar
+            del self.state_of["app-pkg"]  # llegó el veredicto: de fiar
             released = []
             with mock.patch.object(self.r, "forget", lambda fp: released.append(fp) or {"fp": fp}):
                 self.assertEqual(self._sweep(12.002, enforce=True), [])
-        self.assertEqual(released, [self.r.fingerprint({"fp_key": "untrusted_update|system.slice/app.service|pkg=2.0"})])
+        self.assertEqual(released, [self.r.fingerprint({"fp_key": "untrusted_update|system.slice/app.service|app-pkg=2.0"})])
         self.assertEqual(self.p.load()["subjects"]["system.slice/app.service"]["held"], {})
+
+    def _many(self):
+        units = [f"s{i}.service" for i in range(5)]
+        self.installed = {"libc6": "2.39-1", "libfoo1": "1.0"}
+        self.libs = {u: ("libc6",) for u in units}
+        self.libs["s0.service"] = ("libc6", "libfoo1")
+        return units
+
+    def test_a_library_many_services_load_is_never_cut_while_it_is_checked(self):
+        """A#5: libc6 o libssl rutinarios no pueden dejar sin red a medio host mientras se prueban."""
+        units = self._many()
+        with mock.patch.object(self.p, "running_services", lambda: [f"system.slice/{u}" for u in units]):
+            self._sweep(0, enforce=True)
+            self._sweep(11, enforce=True)
+            self.installed.update(libc6="2.39-2", libfoo1="1.1")
+            self.state_of.update(libc6="pending", libfoo1="pending")
+            found = self._sweep(12, enforce=True)
+        kinds = sorted((f["kind"], f.get("target", {}).get("unit", "")) for f in found)
+        self.assertEqual(kinds, [("untrusted_update", "s0.service"), ("update_check", "")])  # libfoo1: solo s0
+        check = next(f for f in found if f["kind"] == "update_check")
+        self.assertIn("libc6 2.39-2 was just updated and 5 services load it", check["detail"])
+        self.assertEqual(self.r.classify(check)["tier"], 0)
+
+    def test_a_wide_update_without_a_verdict_alerts_and_with_an_untrusted_one_is_cut(self):
+        units = self._many()
+        with mock.patch.object(self.p, "running_services", lambda: [f"system.slice/{u}" for u in units]):
+            self._sweep(0, enforce=True)
+            self._sweep(11, enforce=True)
+            self.installed["libc6"] = "2.39-2"
+            self.state_of["libc6"] = "timeout"
+            self.trust_of["libc6"] = {"trusted": False, "score": 0.0, "reason": "did not finish"}
+            found = self._sweep(12, enforce=True)
+            self.assertEqual([(f["kind"], f["sev"]) for f in found], [("update_check", "crit")])  # sin corte
+            self.state_of["libc6"] = "done"
+            self.trust_of["libc6"] = {"trusted": False, "score": 0.0, "reason": "differs from the official package"}
+            cut = [f for f in self._sweep(12.01, enforce=True) if f["kind"] == "untrusted_update"]
+        self.assertEqual(len(cut), 5)  # con veredicto de no fiable, sí: a todos los que la cargan
 
     def test_without_enforce_nothing_is_held_and_critical_or_updater_services_only_alert(self):
         self._sweep(0)
@@ -5783,6 +5823,22 @@ class TrustTests(unittest.TestCase):
     def _c(self, name, result, required=False):
         return {"name": name, "result": result, "detail": name, "required": required}
 
+    def test_the_deb_apt_just_installed_is_used_only_if_the_signed_index_vouches_for_it(self):
+        import hashlib
+        d = tempfile.mkdtemp()
+        good, bad = b"paquete oficial", b"paquete cambiado"
+        for name, data in (("nginx_1.24_arm64.deb", bad), ("nginx_1.24-1_arm64.deb", good), ("other_1_all.deb", good)):
+            with open(os.path.join(d, name), "wb") as f:
+                f.write(data)
+        index = f"Package: nginx\nVersion: 1.24\nSHA256: {hashlib.sha256(good).hexdigest()}\n"
+        with mock.patch.object(self.t, "APT_ARCHIVES", d), \
+                mock.patch.object(self.t, "_run", lambda argv, timeout=30: (0, index)):
+            self.assertEqual(self.t._cached_deb({"package": "nginx:arm64", "version": "1.24"}),
+                             os.path.join(d, "nginx_1.24-1_arm64.deb"))
+        with mock.patch.object(self.t, "APT_ARCHIVES", d), \
+                mock.patch.object(self.t, "_run", lambda argv, timeout=30: (0, "SHA256: " + "0" * 64)):
+            self.assertIsNone(self.t._cached_deb({"package": "nginx", "version": "1.24"}))  # nada coincide: se baja
+
     def test_slow_checks_never_hold_the_sweep(self):
         """A#2: una descarga colgada no retrasa al llamador; una vez por versión; sin veredicto a tiempo,
         no es de fiar; y con la cola llena, tampoco."""
@@ -5795,7 +5851,7 @@ class TrustTests(unittest.TestCase):
             calls.append(pkg)
             gate.wait(10)
             self.t.note_concerns  # noqa: B018 (nada: solo esperar)
-        q = queue.Queue(maxsize=2)
+        q = queue.PriorityQueue(maxsize=2)
         for obj, name, value in [(self.t, "package_facts", lambda pkg: dict(f, package=pkg)),
                                  (self.t, "cached", lambda pkg, deep=False: None), (self.t, "assess", slow),
                                  (self.t, "_queue", q), (self.t, "_jobs", {}), (self.t, "_worker", [])]:

@@ -97,6 +97,8 @@ _PLAN: dict[str, tuple[int, str, bool, str]] = {
     "gauge": (0, tr("log and watch the trend"), True, tr("weak signal; observe first")),
     "egress_profile": (0, tr("cut in the kernel at its first packet; the service keeps running"), True,
                        tr("outside the behavior Arx observed for it; if it is legitimate, accept it")),
+    "update_check": (0, tr("log and alert"), True,
+                     tr("an update many services load: checked first, cut only with an untrusted verdict")),
     "untrusted_update": (1, tr("confine the service: no outbound network, it keeps running (until you decide)"),
                          True, tr("a signed update below the minimum trust: cutting its network stops a backdoor "
                                   "from calling home without stopping the service")),

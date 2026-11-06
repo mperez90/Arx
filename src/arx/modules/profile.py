@@ -47,6 +47,7 @@ OPEN_DIVERSITY = 64   # redes distintas a partir de las cuales el perfil es por 
 ID_HISTORY = 8        # cgroups recientes de cada servicio, para nombrarlo aunque ya se haya reiniciado
 MAX_LIBS = 200
 LIBS_PER_SWEEP = 4    # servicios cuyas librerías se aprenden por barrido (dpkg -S por fichero cuesta)
+PREVENTIVE_MAX = 3    # servicios afectados por una actualización hasta los que se corta mientras se prueba
 SYSTEMD_DIR = "/etc/systemd/system"
 DROPIN = "90-arx-profile.conf"
 # Se observan, pero no se les corta nada: dejar sin parches a un servidor porque su actualizador estrena
@@ -451,6 +452,12 @@ def _investigate_later(pkg: str, why: str, cfg: dict) -> None:
     threading.Thread(target=run, name=f"arx-investigate-{pkg}", daemon=True).start()
 
 
+def _alert_only(unit: str) -> bool:
+    """Críticos (ssh, dbus, systemd), actualizadores, hora y contenedores: nunca se cortan solos."""
+    from arx.modules import response
+    return bool(_OBSERVE_ONLY.match(unit) or response._PROTECTED_UNITS.match(unit))
+
+
 def _updates(subjects: dict, cfg: dict, now: datetime, check_versions: bool = True,
              enforce: bool = False) -> list[dict]:
     """Una actualización es justo cuando llegaría una versión firmada con código malicioso: se evalúa con
@@ -458,7 +465,7 @@ def _updates(subjects: dict, cfg: dict, now: datetime, check_versions: bool = Tr
     confinado sin red (sigue atendiendo) hasta que una persona decida. Cuenta igual una actualización
     de las librerías que el servicio carga."""
     from arx.modules import response, trust
-    findings = []
+    findings, radius, announced = [], {}, set()
     installed = _installed_versions() if check_versions else {}
     learned = 0
     for path, s in subjects.items():
@@ -495,9 +502,13 @@ def _updates(subjects: dict, cfg: dict, now: datetime, check_versions: bool = Tr
             s.pop("recheck", None)
             s.pop("recheck_libs", None)
         held = s.setdefault("held", {})
-        alert_only = bool(_OBSERVE_ONLY.match(s["unit"]) or response._PROTECTED_UNITS.match(s["unit"]))
+        alert_only = _alert_only(s["unit"])
         for p in [pkg, *(s.get("recheck_libs") or [])]:
-            t = trust.assess_async(p, deep=True)  # las pruebas lentas, en un hilo: el barrido no espera
+            users = radius.setdefault(p, [x for x in subjects.values()
+                                          if x.get("package") == p or p in (x.get("libs") or {})])
+            # radio amplio (libc6, libssl): un corte preventivo sería una caída de medio host
+            wide = len(users) > PREVENTIVE_MAX or any(_alert_only(x["unit"]) for x in users)
+            t = trust.assess_async(p, deep=True, urgent=wide)  # en un hilo: el barrido no espera
             pv = version if p == pkg else (s.get("libs") or {}).get(p)
             key = f"untrusted_update|{path}|{p}={pv}"
             base = {"sev": "high", "kind": "untrusted_update", "set": "untrusted_update", "item": f"{p}={pv}",
@@ -505,6 +516,15 @@ def _updates(subjects: dict, cfg: dict, now: datetime, check_versions: bool = Tr
                     # a la unidad, no a un ejecutable: el proceso principal puede ser un intérprete
                     # compartido (sh, python) y confinar por ejecutable tocaría todos sus procesos
                     "target": {"unit": s["unit"], "cgroup": path, **({"alert_only": True} if alert_only else {})}}
+            if t["state"] == "pending" and wide:
+                if p not in announced:
+                    announced.add(p)
+                    findings.append({"sev": "med", "kind": "update_check", "fp_key": f"update_check|{p}={pv}",
+                                     "detail": tr("{pkg} {version} was just updated and {n} services load it: "
+                                                  "checked first, and cut only if it proves untrusted",
+                                                  pkg=p, version=pv, n=len(users)),
+                                     "why": tr("an update is when a signed but poisoned version arrives")})
+                continue
             if t["state"] == "pending":
                 if enforce and not alert_only and key not in held:  # mientras se prueba, sin salida
                     held[key] = _iso(now)
@@ -517,6 +537,15 @@ def _updates(subjects: dict, cfg: dict, now: datetime, check_versions: bool = Tr
                     response.record({"kind": "trust_confirmed", "detail": tr(
                         "{unit}: {pkg} {version} passed the trust checks; its network is back",
                         unit=s["unit"], pkg=p, version=pv)})
+                continue
+            if t["state"] in ("timeout", "full") and wide:  # sin veredicto no se tumba medio host: a una persona
+                if f"!{p}" not in announced:
+                    announced.add(f"!{p}")
+                    findings.append({"sev": "crit", "kind": "update_check", "fp_key": f"update_unverified|{p}={pv}",
+                                     "detail": tr("the trust checks of {pkg} {version} did not finish and {n} services "
+                                                  "load it: not cut automatically, review it",
+                                                  pkg=p, version=pv, n=len(users)),
+                                     "why": t["reason"]})
                 continue
             detail = (tr("{unit} was updated to {new} and cannot be trusted: {reason}",
                          unit=s["unit"], new=pv, reason=t["reason"]) if p == pkg else

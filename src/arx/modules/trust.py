@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import itertools
 import json
 import os
 import queue
@@ -162,11 +163,13 @@ def check_repository_copy(f: dict) -> dict:
     if not shutil.which("apt-get"):
         return _check("matches_repository", "unknown", tr("apt is not available"))
     with tempfile.TemporaryDirectory(prefix="arx-trust-") as tmp:
-        rc, _ = _run_in(tmp, ["apt-get", "download", "-q", f"{f['package'].partition(':')[0]}={f['version']}"])
-        debs = [n for n in os.listdir(tmp) if n.endswith(".deb")]
-        if rc != 0 or not debs:
-            return _check("matches_repository", "unknown", tr("could not download the official package"))
-        deb = os.path.join(tmp, debs[0])
+        deb = _cached_deb(f)  # el que apt acaba de instalar: segundos en vez de una descarga
+        if not deb:
+            rc, _ = _run_in(tmp, ["apt-get", "download", "-q", f"{f['package'].partition(':')[0]}={f['version']}"])
+            debs = [n for n in os.listdir(tmp) if n.endswith(".deb")]
+            if rc != 0 or not debs:
+                return _check("matches_repository", "unknown", tr("could not download the official package"))
+            deb = os.path.join(tmp, debs[0])
         if os.path.getsize(deb) > MAX_DEB_BYTES:
             return _check("matches_repository", "unknown", tr("package too large to compare"))
         try:
@@ -195,6 +198,35 @@ def check_repository_copy(f: dict) -> dict:
                           tr("differs from the official package: {files}", files=", ".join(differ[:3])))
         return _check("matches_repository", "pass",
                       tr("{n} files identical to the official package", n=compared))
+
+
+APT_ARCHIVES = "/var/cache/apt/archives"
+
+
+def _cached_deb(f: dict) -> str | None:
+    """El `.deb` de esa versión en la caché de apt, solo si su SHA256 es el del índice firmado del repositorio
+    (el mismo con el que `apt-get download` comprueba lo que baja)."""
+    name = f["package"].partition(":")[0]
+    rc, out = _run(["apt-cache", "show", f"{name}={f['version']}"])
+    expected = {line.split(":", 1)[1].strip() for line in out.splitlines() if line.startswith("SHA256:")} \
+        if rc == 0 else set()
+    if not expected:
+        return None
+    try:
+        names = [n for n in os.listdir(APT_ARCHIVES) if n.startswith(f"{name}_") and n.endswith(".deb")]
+    except OSError:
+        return None
+    for n in names:
+        path = os.path.join(APT_ARCHIVES, n)
+        try:
+            if os.path.getsize(path) > MAX_DEB_BYTES:
+                continue
+            with open(path, "rb") as fh:
+                if hashlib.sha256(fh.read()).hexdigest() in expected:
+                    return path
+        except OSError:
+            continue
+    return None
 
 
 def _run_in(cwd: str, argv: list[str], timeout: int = 180) -> tuple[int, str]:
@@ -362,9 +394,10 @@ def assess(pkg: str, deep: bool = False, now: datetime | None = None) -> dict:
 
 
 # ── sin frenar la guardia: las pruebas lentas van a un hilo ───────────────────
-ASSESS_TIMEOUT_S = 1200  # sin veredicto en este tiempo, lo contenido sigue contenido y se avisa
+ASSESS_TIMEOUT_S = 300  # sin veredicto en este tiempo: no es de fiar (quien llama decide si corta)
 MAX_QUEUE = 16
-_queue: queue.Queue = queue.Queue(maxsize=MAX_QUEUE)
+_queue: queue.Queue = queue.PriorityQueue(maxsize=MAX_QUEUE)
+_seq = itertools.count()
 _jobs: dict[str, float] = {}  # "paquete=versión|modo" → cuándo se pidió
 _jobs_lock = threading.Lock()
 _worker: list = []
@@ -385,7 +418,7 @@ def cached(pkg: str, deep: bool = False) -> dict | None:
     return None
 
 
-def assess_async(pkg: str, deep: bool = True) -> dict:
+def assess_async(pkg: str, deep: bool = True, urgent: bool = False) -> dict:
     """Como `assess`, sin esperar: {"state": "done", ...} con el veredicto, {"state": "pending"} mientras un
     hilo prueba (una vez por versión), o "timeout"/"full" — sin veredicto a tiempo: no es de fiar."""
     done = cached(pkg, deep)
@@ -401,7 +434,7 @@ def assess_async(pkg: str, deep: bool = True) -> dict:
                         "reason": tr("the trust checks did not finish in {s} s", s=ASSESS_TIMEOUT_S)}
             return {"state": "pending"}
         try:
-            _queue.put_nowait((pkg, deep, key))
+            _queue.put_nowait((0 if urgent else 1, next(_seq), (pkg, deep, key)))  # lo urgente, primero
         except queue.Full:
             return {"state": "full", "trusted": False, "score": 0.0,
                     "reason": tr("too many trust checks waiting")}
@@ -414,7 +447,7 @@ def assess_async(pkg: str, deep: bool = True) -> dict:
 
 def _work_once(block: bool = True) -> bool:
     try:
-        pkg, deep, key = _queue.get(block=block)
+        _, _, (pkg, deep, key) = _queue.get(block=block)
     except queue.Empty:
         return False
     try:

@@ -113,6 +113,12 @@ ES = {
         "las pruebas de confianza no terminaron en {s} s",
     "too many trust checks waiting":
         "demasiadas pruebas de confianza en espera",
+    "{pkg} {version} was just updated and {n} services load it: checked first, and cut only if it proves untrusted":
+        "{pkg} {version} se acaba de actualizar y la cargan {n} servicios: se prueba primero, y solo se corta si resulta no fiable",
+    "the trust checks of {pkg} {version} did not finish and {n} services load it: not cut automatically, review it":
+        "las pruebas de confianza de {pkg} {version} no terminaron y la cargan {n} servicios: no se corta solo, revísalo",
+    "an update many services load: checked first, cut only with an untrusted verdict":
+        "una actualización que cargan muchos servicios: se prueba primero, solo se corta con un veredicto de no fiable",
     "  {n} confined service(s) or program(s) got their network back.":
         "  {n} servicio(s) o programa(s) confinado(s) recuperaron la red.",
     "service marked out-of-bounds":
