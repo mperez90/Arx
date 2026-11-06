@@ -1690,20 +1690,24 @@ def boot_restore() -> str:
     return msg
 
 
-def _confine(exe: str, pids: list[int], finding: dict) -> tuple[str, dict | None]:
+def _confine(exe: str, pids: list[int], finding: dict) -> tuple[str, dict | None, list[int]]:
+    """Confina lo que puede. Devuelve (estado, revert, pids que NO se pudieron confinar)."""
     revert = {"tool": "confine", "exe": exe, "units": [], "scopes": []}
+    left = []
     for pid in pids:
         if _already_confined(pid, revert):
             continue
         done = _confine_pid(pid)
         if done:
             revert["units" if "unit" in done else "scopes"].append(done)
+        else:
+            left.append(pid)
     if not (revert["units"] or revert["scopes"]):
-        return tr("could not confine it (no process could be moved): nothing was done"), None
+        return "", None, left
     register_block(finding, revert, ttl_min=None)
     what = [u["unit"] for u in revert["units"]] + [f"pid {s['pid']}" for s in revert["scopes"]]
     return (tr("confined without outbound network: {what}. It keeps running; it does not expire, "
-               "you decide", what=", ".join(what))), revert
+               "you decide", what=", ".join(what))), revert, left
 
 
 def _release_confinement(revert: dict) -> str:
@@ -1718,6 +1722,15 @@ def _release_confinement(revert: dict) -> str:
     for sc in revert.get("scopes") or []:
         _nft_cgroup("delete", str(sc.get("set")), str(sc.get("path", "")))
         done.append(f"pid {sc.get('pid')}")
+    exe = revert.get("exe")
+    for pid in revert.get("stopped") or []:
+        try:  # anti reutilización de PID: solo si sigue siendo el mismo programa
+            if isinstance(pid, int) and pid > 1 and isinstance(exe, str) and \
+                    os.readlink(f"/proc/{pid}/exe").removesuffix(" (deleted)") == exe:
+                os.kill(pid, signal.SIGCONT)
+                done.append(f"pid {pid}")
+        except OSError:
+            continue
     return tr("network restored to: {what}", what=", ".join(done) or "—")
 
 
@@ -1741,12 +1754,19 @@ def _extend_containment(blk: dict) -> int:
         revert["pids"] = list(revert.get("pids") or []) + new
     else:
         for pid in pids:
-            if _already_confined(pid, revert):
+            if _already_confined(pid, revert) or pid in (revert.get("stopped") or []):
                 continue
             done = _confine_pid(pid)
             if done:
                 revert["units" if "unit" in done else "scopes"].append(done)
                 new.append(pid)
+                continue
+            try:  # no se pudo confinar: suspendido hasta que decidas, nunca libre y con red
+                os.kill(pid, signal.SIGSTOP)
+            except OSError:
+                continue
+            revert["stopped"] = list(revert.get("stopped") or []) + [pid]
+            new.append(pid)
     if new:
         _save_blocks([{**b, "revert": revert} if b.get("fp") == blk.get("fp") else b
                       for b in _load_blocks()])
@@ -1834,11 +1854,15 @@ def _execute_tier1(finding: dict, cfg: dict | None = None) -> tuple[str, dict | 
         pids = [p for p in _pids_for_exe(exe) if p > 1 and p != os.getpid()]
         if not pids:
             return tr("the process is no longer alive: nothing to suspend"), None
-        fallback = ""
+        fallback, confined_status = "", ""
         if finding.get("provenance") is not None and not finding.get("harm"):
             if _can_confine():
-                return _confine(exe, pids, finding)
-            # sin cgroup v2 + nftables + systemd no hay confinamiento real: lo seguro es suspender
+                confined_status, revert, pids = _confine(exe, pids, finding)
+                if not pids:
+                    return confined_status, revert
+            # Sin confinamiento real (sin cgroup v2 + nftables + systemd, o un proceso que no se pudo
+            # mover: medido en el kernel de GitHub, dentro de un contenedor), lo seguro es suspender.
+            # Nunca queda libre y con red.
             fallback = tr(" (confinement is not possible on this host: suspended instead)")
         stopped = 0
         for pid in pids:
@@ -1851,8 +1875,9 @@ def _execute_tier1(finding: dict, cfg: dict | None = None) -> tuple[str, dict | 
             return tr("could not suspend (race or permissions)"), None
         revert = {"tool": "sigstop", "exe": exe, "pids": pids}
         register_block(finding, revert)
-        return (tr("process suspended ({stopped} pid): automatic SIGCONT on expiry "
-                   "({DEFAULT_TTL_MIN} min)", stopped=stopped, DEFAULT_TTL_MIN=DEFAULT_TTL_MIN)
+        return ((f"{confined_status} · " if confined_status else "")
+                + tr("process suspended ({stopped} pid): automatic SIGCONT on expiry "
+                     "({DEFAULT_TTL_MIN} min)", stopped=stopped, DEFAULT_TTL_MIN=DEFAULT_TTL_MIN)
                 + fallback), revert
     if kind == "canary":
         return tr("alert level raised and context captured"), None

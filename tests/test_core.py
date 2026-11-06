@@ -4684,11 +4684,27 @@ class ConfinementTests(unittest.TestCase):
         self.assertEqual(self.kills, [(4242, signal.SIGSTOP)])
         self.assertIn("suspended instead", o["status"])
 
-    def test_core_services_are_never_confined(self):
+    def test_core_services_are_never_confined_but_the_unknown_program_does_not_go_free(self):
+        import signal
         self._live([5], {5: ("system.slice/ssh.service", "ssh.service")})
         o = self.r.handle(self._exe("/opt/x"), enforce=True, cfg={})
         self.assertFalse(any(c[:3] == ["nft", "add", "element"] for c in self.calls))
-        self.assertIn("could not confine", o["status"])
+        self.assertEqual(self.kills, [(5, signal.SIGSTOP)])
+        self.assertIn("suspended instead", o["status"])
+
+    def test_a_process_that_cannot_be_moved_is_suspended_not_left_free(self):
+        """Medido en el kernel de GitHub: la regla se creaba, pero el proceso no se movía a su scope,
+        y Arx decía «no se hizo nada». El programa seguía con red."""
+        import signal
+        self._live([4242, 4343])
+        real = self.r._confine_pid
+        self._patch(self.r, "_confine_pid", lambda pid: None if pid == 4343 else real(pid))
+        o = self.r.handle(self._exe("/opt/x"), enforce=True, cfg={})
+        self.assertIn(["nft", "add", "element", "inet", "arx", "confined2",
+                       '{ "arxconfine.slice/arxconfine-4242.scope" }'], self.calls)
+        self.assertEqual(self.kills, [(4343, signal.SIGSTOP)])
+        self.assertIn("confined", o["status"])
+        self.assertIn("suspended", o["status"])
 
     def test_it_does_not_expire_and_is_not_an_account_lock(self):
         self._live([4242])
@@ -4726,6 +4742,21 @@ class ConfinementTests(unittest.TestCase):
         self.r.handle(g, enforce=True, cfg={})
         self.assertIn(["nft", "add", "element", "inet", "arx", "confined2",
                        '{ "arxconfine.slice/arxconfine-7001.scope" }'], self.calls)
+
+    def test_a_new_process_that_cannot_be_confined_is_held_until_you_decide(self):
+        import signal
+        self._live([7000])
+        g = self._exe("/opt/y")
+        self.r.handle(g, enforce=True, cfg={})
+        self._live([7000, 7002])
+        self._patch(self.r, "_confine_pid", lambda pid: None)
+        self.r.handle(g, enforce=True, cfg={})
+        self.assertIn((7002, signal.SIGSTOP), self.kills)
+        self.assertEqual(self.r._load_blocks()[0]["revert"]["stopped"], [7002])
+        self.kills.clear()
+        self._patch(self.r.os, "readlink", lambda p: "/opt/y")
+        self.r._apply_revert(self.r._load_blocks()[0]["revert"])
+        self.assertIn((7002, signal.SIGCONT), self.kills)
 
     def test_after_a_reboot_or_flush_it_is_put_back(self):
         self._live([300], {300: ("system.slice/app.service", "app.service")})

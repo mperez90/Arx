@@ -19,8 +19,6 @@ ES = {
         "confinarlo: sin red saliente, sigue funcionando (hasta que decidas)",
     "unproven origin and no sign of harm: cutting its network stops a backdoor from calling home without stopping your program":
         "procedencia sin probar y sin señales de daño: cortarle la red impide que una puerta trasera llame a casa sin parar tu programa",
-    "could not confine it (no process could be moved): nothing was done":
-        "no se pudo confinar (ningún proceso se pudo mover): no se hizo nada",
     " (confinement is not possible on this host: suspended instead)":
         " (en este host no se puede confinar: suspendido en su lugar)",
     "{n} confinement(s) put back":
