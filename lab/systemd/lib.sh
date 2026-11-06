@@ -47,7 +47,8 @@ for path in (r._findings_path(), r._blocks_path(), r._actions_path(), r._pending
   v nft flush set inet arx scan4 2>/dev/null || true
   v nft flush set inet arx block_ipv4 2>/dev/null || true
 }
-in_block_set() { v nft list set inet arx block_ipv4 2>/dev/null | grep -q "$1"; }
+# la salida primero: con pipefail, `grep -q` puede cortar la tubería y dar fallo aunque la línea esté
+in_block_set() { local out; out=$(v nft list set inet arx block_ipv4 2>/dev/null); grep -q "$1" <<<"$out"; }
 scan_clean() { v nft flush set inet arx scan4 2>/dev/null || true; }
 
 lab_up() {

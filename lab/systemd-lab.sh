@@ -34,7 +34,10 @@ if wait_for 70 bash -c "docker exec $VIC sh -c 'ps -o stat= -p \$(pgrep -f ^/tmp
 home_contained() {
   # cualquier set de confinamiento: en un contenedor que comparte el árbol del host el servicio cuelga
   # más hondo (confined4), y anclado a la raíz del PID 1 Arx ya puede confinarlo
-  if docker exec "$VIC" nft list table inet arx 2>/dev/null | grep -q dropper2.service; then
+  # primero la salida, luego la búsqueda: con pipefail, `grep -q` corta la tubería, nft recibe SIGPIPE
+  # y la tubería falla aunque la línea esté (con la tabla grande de CI, siempre)
+  local table; table=$(docker exec "$VIC" nft list table inet arx 2>/dev/null)
+  if grep -q dropper2.service <<<"$table"; then
     ! docker exec "$VIC" sh -c 'ps -o stat= -p $(pgrep -f ^/home/bob/minero | head -1)' 2>/dev/null | grep -q T
   else
     docker exec "$VIC" sh -c 'ps -o stat= -p $(pgrep -f ^/home/bob/minero | head -1)' 2>/dev/null | grep -q T \
@@ -149,11 +152,12 @@ v arx guard --once --enforce >/dev/null 2>&1
 a bash -c "echo 'touch /tmp/c2-despues' > /tmp/c2in"
 sleep 3
 if v test -f /tmp/c2-despues; then fail "ufw: la orden no llega tras cortar el canal"; else pass "ufw: la orden no llega tras cortar el canal"; fi
-if v nft list set inet arx c2_out4 2>/dev/null | grep -q "$ATTACKER_IP"; then pass "canal en c2_out4"; else fail "canal en c2_out4"; fi
+c2_set() { local out; out=$(v nft list set inet arx c2_out4 2>/dev/null); grep -q "$ATTACKER_IP" <<<"$out"; }
+if c2_set; then pass "canal en c2_out4"; else fail "canal en c2_out4"; fi
 
 step "ufw recargado: no debe llevarse por delante la tabla de Arx"
 v ufw reload >/dev/null
-if v nft list set inet arx c2_out4 2>/dev/null | grep -q "$ATTACKER_IP"; then pass "el canal sigue cortado tras ufw reload"; else fail "el canal sigue cortado tras ufw reload"; fi
+if c2_set; then pass "el canal sigue cortado tras ufw reload"; else fail "el canal sigue cortado tras ufw reload"; fi
 slate
 
 step "ufw activo: un puerto nuevo que ufw ya permitía"

@@ -234,7 +234,8 @@ sys.exit(0 if all(s.get(k, {}).get('enforced') for k in ('system.slice/obs.servi
 check "precondición: los dos servicios de prueba están activos" v systemctl is-active -q obs quiet
 if wait_for 420 watching; then pass "los dos servicios pasan de observación a vigilancia"; else fail "los dos servicios pasan de observación a vigilancia"; fi
 # cortado = el kernel registró el intento y al atacante no le llegó: las dos cosas, o no se midió nada
-attempted() { v nft list set inet arx denied4 | grep -F "$1" | grep -qF ". tcp . $A . $2"; }
+# la salida primero: con pipefail, `grep -q` puede cortar la tubería y dar fallo aunque la línea esté
+attempted() { local out; out=$(v nft list set inet arx denied4); grep -F "$1" <<<"$out" | grep -qF ". tcp . $A . $2"; }
 check "lo aprendido sigue funcionando" wait_for 20 growing "$P3"
 v sh -c "echo '$P3 $P4' > /etc/obs-ports"
 cut_p4() { attempted obs.service "$P4" && quiet "$P4"; }
