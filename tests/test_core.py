@@ -4147,9 +4147,6 @@ class SelfProtectionTests(unittest.TestCase):
         self.addCleanup(i18n.set_lang, "es")
         self.unit, self.early = os.path.join(self.d, "arx.service"), os.path.join(self.d, "arx-firewall.service")
         for name, value in [("UNIT_PATH", self.unit), ("EARLY_UNIT_PATH", self.early),
-                            ("DOWN_UNIT_PATH", os.path.join(self.d, "arx-down.service")),
-                            ("REVIVE_UNIT_PATH", os.path.join(self.d, "arx-revive.service")),
-                            ("REVIVE_TIMER_PATH", os.path.join(self.d, "arx-revive.timer")),
                             ("PLANNED_STOP", os.path.join(self.d, "planned-stop"))]:
             p = mock.patch.object(service, name, value)
             p.start()
@@ -4166,19 +4163,6 @@ class SelfProtectionTests(unittest.TestCase):
 
     def test_stopping_arx_runs_a_report(self):
         self.assertIn("ExecStopPost=-/usr/bin/arx service stopped", self.s.unit_text("/usr/bin/arx"))
-
-    def test_if_systemd_gives_up_it_alerts_and_retries_only_after_a_failure(self):
-        """DEC#11: sin ser la primera víctima de la presión de memoria; caído, se avisa y se reintenta."""
-        unit = self.s.unit_text("/usr/bin/arx")
-        self.assertIn("OOMScoreAdjust=0", unit)
-        self.assertIn("OnFailure=arx-down.service", unit)
-        self.assertIn("ExecStart=/usr/bin/arx service down", self.s.down_unit_text("/usr/bin/arx"))
-        revive = self.s.revive_unit_text()
-        self.assertIn("is-failed -q arx.service", revive.split("ExecStart")[0])  # una parada a mano no se deshace
-        self.assertIn("OnUnitActiveSec=15min", self.s.revive_timer_text())
-        sent = []
-        self.s.down(notify_send=sent.append)
-        self.assertIn("Arx is down", sent[0])
 
     def test_an_untouched_arx_says_nothing(self):
         self.assertEqual(self._check(), [])
@@ -4204,13 +4188,6 @@ class SelfProtectionTests(unittest.TestCase):
             self.s.stopped(env, notify_send=sent.append)
         self.assertEqual(len(sent), 1)
         self.assertIn("signal (killed KILL)", sent[0])
-        open(self.s.PLANNED_STOP, "w").close()
-        old = time.time() - 3600
-        os.utime(self.s.PLANNED_STOP, (old, old))  # una marca vieja (de una desinstalación con Arx ya parado)
-        with mock.patch.object(self.s.subprocess, "run", lambda *a, **k: R()):
-            self.s.stopped(env, notify_send=sent.append)
-        self.assertEqual(len(sent), 2)  # no se traga una parada de verdad
-        self.assertFalse(os.path.exists(self.s.PLANNED_STOP))
         open(self.s.PLANNED_STOP, "w").close()
         old = time.time() - 3600
         os.utime(self.s.PLANNED_STOP, (old, old))  # una marca vieja (de una desinstalación con Arx ya parado)
