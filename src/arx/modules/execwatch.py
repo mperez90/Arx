@@ -320,14 +320,20 @@ def descendants(pid: int) -> list[int]:
     return out
 
 
+FREEZE_BUDGET_S = 0.5
+MAX_FAMILY = 1024
+
+
 def freeze_family(pid: int) -> list[dict]:
     """Congela a `pid` y a lo que ya hubiera lanzado: un `sh -c` crea su hijo en menos de un milisegundo,
-    antes de que nadie lo pare. Se repasa hasta que no aparezca nadie nuevo. Devuelve los descendientes."""
+    antes de que nadie lo pare. Se repasa hasta que no aparezca nadie nuevo, con tope de vueltas, de tiempo
+    y de procesos: un bucle de forks no puede colgar a Arx (lo que quede lo atrapa el cgroup congelado)."""
     family: list[dict] = []
     seen = {pid}
+    deadline = time.monotonic() + FREEZE_BUDGET_S
     for _ in range(5):
-        new = [c for c in descendants(pid) if c not in seen]
-        if not new:
+        new = [c for c in descendants(pid) if c not in seen][:MAX_FAMILY - len(family)]
+        if not new or time.monotonic() > deadline:
             break
         for c in new:
             seen.add(c)
@@ -348,7 +354,21 @@ def _freeze(ev: dict) -> bool:
         os.kill(ev["pid"], signal.SIGSTOP)
     except OSError:
         return False
+    if ev.get("ts"):  # el kernel fecha el exec con el mismo reloj monotónico: lo que tardó el SIGSTOP
+        ev["latency_ms"] = max(0, (time.monotonic_ns() - ev["ts"]) // 1_000_000)
     ev["family"] = freeze_family(ev["pid"])
+    # su scope congelado, ya: un SIGSTOP lo deshace cualquier cómplice con un SIGCONT; un cgroup congelado, no.
+    # El barrido solo registra lo hecho.
+    try:
+        from arx.modules import response
+        if _state.get("confine") is None:
+            _state["confine"] = response._can_confine()
+        scope = response._adopt_into_scope(ev["pid"], [m["pid"] for m in ev["family"]]) if _state["confine"] else None
+        if scope:
+            ev["scope"] = scope
+            ev["scope_frozen"] = response._freeze_cgroup(scope["path"], True)
+    except Exception:
+        pass
     return True
 
 
@@ -359,9 +379,8 @@ def handle_pid(pid: int, root: str, enforce, ts: int | None = None) -> dict | No
     ev["preauth"] = sshd_preauth(ev)
     ev["sure"] = sshd_sure() if ev["preauth"] else True
     if ev["preauth"] and ev["sure"] and enforce():  # milisegundos: antes de que la orden de la puerta trasera haga nada
+        ev["ts"] = ts
         ev["stopped"] = _freeze(ev)
-        if ts:  # el kernel fecha el exec con el mismo reloj monotónico
-            ev["latency_ms"] = max(0, (time.monotonic_ns() - ts) // 1_000_000)
     _events.append(ev)
     return ev
 

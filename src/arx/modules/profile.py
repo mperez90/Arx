@@ -806,6 +806,7 @@ def _exec_finding(ev: dict, why: str) -> dict:
             "why": tr("a compromised program shows itself by what it starts"),
             "target": {"pid": ev["pid"], "start": ev["start"], "exe": exe, "unit": unit,
                        "stopped": bool(ev.get("stopped")), "family": ev.get("family") or [],
+                       **({"scope": ev["scope"], "scope_frozen": bool(ev.get("scope_frozen"))} if ev.get("scope") else {}),
                        **({"alert_only": True} if why == "sshd" and ev.get("sure") is False else {})},
             "set": "unexpected_exec", "item": f"{ev['unit']}|{exe}",
             # uno por servicio y programa: los procesos siguientes se contienen bajo el mismo aviso
