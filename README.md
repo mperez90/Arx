@@ -8,7 +8,7 @@ actions it can undo. Anything irreversible waits for you.
 
 <sub>Real output of [`lab/demo.sh`](lab/demo.sh), with long waits shortened.</sub>
 
-> **Status:** v0.0.4, early public testing. **Arx Core is free and available now.** The paid
+> **Status:** v0.0.5, early public testing. **Arx Core is free and available now.** The paid
 > tiers open after Core completes its public testing phase, **Pro first, Business last**.
 > Founding pricing (half price, first 500 purchases of each plan) is reserved for that
 > opening: [get notified](https://github.com/mperez90/Arx/discussions/1).
