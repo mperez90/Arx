@@ -41,7 +41,14 @@ home_contained() {
       && docker exec "$VIC" grep -q "confinement is not possible" /var/lib/arx/incidents.jsonl
   fi
 }
-if wait_for 70 home_contained; then pass "programa de /home: confinado sin red (o suspendido, dicho, si aquí no se puede confinar)"; else fail "programa de /home contenido como corresponde"; fi
+if wait_for 70 home_contained; then pass "programa de /home: confinado sin red (o suspendido, dicho, si aquí no se puede confinar)"; else
+  fail "programa de /home contenido como corresponde"
+  # sin contexto, un fallo aquí no se puede diagnosticar (el kernel de CI no es el de Docker Desktop)
+  docker exec "$VIC" sh -c 'p=$(pgrep -f ^/home/bob/minero | head -1); echo "  pid $p · estado $(ps -o stat= -p $p) · cgroup $(cat /proc/$p/cgroup)"
+    echo "  pid 1: $(cat /proc/1/cgroup)"
+    grep minero /var/lib/arx/incidents.jsonl | tail -2 | cut -c1-600
+    nft list table inet arx | grep -E "set confined|elements" | head -20' 2>&1 | sed 's/^/  · /'
+fi
 v systemctl stop dropper1 dropper2 2>/dev/null
 slate
 
