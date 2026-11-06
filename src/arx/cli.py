@@ -114,7 +114,7 @@ def _status_data() -> dict:
 
     from arx import config, notify
     from arx import license as lic
-    from arx.modules import baseline, canaries, guard, proposals, response, service, vaccines
+    from arx.modules import baseline, canaries, guard, profile, proposals, response, service, vaccines
 
     cfg = config.load_config()
     base = baseline.load()
@@ -132,7 +132,8 @@ def _status_data() -> dict:
             "vaccines": len(vaccines._load().get("applied") or {}), "proposals": len(proposals.all_proposals()),
             "pending": [{"id": p["id"], "sev": p.get("sev"), "detail": p.get("detail")}
                         for p in response.list_pending()],
-            "locked_accounts": response.locked_accounts(), "quarantine": len(response.list_quarantine())}
+            "locked_accounts": response.locked_accounts(), "quarantine": len(response.list_quarantine()),
+            "observation": profile.summary()}
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -172,12 +173,15 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(tr("  T1 blocks      {n} active", n=len(response._load_blocks()))
           + (tr("   ⚠ SAFETY BRAKE active") if response.breaker_tripped() else ""))
     from arx import notify
-    from arx.modules import guard, proposals, vaccines
+    from arx.modules import guard, profile, proposals, vaccines
     seen = guard.mode_seen()
     print(tr("  mode           {v}",
              v=tr("has not run yet") if seen is None else tr("protect (--enforce)") if seen else tr("observe")))
     print(tr("  alerts         {v}", v=', '.join(notify.channels(cfg)) or tr("none  (arx setup)")))
     print(tr("  vaccines       {n} applied", n=len(vaccines._load().get('applied') or {})))
+    obs = profile.summary()
+    print(tr("  observation    {observing} services being learned · {watching} watched",
+             observing=obs["observing"], watching=obs["watching"]))
     props = proposals.all_proposals()
     if props:
         print(tr("  proposals      {n}   ·  review them: arx proposals", n=len(props)))

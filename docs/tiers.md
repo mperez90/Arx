@@ -14,7 +14,7 @@ intended, not what you can buy now. Every paid ✅ must exist and be tested befo
 | Tier 0/1 response (automatic and reversible) | ✅ | ✅ | ✅ |
 | Tier 2 response (human + word) | ✅ | ✅ | ✅ |
 | Proof of origin for new software; confinement without network for what can't prove it | ✅ | ✅ | ✅ |
-| Behavior profile per program (40 days), cutting what departs from it | planned | planned | planned |
+| Behavior observation: each service's usual behavior, and a cut for what departs from it | ✅ | ✅ (shared across hosts: planned) | ✅ (shared across hosts: planned) |
 | Account lock: closes sessions and access, only a person lifts it | ✅ | ✅ | ✅ |
 | The model (your key) can confirm a threat and close that account, with safeguards | ✅ | ✅ | ✅ |
 | Control from Telegram, with a one-time code | ✅ | ✅ | ✅ |

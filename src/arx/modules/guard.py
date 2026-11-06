@@ -28,8 +28,8 @@ from datetime import datetime, timezone
 from arx import config, engine, notify, redact
 from arx import license as lic
 from arx.i18n import lang, tr
-from arx.modules import (baseline, canaries, fleet, provenance, recon, response, sandbox, sensors,
-                         telegram, vaccines)
+from arx.modules import (baseline, canaries, fleet, profile, provenance, recon, response, sandbox,
+                         sensors, telegram, vaccines)
 
 SYSTEM_PROMPT = (
     "You are Arx, the defensive guardian of this server. Answer briefly and action-first, in "
@@ -132,6 +132,7 @@ def sweep(base: dict, enforce: bool = False, include_suid: bool = True,
     sets = base.get("sets") or {}
     findings += _quietly(lambda: sensors.detect_uid0_accounts(known=sets.get("uid0_accounts") or ()), [])
     findings += _quietly(lambda: vaccines.findings(known=sets.get("intel_allow") or ()), [])
+    findings += _quietly(lambda: profile.sweep(enforce=enforce, cfg=cfg), [])
     if reset:
         findings.append(reset)
     findings = _new_logins_only(findings, base)

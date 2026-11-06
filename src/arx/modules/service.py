@@ -142,6 +142,8 @@ def uninstall() -> int:
               "&& sudo systemctl daemon-reload")
         return 0
     subprocess.run(["systemctl", "disable", "--now", "arx", "arx-firewall"], check=False)
+    from arx.modules import profile
+    profile.release_all()  # sin Arx, los drop-ins de vigilancia no tienen sentido
     for unit in (UNIT_PATH, EARLY_UNIT_PATH):
         try:
             Path(unit).unlink()

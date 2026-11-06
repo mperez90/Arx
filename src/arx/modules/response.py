@@ -95,6 +95,10 @@ _PLAN: dict[str, tuple[int, str, bool, str]] = {
                    tr("wiping logs is a sign of an intruder INSIDE: observe and escalate, do not "
                       "act blindly")),
     "gauge": (0, tr("log and watch the trend"), True, tr("weak signal; observe first")),
+    "egress_profile": (0, tr("cut in the kernel at its first packet; the service keeps running"), True,
+                       tr("outside the behavior Arx observed for it; if it is legitimate, accept it")),
+    "profile_extended": (0, tr("log and alert"), True, tr("Arx keeps observing while it has doubts")),
+    "profile_doc": (0, tr("log and alert"), True, tr("the model compared what it did with its documentation")),
     "firewall_reset": (0, tr("log and alert: active containment was already put back"), True,
                        tr("it may be a legitimate reboot: your call")),
 }
@@ -1256,10 +1260,14 @@ def accept(fp: str) -> str | None:
     None si no hay un hallazgo aceptable con ese id. La autorización, si hace falta, es del llamador."""
     from arx.modules import baseline, vaccines  # perezoso: ambos importan este módulo
 
+    from arx.modules import profile
+
     e = load_findings().get(fp)
     if not e or not e.get("set"):
         return None
-    if not baseline.accept(e["set"], e["item"]):
+    accepted = (profile.accept(e["item"]) if e["set"] == "egress_profile"
+                else baseline.accept(e["set"], e["item"]))
+    if not accepted:
         return tr("Could not update the baseline (does it exist and contain that set?).")
     contained = _active_block(fp)
     forget(fp)
@@ -1528,11 +1536,12 @@ def _nft_setup() -> bool:
 #    Por eso `NFTSet=` es persistente (no `--runtime`) y `arx-firewall.service` crea la tabla antes de
 #    que haya red: systemd mete al servicio en el set desde su primer arranque.
 # Sin DNS tampoco: por el resolutor local se puede sacar información.
-_CONFINE_SETS = {2: "confined2", 3: "confined3"}
+# Un nivel por profundidad: en un contenedor que comparte el árbol del host, los servicios cuelgan más hondo
+_CONFINE_SETS = {n: f"confined{n}" for n in range(2, 7)}
 _CONFINE_SLICE = "arxconfine.slice"
 _SYSTEMD_DIR = "/etc/systemd/system"
 _CONFINE_DROPIN = "90-arx-confine.conf"
-_CGROUP_PATH_RE = re.compile(r"^[A-Za-z0-9@_.:\\-]{1,200}(?:/[A-Za-z0-9@_.:\\-]{1,200}){1,3}$")
+_CGROUP_PATH_RE = re.compile(r"^[A-Za-z0-9@_.:\\-]{1,200}(?:/[A-Za-z0-9@_.:\\-]{1,200}){1,5}$")
 _PROTECTED_UNITS = re.compile(r"^(?:ssh|sshd|dbus|dbus-broker|arx|polkit|systemd-[\w-]+|"
                               r"getty@[\w-]*|serial-getty@[\w-]*)\.service$")
 
@@ -1657,21 +1666,26 @@ def _confine_pid(pid: int) -> dict | None:
                            capture_output=True, text=True, timeout=15)
     except (OSError, subprocess.TimeoutExpired):
         return None
-    path = f"{_CONFINE_SLICE}/{scope}"
+    from arx.modules import provenance as prov
+    root = prov.system_root()
+    path = f"{root}/{_CONFINE_SLICE}/{scope}" if root else f"{_CONFINE_SLICE}/{scope}"
+    set_name = _CONFINE_SETS.get(path.count("/") + 1)
+    if not set_name:
+        return None
     for _ in range(20):  # systemd mueve el proceso en segundo plano
         if _cgroup_of(pid) == path:
             break
         time.sleep(0.1)
     else:
         return None
-    if r.returncode != 0 or not _nft_cgroup("add", "confined2", path):
+    if r.returncode != 0 or not _nft_cgroup("add", set_name, path):
         return None
-    return {"scope": scope, "path": path, "set": "confined2", "pid": pid}
+    return {"scope": scope, "path": path, "set": set_name, "pid": pid}
 
 
 def _already_confined(pid: int, revert: dict) -> bool:
     cg = _cgroup_of(pid) or ""
-    return cg.startswith(_CONFINE_SLICE + "/") or any(
+    return f"{_CONFINE_SLICE}/" in f"/{cg}" or any(
         cg == u.get("path") or cg.startswith(str(u.get("path")) + "/") for u in revert.get("units") or [])
 
 

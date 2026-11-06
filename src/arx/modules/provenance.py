@@ -33,12 +33,14 @@ MAX_HASH_BYTES = 1024 * 1024 * 1024
 _INTERPRETER_RE = re.compile(r"^(?:python[0-9.]*|perl[0-9.]*|ruby[0-9.]*|node(?:js)?|php[0-9.]*|"
                              r"php-fpm[0-9.]*|java|bash|sh|dash|zsh|ksh|lua[0-9.]*|tclsh[0-9.]*|"
                              r"Rscript|pwsh|busybox)$")
-# Lo que cambia qué se ejecuta, o como quién. Un drop-in con límites de recursos no cambia nada de eso.
+# Lo que cambia qué se ejecuta, con qué entorno, como quién o con qué poderes. Relajar el aislamiento
+# (`NoNewPrivileges=no`, `ProtectProc=`) no cambia el programa: es lo que hace LXC con TODOS los servicios
+# (zzz-lxc-service.conf), y contarlo bloqueaba cualquier servicio nuevo en un contenedor (medido en Incus).
+# Una asignación vacía solo vuelve al valor por defecto: tampoco cuenta.
 _RISKY_DROPIN_KEYS = re.compile(r"^\s*(?:Exec[A-Za-z]*|Environment(?:File)?|User|Group|DynamicUser|"
                                 r"WorkingDirectory|RootDirectory|RootImage|BindPaths|"
-                                r"BindReadOnlyPaths|LoadCredential|SetCredential|"
-                                r"SupplementaryGroups|AmbientCapabilities|CapabilityBoundingSet|"
-                                r"NoNewPrivileges|Type)\s*=", re.M)
+                                r"BindReadOnlyPaths|SupplementaryGroups|AmbientCapabilities|"
+                                r"CapabilityBoundingSet)\s*=\s*\S", re.M)
 _UNIT_RE = re.compile(r"^[A-Za-z0-9@_.:\\-]{1,200}\.service$")
 _SUSPECT_DIRS = ("/tmp/", "/dev/shm/", "/var/tmp/", "/run/user/")
 # Quien atiende la red: un programa desconocido que nace de ellos es la firma de una webshell
@@ -211,15 +213,42 @@ def unit_of(pid: int) -> tuple[str, str] | None:
     return unit_from_cgroup(line.strip()[3:])
 
 
-def unit_from_cgroup(path: str) -> tuple[str, str] | None:
-    parts = path.strip("/").split("/")
+def system_root(cgroup_of_pid1: str | None = None) -> str:
+    """Raíz de cgroups de este sistema: la del PID 1, que nadie puede mover. En un host es "".
+
+    En un contenedor que comparte el árbol del host (`--cgroupns=host`) los servicios cuelgan de
+    `…/docker-<id>.scope/`: anclarse aquí permite probarlos sin abrir la puerta a que un usuario se
+    fabrique un cgroup llamado `system.slice/…` bajo su propia sesión."""
+    if cgroup_of_pid1 is None:
+        try:
+            cgroup_of_pid1 = next((ln.strip()[3:] for ln in open("/proc/1/cgroup", encoding="utf-8")
+                                   if ln.startswith("0::")), "")
+        except OSError:
+            return ""
+    path = cgroup_of_pid1.strip("/")
+    parent, _, last = path.rpartition("/")
+    if last == "init.scope":
+        return parent
+    return "" if path in ("", "init.scope") else path
+
+
+def unit_from_cgroup(path: str, root: str | None = None) -> tuple[str, str] | None:
+    root = system_root() if root is None else root
+    path = path.strip("/")
+    if root:
+        if not path.startswith(root + "/"):
+            return None  # fuera de este sistema
+        rel = path[len(root) + 1:]
+    else:
+        rel = path
+    parts = rel.split("/")
     if not parts or parts[0] != "system.slice":
         return None  # un servicio de usuario, una sesión o un contenedor no son servicios del sistema
     for i, comp in enumerate(parts):
         if comp.endswith(".service"):
             if not all(p.endswith(".slice") for p in parts[:i]):
                 return None
-            return "/".join(parts[:i + 1]), comp
+            return "/".join(([root] if root else []) + parts[:i + 1]), comp
     return None
 
 
@@ -235,6 +264,20 @@ def _unit_files(unit: str) -> tuple[str | None, list[str]]:
     return frag, drops
 
 
+_ARX_CONFINE_DROPIN = re.compile(r"\A# Arx: confined without outbound network until you decide \(arx accept\)\.\n"
+                                 r"\[Service\]\nExecStartPre=-/[\w/.-]+/nft add element inet arx confined[2-6] "
+                                 r"'\{ \"[A-Za-z0-9@_.:\\/-]+\" \}'\n\Z")
+
+
+def _is_arx_dropin(path: str, text: str) -> bool:
+    """Los de Arx se reconocen por su contenido exacto: un nombre parecido no basta para colarse."""
+    from arx.modules import profile  # perezoso: profile importa este módulo
+    name, unit = os.path.basename(path), os.path.basename(os.path.dirname(path))[:-2]
+    if name == profile.DROPIN:
+        return text == profile.dropin_text(str(profile._files_dir() / f"{unit}.nft"))
+    return name == "90-arx-confine.conf" and bool(_ARX_CONFINE_DROPIN.match(text))
+
+
 def _risky_dropins(drops: list[str]) -> list[str]:
     """Drop-ins que cambian qué se ejecuta. Los de Arx (`systemctl set-property`) no cuentan."""
     bad = []
@@ -246,7 +289,7 @@ def _risky_dropins(drops: list[str]) -> list[str]:
         except OSError:
             bad.append(d)  # sin poder leerlo, no se da por bueno
             continue
-        if _RISKY_DROPIN_KEYS.search(text) and package_of(d) is None:
+        if _RISKY_DROPIN_KEYS.search(text) and package_of(d) is None and not _is_arx_dropin(d, text):
             bad.append(d)
     return bad
 

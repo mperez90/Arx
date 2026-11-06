@@ -63,6 +63,7 @@ shown above. Both only need Docker.
 | New listening port from software that can't prove that (a stray `.deb`, a unit no package owns) | Blocks the port | VM |
 | New program of unproven origin, with no sign of harm | Confines it: it keeps running, but can't open connections. Survives restarts and reboots | VM |
 | Dropper in `/tmp`, a hidden path, or started by a web server | Suspends the process | Lab, VM |
+| A trusted service starts doing something it never did, like a tampered update calling home | Cuts that action in the kernel and tells you; the service keeps running | VM |
 | Reverse shell from `bash`, `sh`, `nc` or `socat` | Cuts the channel and suspends only that process | Lab |
 | New SUID binary | Critical alert naming it; on your word, drops the bit | Lab |
 | Persistence planted in cron | On your word: restores from the vault and quarantines the planted file | Lab |
@@ -156,9 +157,9 @@ Read these before you rely on it.
   behavior profiling, still planned, is what covers that.
 - **Confining needs cgroup v2, nftables that can match by cgroup, and systemd.** Without them, Arx
   suspends instead. Tested on Ubuntu 22.04 and 24.04 VMs, across service restarts and reboots.
-- **Inside a container that shares the host's cgroup tree, nothing new can prove its origin**, so
-  everything new is contained. LXC containers with their own cgroup namespace see the normal
-  layout, but haven't been tested.
+- **Run Arx on the host, not inside a container that shares the host's cgroup tree.** There, proof
+  of origin and confinement work, but behavior watching doesn't. LXC containers (tested unprivileged,
+  with Incus) work like a machine.
 - **Blocks work best with `nftables`.** The package recommends it. With only `ufw`, a block doesn't
   cut connections already open and won't touch a port you already have a rule for. With neither,
   it reports that it can't block. Cutting a reverse-shell channel always needs `nftables`.

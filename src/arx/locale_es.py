@@ -1,6 +1,38 @@
 """Arx · catálogo español. La clave es el texto fuente (inglés) tal como aparece en tr(...)."""
 
 ES = {
+    "the model flagged {dest} of {unit} against its documentation: {reason}":
+        "el modelo marcó {dest} de {unit} frente a su documentación: {reason}",
+    "it will be cut the first time it is used; accept it if it is legitimate":
+        "se cortará la primera vez que se use; acéptalo si es legítimo",
+    "its documentation does not explain {dest} of {unit}: review it":
+        "su documentación no explica {dest} de {unit}: revísalo",
+    "the model compared what it did with its documentation":
+        "el modelo contrastó lo que hizo con su documentación",
+    "  observation    {observing} services being learned · {watching} watched":
+        "  observación    {observing} servicios aprendiendo · {watching} vigilados",
+    "{unit} tried to reach {ip}:{port}/{proto}, outside its usual behavior: cut":
+        "{unit} intentó llegar a {ip}:{port}/{proto}, fuera de su comportamiento habitual: cortado",
+    "{unit} reached {ip}:{port}/{proto}, outside its usual behavior: it would be cut with --enforce":
+        "{unit} llegó a {ip}:{port}/{proto}, fuera de su comportamiento habitual: con --enforce se cortaría",
+    "a program that starts talking somewhere new is how a compromised update calls home":
+        "un programa que empieza a hablar con un sitio nuevo es como llama a casa una actualización comprometida",
+    "its behavior was still changing at the end of the observation":
+        "su comportamiento aún cambiaba al final de la observación",
+    "it contacted addresses flagged by intelligence: {ips}":
+        "contactó direcciones señaladas por inteligencia: {ips}",
+    "it was updated during the observation ({old} → {new})":
+        "se actualizó durante la observación ({old} → {new})",
+    "observation of {unit} extended: {why}":
+        "observación de {unit} alargada: {why}",
+    "Arx keeps observing while it has doubts":
+        "Arx sigue observando mientras tenga dudas",
+    "cut in the kernel at its first packet; the service keeps running":
+        "cortado en el kernel desde el primer paquete; el servicio sigue funcionando",
+    "outside the behavior Arx observed for it; if it is legitimate, accept it":
+        "fuera del comportamiento que Arx le observó; si es legítimo, acéptalo",
+    "log and alert":
+        "registrar y avisar",
     "requires Linux + root with nftables":
         "requiere Linux + root con nftables",
     "containment back in the kernel: {blocks} · confinements: {confined}":
