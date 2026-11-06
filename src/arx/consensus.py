@@ -8,8 +8,9 @@ propio host, una supermayoría de organizaciones con licencia de pago. Lo que ha
   · Más de 2/3 de las organizaciones que votan, no el 51 %. El atacante vota siempre y los honestos
     no todos: con el 51 % y poca participación, una minoría decidida gana.
   · Quórum: un mínimo de organizaciones y una fracción de las que podrían votar.
-  · Licencias con antigüedad, redes distintas entre las que aprueban, y una ventana de tiempo: los
-    votos no se compran de un día para otro ni se meten todos de golpe.
+  · Licencias con antigüedad, redes distintas entre las que aprueban (la red de cada nodo se fija al
+    darlo de alta y va en la lista firmada), y una ventana de tiempo: los votos no se compran de un día
+    para otro ni se meten todos de golpe.
   · Un voto «hostil» manda la propuesta a una persona, si trae evidencia comprobable y su organización
     no ha agotado su cupo de vetos (que nadie bloquee todo vetándolo todo).
   · El servidor no es de fiar: el paquete automático lleva los votos firmados y cada Arx repite el
@@ -177,8 +178,8 @@ def tally(proposal: dict, votes: list, registry: dict, eligible_orgs: int, now: 
           veto_proof: dict | None = None, structural=None) -> dict:
     """Estado de una propuesta: pending, consensus, escalate (a una persona) o expired.
 
-    `votes`: [{"vote": voto sellado, "network": red desde la que llegó, según el servidor}].
-    `registry`: llave pública del nodo → {"org", "tier", "licensed_since", "active"}.
+    `votes`: [{"vote": voto sellado, "network": red desde la que llegó, según el servidor (no cuenta)}].
+    `registry`: llave pública del nodo → {"org", "tier", "licensed_since", "active", "network"}.
     `veto_proof`: organización → sus votos hostiles firmados en otras propuestas (cupo agotado)."""
     pid = proposal.get("id")
     opened = _parse(proposal.get("opened"))
@@ -212,7 +213,8 @@ def tally(proposal: dict, votes: list, registry: dict, eligible_orgs: int, now: 
             out["ignored"]["hostile without evidence"] = out["ignored"].get("hostile without evidence", 0) + 1
             verdict = "insufficient"  # no aprueba, pero tampoco veta
         if node not in latest or at >= latest[node][0]:  # vale el último voto de cada nodo
-            latest[node] = (at, verdict, reg["org"], str(item.get("network") or ""))
+            # la red es la del roster (verificada al dar de alta y firmada offline), no la que diga el servidor
+            latest[node] = (at, verdict, reg["org"], str(reg.get("network") or ""))
     orgs = {}
     for _, verdict, org, net in latest.values():
         orgs.setdefault(org, []).append((verdict, net))

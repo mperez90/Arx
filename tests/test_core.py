@@ -3359,11 +3359,12 @@ class ConsensusTests(unittest.TestCase):
         self.registry, self.votes = {}, []
         self.nodes = {}
 
-    def _node(self, org, tier="business", since="2026-09-01T00:00:00+00:00", active=True, n=None):
+    def _node(self, org, tier="business", since="2026-09-01T00:00:00+00:00", active=True, n=None, net=None):
         secret = bytes([len(self.nodes) + 1]) * 32 if n is None else n
         pub = self.e.public_key(secret).hex()
         self.nodes[pub] = secret
-        self.registry[pub] = {"org": org, "tier": tier, "licensed_since": since, "active": active}
+        self.registry[pub] = {"org": org, "tier": tier, "licensed_since": since, "active": active,
+                              "network": net or f"AS{64500 + len(self.nodes)}"}
         return secret
 
     def _vote(self, secret, verdict="valid", net=None, at=None, vaccine=None, evidence=None):
@@ -3474,7 +3475,13 @@ class ConsensusTests(unittest.TestCase):
 
     def test_approvals_from_too_few_networks_are_not_enough(self):
         for org in "abcde":
-            self._vote(self._node(org), net="203.0.0.0/16" if org != "e" else "198.51.0.0/16")
+            self._vote(self._node(org, net="AS64500" if org != "e" else "AS64501"))
+        self.assertEqual(self._tally()["why"], "approvals come from too few networks")
+
+    def test_the_network_that_counts_is_the_signed_one_not_the_servers(self):
+        """DEC#7: la red de cada votante va en el roster firmado; la que diga el servidor no cuenta."""
+        for org in "abcde":
+            self._vote(self._node(org, net="AS64500"), net=f"10.{ord(org)}.0.0/16")  # el servidor «diversifica»
         self.assertEqual(self._tally()["why"], "approvals come from too few networks")
 
     def test_time_window(self):
@@ -3554,7 +3561,8 @@ class AutoVaccineChannelTests(unittest.TestCase):
         self.auto_pub = self.tool.public_key(self.AUTO).hex()
         vaccines._reset_index()
         self.roster = {self.tool.public_key(v).hex(): {"org": f"o{i}", "tier": "pro", "active": True,
-                                                        "licensed_since": "2026-09-01T00:00:00+00:00"}
+                                                        "licensed_since": "2026-09-01T00:00:00+00:00",
+                                                        "network": f"AS{64500 + i}"}
                        for i, v in enumerate(self.VOTERS)}
         for name, value in [("_host_samples", lambda: []), ("_host_bucket", lambda vid: 0)]:
             p = mock.patch.object(vaccines, name, value)
@@ -3690,7 +3698,7 @@ class ConsensusServerTests(unittest.TestCase):
                                "active": True}
         body = {**self.c.seal({"node": node, "activation_id": f"act{i}"}, secret), "node": node,
                 "license_key": f"key{i}"}
-        return secret, self.store.register(body)
+        return secret, self.store.register(body, f"{20 + i}.1.2.3")
 
     def test_registration_needs_the_node_key_and_a_license_polar_recognizes(self):
         secret, ok = self._register(1)
@@ -3755,6 +3763,13 @@ class ConsensusServerTests(unittest.TestCase):
         secret, _ = self._register(1)
         vote = self.c.make_vote(self.vaccine, secret, self.NOW, validate=lambda v: ("valid", ""))
         self.assertFalse(self.store.vote(vote, "1.2.3.4"))  # aún no hay propuesta
+
+    def test_the_network_is_fixed_at_enrollment_and_goes_in_the_roster(self):
+        self._register(1)
+        self.assertEqual(list(self.srv.roster(self.store).values())[0]["network"], "21.1.0.0/16")
+        asn = self.srv.Store(os.path.join(self.d, "srv2"), lookup=lambda key, act: self.lic.get(key),
+                             asn=lambda ip: "AS64511")
+        self.assertEqual(asn.network("21.1.2.3"), "AS64511")
 
     def test_the_network_is_coarse(self):
         self.assertEqual(self.srv.network_of("203.0.113.9"), "203.0.0.0/16")

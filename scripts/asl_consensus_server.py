@@ -102,8 +102,9 @@ def polar_lookup(key: str, activation_id: str, env: str = "production") -> dict 
 
 # ── estado en disco ──────────────────────────────────────────────────────────
 class Store:
-    def __init__(self, root: str | Path, lookup=polar_lookup):
+    def __init__(self, root: str | Path, lookup=polar_lookup, asn=None):
         self.root = Path(root)
+        self.asn = asn  # ip → "AS64500"; sin base de ASN, la red /16 o /32
         (self.root / "votes").mkdir(parents=True, exist_ok=True)
         (self.root / "review").mkdir(exist_ok=True)
         self.lookup = lookup
@@ -126,7 +127,11 @@ class Store:
     def proposals(self) -> dict:
         return self._read("proposals.json")
 
-    def register(self, body: dict) -> bool:
+    def network(self, ip: str) -> str:
+        return (self.asn(ip) if self.asn else None) or network_of(ip)
+
+    def register(self, body: dict, ip: str = "") -> bool:
+        """La red se fija aquí, al dar de alta, y viaja en la lista que firma la clave maestra."""
         node = body.get("node")
         claim = consensus.unseal(body, node) if isinstance(node, str) else None
         if not claim or claim.get("node") != node or not claim.get("activation_id"):
@@ -139,7 +144,7 @@ class Store:
             act = _h(str(claim["activation_id"]))
             for other in [k for k, v in reg.items() if v.get("activation") == act and k != node]:
                 del reg[other]  # una activación, un nodo: el host cambió de llave
-            reg[node] = {**lic, "activation": act, "checked": consensus._iso(_now())}
+            reg[node] = {**lic, "activation": act, "checked": consensus._iso(_now()), "network": self.network(ip)}
             self._write("registry.json", reg)
         return True
 
@@ -177,7 +182,8 @@ class Store:
         body = consensus.unseal(sealed, node)
         if not body or body.get("proposal") not in self.proposals():
             return False
-        line = json.dumps({"vote": sealed, "network": network_of(ip)}) + "\n"
+        # la red de llegada solo filtra aquí (otra red que la del alta: se anota); no cuenta en el recuento
+        line = json.dumps({"vote": sealed, "network": self.network(ip)}) + "\n"
         with self.lock, open(self.root / "votes" / f"{body['proposal']}.jsonl", "a") as f:
             f.write(line)
         return True
@@ -236,7 +242,7 @@ def engine_reviewers(cfg_path: str) -> list:
 # ── recuento y publicación ───────────────────────────────────────────────────
 def roster(store: Store) -> dict:
     """Los votantes con licencia de pago activa: lo que firma la clave maestra con la delegación."""
-    return {k: {f: v.get(f) for f in ("org", "tier", "licensed_since", "active")}
+    return {k: {f: v.get(f) for f in ("org", "tier", "licensed_since", "active", "network")}
             for k, v in store.registry().items() if v.get("active") and v.get("tier") in consensus.VOTING_TIERS}
 
 
@@ -353,7 +359,7 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(body, dict):
             return self._reply(400, {})
         if self.path == "/v1/register":
-            return self._reply(200, {"registered": self.store.register(body)})
+            return self._reply(200, {"registered": self.store.register(body, self._client())})
         if self.path == "/v1/votes":
             return self._reply(200, {"accepted": self.store.vote(body, self._client())})
         if self.path == "/v1/proposals":
