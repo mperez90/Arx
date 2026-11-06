@@ -103,6 +103,22 @@ ES = {
         "servicio crítico ({unit}): no se confina solo",
     "invalid service: nothing confined":
         "servicio no válido: no se confina nada",
+    "Arx's unit {path} was changed or removed":
+        "la unit de Arx {path} se cambió o se borró",
+    "someone added drop-ins to Arx's unit: {files}":
+        "alguien añadió drop-ins a la unit de Arx: {files}",
+    "Arx's own files differ from its package: {files}":
+        "los ficheros de Arx no coinciden con su paquete: {files}",
+    "someone changed Arx itself: it may be an attempt to blind it":
+        "alguien ha tocado a Arx: puede ser un intento de dejarlo ciego",
+    "Arx stopped: {why}":
+        "Arx se detuvo: {why}",
+    "⚠ Arx stopped on {host}: {why}. If it wasn't you, someone may be trying to blind it.":
+        "⚠ Arx se detuvo en {host}: {why}. Si no fuiste tú, alguien puede estar intentando dejarlo ciego.",
+    "log and alert outside the host":
+        "registrar y avisar fuera del host",
+    "report that Arx was stopped (systemd runs it)":
+        "avisar de que Arx se detuvo (lo ejecuta systemd)",
     "could not prepare what {unit} needs to keep authenticating: not confined":
         "no se pudo preparar lo que {unit} necesita para seguir autenticando: no se confina",
     "  process watch: {mode}":

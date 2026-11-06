@@ -54,6 +54,8 @@ StartLimitBurst=10
 [Service]
 Type=simple
 ExecStart={exec_start} guard{' --enforce' if enforce else ''}
+# Whoever stops Arx gets reported outside the host (unless it is Arx's own uninstall, or a shutdown).
+ExecStopPost=-{exec_start} service stopped
 Restart=always
 RestartSec=10
 # Arx never takes the host down: capped, low priority, and the first the kernel kills if memory runs out.
@@ -139,6 +141,7 @@ def install(exec_start: str | None = None, enforce: bool = False) -> int:
         return 0
     Path(UNIT_PATH).write_text(text)
     Path(EARLY_UNIT_PATH).write_text(early_unit_text(exec_start or _default_exec()))
+    _seal_units()
     subprocess.run(["systemctl", "daemon-reload"], check=False)
     subprocess.run(["systemctl", "enable", "arx-firewall"], check=False)
     r = subprocess.run(["systemctl", "enable", "--now", "arx"], check=False)
@@ -149,12 +152,90 @@ def install(exec_start: str | None = None, enforce: bool = False) -> int:
     return 1
 
 
+# ── autoprotección (DoD-6): parar o tocar a Arx se avisa fuera del host ───────
+PLANNED_STOP = "/run/arx/planned-stop"
+DROPIN_DIRS = ("/etc/systemd/system/arx.service.d", "/etc/systemd/system/arx-firewall.service.d")
+
+
+def _sha(path: str) -> str | None:
+    import hashlib
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        return None
+
+
+def _seal_units() -> None:
+    """La huella de las units que Arx acaba de escribir: otra cosa en su lugar es manipulación."""
+    config.write_json(config.state_dir() / "self.json", {p: _sha(p) for p in (UNIT_PATH, EARLY_UNIT_PATH)})
+
+
+def self_check(dropin_dirs=DROPIN_DIRS) -> list[dict]:
+    """Arx comprueba que nadie lo ha tocado: sus units, sus drop-ins y sus ficheros (contra dpkg)."""
+    findings = []
+    sealed = config.read_json(config.state_dir() / "self.json", {}) or {}
+    for path, sha in sealed.items():
+        now = _sha(path)
+        if sha and now != sha:
+            findings.append(_tamper(tr("Arx's unit {path} was changed or removed", path=path), f"unit|{path}|{now}"))
+    for d in dropin_dirs:
+        try:
+            extra = sorted(n for n in os.listdir(d) if n.endswith(".conf"))
+        except OSError:
+            continue
+        if extra:
+            findings.append(_tamper(tr("someone added drop-ins to Arx's unit: {files}", files=", ".join(extra)),
+                                    f"dropin|{d}|{','.join(extra)}"))
+    try:
+        out = subprocess.run(["dpkg", "--verify", "arx"], capture_output=True, text=True, timeout=30).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        out = ""
+    changed = [line.split()[-1] for line in out.splitlines() if len(line) > 2 and line[2] == "5"]
+    if changed:
+        findings.append(_tamper(tr("Arx's own files differ from its package: {files}", files=", ".join(changed[:3])),
+                                f"code|{','.join(changed)}"))
+    return findings
+
+
+def _tamper(detail: str, key: str) -> dict:
+    return {"sev": "crit", "kind": "self_tamper", "detail": detail,
+            "why": tr("someone changed Arx itself: it may be an attempt to blind it"), "fp_key": f"self_tamper|{key}"}
+
+
+def stopped(env=None, notify_send=None) -> int:
+    """ExecStopPost: Arx se ha parado. Fuera de su desinstalación o de un apagado, se avisa fuera del host."""
+    import socket
+    env = os.environ if env is None else env
+    if os.path.exists(PLANNED_STOP):
+        os.unlink(PLANNED_STOP)
+        return 0
+    try:
+        state = subprocess.run(["systemctl", "is-system-running"], capture_output=True, text=True, timeout=5).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        state = ""
+    why = f"{env.get('SERVICE_RESULT', '?')} ({env.get('EXIT_CODE', '?')} {env.get('EXIT_STATUS', '')})".strip()
+    from arx.modules import response
+    response.record({"kind": "self_stopped", "sev": "crit", "detail": tr("Arx stopped: {why}", why=why)})
+    if state == "stopping":  # un apagado: sin red y sin prisa por avisar
+        return 0
+    from arx import notify
+    (notify_send or notify.send)(tr("⚠ Arx stopped on {host}: {why}. If it wasn't you, someone may be trying "
+                                    "to blind it.", host=socket.gethostname(), why=why))
+    return 0
+
+
 def uninstall() -> int:
     if not (_systemd_available() and _is_root()):
         print(tr("Requires Linux + root with systemd. On the server:"))
         print(f"  sudo systemctl disable --now arx arx-firewall && sudo rm -f {UNIT_PATH} {EARLY_UNIT_PATH} "
               "&& sudo systemctl daemon-reload")
         return 0
+    try:  # la parada que viene es la de su propia desinstalación: no es un ataque
+        os.makedirs(os.path.dirname(PLANNED_STOP), exist_ok=True)
+        Path(PLANNED_STOP).touch()
+    except OSError:
+        pass
     subprocess.run(["systemctl", "disable", "--now", "arx", "arx-firewall"], check=False)
     from arx.modules import profile, response
     profile.release_all()  # sin Arx, los drop-ins de vigilancia no tienen sentido
@@ -187,6 +268,8 @@ def run(action: str, exec_start: str | None = None, enforce: bool = False) -> in
         from arx.modules import response
         print(response.boot_restore())
         return 0
+    if action == "stopped":
+        return stopped()
     if action == "install":
         return install(exec_start, enforce)
     if action == "uninstall":

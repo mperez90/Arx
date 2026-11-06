@@ -3985,6 +3985,71 @@ class RedactionTests(unittest.TestCase):
         self.assertIn("redact", texts[0] + texts[1])
 
 
+class SelfProtectionTests(unittest.TestCase):
+    """DoD-6: parar o tocar a Arx se avisa fuera del host."""
+
+    def setUp(self):
+        self.d = _isolate()
+        from arx import i18n
+        from arx.modules import service
+        self.s = service
+        i18n.set_lang("en")
+        self.addCleanup(i18n.set_lang, "es")
+        self.unit, self.early = os.path.join(self.d, "arx.service"), os.path.join(self.d, "arx-firewall.service")
+        for name, value in [("UNIT_PATH", self.unit), ("EARLY_UNIT_PATH", self.early),
+                            ("PLANNED_STOP", os.path.join(self.d, "planned-stop"))]:
+            p = mock.patch.object(service, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+        open(self.unit, "w").write(service.unit_text("/usr/bin/arx", enforce=True))
+        open(self.early, "w").write(service.early_unit_text("/usr/bin/arx"))
+        service._seal_units()
+
+    def _check(self, dpkg="", dropins=()):
+        class R:
+            stdout = dpkg
+        with mock.patch.object(self.s.subprocess, "run", lambda *a, **k: R()):
+            return self.s.self_check(dropin_dirs=dropins)
+
+    def test_stopping_arx_runs_a_report(self):
+        self.assertIn("ExecStopPost=-/usr/bin/arx service stopped", self.s.unit_text("/usr/bin/arx"))
+
+    def test_an_untouched_arx_says_nothing(self):
+        self.assertEqual(self._check(), [])
+
+    def test_a_changed_unit_a_dropin_or_changed_code_is_critical(self):
+        open(self.unit, "w").write(self.s.unit_text("/usr/bin/arx", enforce=False))  # alguien le quitó --enforce
+        d = os.path.join(self.d, "arx.service.d")
+        os.makedirs(d)
+        open(os.path.join(d, "override.conf"), "w").write("[Service]\nExecStartPre=/tmp/x\n")
+        found = self._check(dpkg="??5??????   /usr/lib/arx/arx.pyz\n", dropins=(d,))
+        self.assertEqual([f["sev"] for f in found], ["crit"] * 3)
+        text = " ".join(f["detail"] for f in found)
+        for what in ("arx.service was changed", "override.conf", "/usr/lib/arx/arx.pyz"):
+            self.assertIn(what, text)
+
+    def test_a_stop_is_reported_unless_planned_or_a_shutdown(self):
+        sent = []
+        env = {"SERVICE_RESULT": "signal", "EXIT_CODE": "killed", "EXIT_STATUS": "KILL"}
+
+        class R:
+            stdout = "running\n"
+        with mock.patch.object(self.s.subprocess, "run", lambda *a, **k: R()):
+            self.s.stopped(env, notify_send=sent.append)
+        self.assertEqual(len(sent), 1)
+        self.assertIn("signal (killed KILL)", sent[0])
+        open(self.s.PLANNED_STOP, "w").close()  # su propia desinstalación
+        with mock.patch.object(self.s.subprocess, "run", lambda *a, **k: R()):
+            self.s.stopped(env, notify_send=sent.append)
+        R.stdout = "stopping\n"  # un apagado
+        with mock.patch.object(self.s.subprocess, "run", lambda *a, **k: R()):
+            self.s.stopped(env, notify_send=sent.append)
+        self.assertEqual(len(sent), 1)
+        from arx.modules import response
+        log = open(response._incidents_path()).read()
+        self.assertEqual(log.count("self_stopped"), 2)  # lo planificado no se anota; el apagado, sí (sin avisar)
+
+
 class TotpTests(unittest.TestCase):
     def setUp(self):
         from arx import totp

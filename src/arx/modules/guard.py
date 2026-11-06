@@ -29,7 +29,7 @@ from arx import config, consensus, engine, notify, redact
 from arx import license as lic
 from arx.i18n import lang, tr
 from arx.modules import (baseline, canaries, execwatch, fleet, profile, provenance, recon, response, sandbox,
-                         sensors, telegram, vaccines)
+                         sensors, service, telegram, vaccines)
 
 SYSTEM_PROMPT = (
     "You are Arx, the defensive guardian of this server. Answer briefly and action-first, in "
@@ -130,6 +130,10 @@ def _new_suid(known) -> list[dict]:
             for p in current if p not in known]
 
 
+SELF_CHECK_EVERY_S = 300
+_self_checked = [-SELF_CHECK_EVERY_S]
+
+
 def _quietly(fn, default):
     """Un sensor roto se queda sin ver lo suyo; no deja al host sin guardia."""
     try:
@@ -155,6 +159,9 @@ def sweep(base: dict, enforce: bool = False, include_suid: bool = True,
     findings += _quietly(lambda: sensors.detect_uid0_accounts(known=sets.get("uid0_accounts") or ()), [])
     findings += _quietly(lambda: vaccines.findings(known=sets.get("intel_allow") or ()), [])
     findings += _quietly(lambda: profile.sweep(enforce=enforce, cfg=cfg), [])
+    if time.monotonic() - _self_checked[0] >= SELF_CHECK_EVERY_S:  # ¿alguien ha tocado a Arx? (DoD-6)
+        _self_checked[0] = time.monotonic()
+        findings += _quietly(lambda: service.self_check(), [])
     if reset:
         findings.append(reset)
     findings = _new_logins_only(findings, base)

@@ -99,6 +99,8 @@ _PLAN: dict[str, tuple[int, str, bool, str]] = {
                        tr("outside the behavior Arx observed for it; if it is legitimate, accept it")),
     "unexpected_exec": (1, tr("isolate that process: no network, and suspended if there are signs of harm"), True,
                         tr("a program its service never started: the service keeps running")),
+    "self_tamper": (0, tr("log and alert outside the host"), True,
+                    tr("someone changed Arx itself: it may be an attempt to blind it")),
     "update_check": (0, tr("log and alert"), True,
                      tr("an update many services load: checked first, cut only with an untrusted verdict")),
     "untrusted_update": (1, tr("confine the service: no outbound network, it keeps running (until you decide)"),

@@ -55,6 +55,15 @@ check "precondición: desde loose no se sale" sh -c "! limactl shell $VM sudo sh
 profiled() { v sh -c 'ls /etc/systemd/system/*.service.d/90-arx-profile.conf' >/dev/null 2>&1; }
 check "precondición: servicios vigilados con su drop-in" wait_for 420 profiled
 
+step "autoprotección: pararlo o tocarlo queda dicho (DoD-6)"
+incident() { local out; out=$(v cat /var/lib/arx/incidents.jsonl 2>/dev/null); grep -q "$1" <<<"$out"; }
+v systemctl stop arx
+check "parar Arx queda anotado (y se avisaría por los canales)" wait_for 20 incident "self_stopped"
+v bash -c 'mkdir -p /etc/systemd/system/arx.service.d && printf "[Service]\nEnvironment=X=1\n" > /etc/systemd/system/arx.service.d/override.conf
+  systemctl daemon-reload; systemctl start arx'
+check "un drop-in ajeno en su unit da alerta crítica" wait_for 60 incident "someone added drop-ins to Arx"
+v bash -c 'rm -rf /etc/systemd/system/arx.service.d; systemctl daemon-reload; systemctl restart arx'
+
 step "desinstalar (purge)"
 v bash -c 'DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 purge -y -qq arx >/dev/null 2>&1'
 check "Arx ya no corre" sh -c "! limactl shell $VM systemctl is-active -q arx"
