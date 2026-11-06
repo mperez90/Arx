@@ -13,6 +13,8 @@ intended, not what you can buy now. Every paid ✅ must exist and be tested befo
 | Sensors (osquery · auditd · Falco, if installed) | ✅ | ✅ | ✅ |
 | Tier 0/1 response (automatic and reversible) | ✅ | ✅ | ✅ |
 | Tier 2 response (human + word) | ✅ | ✅ | ✅ |
+| Proof of origin for new software; confinement without network for what can't prove it | ✅ | ✅ | ✅ |
+| Behavior profile per program (40 days), cutting what departs from it | planned | planned | planned |
 | Account lock: closes sessions and access, only a person lifts it | ✅ | ✅ | ✅ |
 | The model (your key) can confirm a threat and close that account, with safeguards | ✅ | ✅ | ✅ |
 | Control from Telegram, with a one-time code | ✅ | ✅ | ✅ |

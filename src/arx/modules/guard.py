@@ -28,7 +28,8 @@ from datetime import datetime, timezone
 from arx import config, engine, notify, redact
 from arx import license as lic
 from arx.i18n import lang, tr
-from arx.modules import baseline, canaries, fleet, recon, response, sandbox, sensors, telegram, vaccines
+from arx.modules import (baseline, canaries, fleet, provenance, recon, response, sandbox, sensors,
+                         telegram, vaccines)
 
 SYSTEM_PROMPT = (
     "You are Arx, the defensive guardian of this server. Answer briefly and action-first, in "
@@ -70,6 +71,11 @@ def _integrity_drift(base: dict, include_suid: bool) -> list[dict]:
     """Compara la huella actual de ficheros críticos contra la sellada en la base."""
     sealed = base.get("integrity") or {}
     now = baseline.integrity_fingerprint(include_suid=include_suid)
+    for k in sorted(set(now) - set(sealed) - {"suid_set"}):
+        # vigilancia nueva (p. ej. los repositorios de apt): se adopta lo que hay, una vez, y se dice
+        if baseline.accept("integrity", k):
+            sealed[k] = now[k]
+            response.record({"kind": "integrity_watch_added", "detail": k})
     findings = []
     known_suid = (base.get("sets") or {}).get("suid_binaries")
     for k, v in sealed.items():
@@ -80,7 +86,8 @@ def _integrity_drift(base: dict, include_suid: bool) -> list[dict]:
             findings.append(
                 {
                     "sev": "crit" if k in ("authorized_keys_root", "authorized_keys_users",
-                                           "sudoers", "sudoers_d", "ld_preload") else "high",
+                                           "sudoers", "sudoers_d", "ld_preload", "apt_sources",
+                                           "apt_keys") else "high",
                     "kind": "integrity",
                     "detail": tr("{k} changed since the baseline was sealed", k=k),
                     "fp_key": f"integrity|cambió {k} desde el sellado de la línea base",
@@ -192,8 +199,12 @@ def _prepare(finding: dict, enrich: bool = True) -> dict:
     if not enrich:  # muchos ficheros-trampa en un barrido: primero responder
         return f
     try:
-        return sandbox.enrich_finding(f)
+        f = sandbox.enrich_finding(f)
     except Exception:  # el análisis es un extra: su fallo jamás frena la respuesta
+        pass
+    try:  # después del estático: sus señales cuentan para decidir entre suspender y confinar
+        return provenance.enrich(f)
+    except Exception:  # sin prueba de procedencia, se contiene como siempre
         return f
 
 

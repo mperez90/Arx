@@ -61,17 +61,18 @@ and B are green.
 
 ---
 
-## The other three labs
+## The other labs
 
 | Lab | What it adds | Command |
 |---|---|---|
 | **systemd** | Real `.deb`, `arx setup` through the console, the unit and its hardening, journald, `kill -9`, reboot and nftables `flush`, `ufw` with existing `allow` rules, the model from the service (its answer is simulated), control from the chat with a fake Telegram | `bash lab/systemd-lab.sh` |
 | **Normal day** | No attacks: apt, services, logrotate, tmux, useradd, an in-house app, scp, all with `--enforce`. It measures whether Arx gets in the way and how much noise it makes. It's synthetic: a first number, not the metric | `bash lab/normal-day.sh` |
 | **Level 10** | Encrypted canaries, a storm against the brake, a bounded fork bomb, log wiping, `kill -9`. What's measured: it stays up, alerts and does nothing irreversible | `bash lab/level10.sh` |
+| **VM (Lima)** | Proof of origin and confinement on a real kernel, measured from a second VM: nginx from apt stays reachable; a stray `.deb` or an unowned unit gets its port blocked; a program of unproven origin keeps serving but can't reach the attacker, across a service restart and a real reboot; accepting gives its network back | `bash lab/lima-lab.sh` |
 
 They use their own image, `lab/systemd/Dockerfile`, built only from the official `ubuntu:22.04` and
 Ubuntu packages. With systemd as PID 1 in a privileged container, they share a kernel with Docker:
-no auditd and no real kernel reboot. They don't replace the VM (`lab/vm/`), which hasn't been run yet.
+no auditd and no real kernel reboot. A real kernel and a real reboot are in the Lima lab; the level 7–10 runbook in `lab/vm/` still hasn't been run.
 
 ## Running
 

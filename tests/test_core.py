@@ -7,6 +7,7 @@ import os
 os.environ["ARX_LANG"] = "es"  # los textos de estas pruebas fijan el catálogo: si cambia uno sin querer, falla
 
 import io
+import json
 import sys
 import tempfile
 import time
@@ -4370,6 +4371,439 @@ class OldReportTests(unittest.TestCase):
         report = self.f.build_report()
         report["firma"], report["cronologia"] = report.pop("seal"), report.pop("timeline")
         self.assertFalse(self.f.verify(report)[0])
+
+
+
+class ProvenanceTests(unittest.TestCase):
+    """Decisión D: se avisa solo de lo que prueba su procedencia; lo demás se contiene."""
+
+    def setUp(self):
+        _isolate()
+        from arx import i18n
+        from arx.modules import provenance
+        self.p = provenance
+        provenance.clear_cache()
+        self.addCleanup(provenance.clear_cache)
+        i18n.set_lang("en")  # los motivos se comprueban por su texto en inglés
+        self.addCleanup(i18n.set_lang, "es")
+
+    def _patch(self, obj, name, value):
+        p = mock.patch.object(obj, name, value)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_package_owner_ignores_diversions_and_needs_the_exact_path(self):
+        out = {"/usr/sbin/nginx": "diversion by x from: /usr/sbin/nginx\nnginx-core: /usr/sbin/nginx\n",
+               "/usr/bin/socat": "socat: /usr/bin/socat1\n"}
+        self._patch(self.p, "_q", lambda argv, timeout=10: out.get(argv[-1]))
+        self.assertEqual(self.p.package_of("/usr/sbin/nginx"), "nginx-core")
+        self.assertIsNone(self.p.package_of("/usr/bin/socat"))  # otro fichero que empieza igual
+
+    def test_usr_merge_paths_are_the_same_file(self):
+        self.assertIn("/bin/ls", self.p._variants("/usr/bin/ls"))
+        self.assertIn("/usr/bin/ls", self.p._variants("/bin/ls"))
+
+    def test_intact_compares_against_dpkg_checksums(self):
+        import hashlib
+        d = tempfile.mkdtemp()
+        f = os.path.join(d, "app")
+        with open(f, "wb") as fh:
+            fh.write(b"binario original")
+        rel = f.lstrip("/")
+        info = os.path.join(d, "info")
+        os.makedirs(info)
+        with open(os.path.join(info, "app.md5sums"), "w") as fh:
+            fh.write(f"{hashlib.md5(b'binario original').hexdigest()}  {rel}\n")
+        self._patch(self.p, "DPKG_INFO", info)
+        self.assertTrue(self.p.intact(f, "app"))
+        with open(f, "ab") as fh:
+            fh.write(b" + parche")
+        self.assertFalse(self.p.intact(f, "app"))
+        self.assertIsNone(self.p.intact(os.path.join(d, "otro"), "app"))  # sin resumen: no se prueba
+
+    POLICY = """nginx:
+  Installed: 1.24.0-2ubuntu7.19
+  Candidate: 1.24.0-2ubuntu7.19
+  Version table:
+ *** 1.24.0-2ubuntu7.19 500
+        500 http://ports.ubuntu.com/ubuntu-ports noble-updates/main arm64 Packages
+        100 /var/lib/dpkg/status
+     1.24.0-2ubuntu7 500
+        500 http://ports.ubuntu.com/ubuntu-ports noble/main arm64 Packages
+"""
+    LOCAL = """evild:
+  Installed: 1.0
+  Candidate: 1.0
+  Version table:
+ *** 1.0 100
+        100 /var/lib/dpkg/status
+"""
+
+    def test_origin_from_a_signed_repository(self):
+        self._patch(self.p, "_q", lambda argv, timeout=10: self.POLICY)
+        self._patch(self.p, "_trusted_yes_urls", lambda: [])
+        self.assertEqual(self.p.signed_origin("nginx"), (True, "http://ports.ubuntu.com/ubuntu-ports"))
+
+    def test_a_local_deb_is_not_signed(self):
+        """Medido en Ubuntu: un .deb suelto solo aparece en /var/lib/dpkg/status."""
+        self._patch(self.p, "_q", lambda argv, timeout=10: self.LOCAL)
+        ok, why = self.p.signed_origin("evild")
+        self.assertFalse(ok)
+        self.assertIn("local", why)
+
+    def test_a_trusted_yes_repository_is_not_signed(self):
+        self._patch(self.p, "_q", lambda argv, timeout=10: self.POLICY)
+        self._patch(self.p, "_trusted_yes_urls", lambda: ["http://ports.ubuntu.com/ubuntu-ports"])
+        self.assertFalse(self.p.signed_origin("nginx")[0])
+
+    def test_trusted_yes_is_read_from_both_source_formats(self):
+        d = tempfile.mkdtemp()
+        os.makedirs(os.path.join(d, "sources.list.d"))
+        with open(os.path.join(d, "sources.list"), "w") as f:
+            f.write("deb [arch=arm64 trusted=yes] http://evil.example/repo stable main\n")
+        with open(os.path.join(d, "sources.list.d", "x.sources"), "w") as f:
+            f.write("Types: deb\nURIs: https://otro.example/apt/\nTrusted: yes\n")
+        real_glob = self.p.glob.glob
+        self._patch(self.p.glob, "glob", lambda pat: real_glob(pat.replace("/etc/apt", d)))
+        real_open = open
+        self._patch(self.p, "open", lambda f, *a, **k: real_open(f.replace("/etc/apt", d), *a, **k),)
+        self.assertEqual(sorted(self.p._trusted_yes_urls()),
+                         ["http://evil.example/repo", "https://otro.example/apt"])
+
+    def test_only_system_services_count(self):
+        self.assertEqual(self.p.unit_from_cgroup("/system.slice/nginx.service"),
+                         ("system.slice/nginx.service", "nginx.service"))
+        self.assertEqual(self.p.unit_from_cgroup("/system.slice/system-x.slice/x@1.service"),
+                         ("system.slice/system-x.slice/x@1.service", "x@1.service"))
+        self.assertIsNone(self.p.unit_from_cgroup("/user.slice/user-1000.slice/session-3.scope"))
+        self.assertIsNone(self.p.unit_from_cgroup("/user.slice/user-1000.slice/user@1000.service/app.slice/a.service"))
+
+    def test_a_dropin_that_changes_what_runs_breaks_the_proof(self):
+        d = tempfile.mkdtemp()
+        risky, limits = os.path.join(d, "override.conf"), os.path.join(d, "limits.conf")
+        with open(risky, "w") as f:
+            f.write("[Service]\nExecStart=\nExecStart=/usr/bin/socat TCP-LISTEN:80 EXEC:/bin/sh\n")
+        with open(limits, "w") as f:
+            f.write("[Service]\nLimitNOFILE=65536\n")
+        self._patch(self.p, "package_of", lambda path: None)
+        self.assertEqual(self.p._risky_dropins([risky, limits]), [risky])
+        # los de Arx (`systemctl set-property --runtime`) no cuentan
+        self.assertEqual(self.p._risky_dropins(["/run/systemd/system.control/x.service.d/50-NFTSet.conf"]), [])
+
+    def _service(self, **over):
+        facts = {"exe": "/usr/sbin/nginx", "file": {"verified": True, "package": "nginx", "reason": "ok"},
+                 "unit": ("system.slice/nginx.service", "nginx.service"),
+                 "files": ("/usr/lib/systemd/system/nginx.service", []),
+                 "owners": {"/usr/lib/systemd/system/nginx.service": "nginx-common"},
+                 "sources": {"nginx": "nginx", "nginx-common": "nginx"}}
+        facts.update(over)
+        self._patch(self.p, "_exe", lambda pid: facts["exe"])
+        self._patch(self.p, "verify_file", lambda path: dict(facts["file"]))
+        self._patch(self.p, "unit_of", lambda pid: facts["unit"])
+        self._patch(self.p, "_unit_files", lambda unit: facts["files"])
+        self._patch(self.p, "package_of", lambda path: facts["owners"].get(path))
+        self._patch(self.p, "source_package", lambda pkg: facts["sources"].get(pkg, pkg))
+        return self.p.verify_process(812)
+
+    def test_a_packaged_service_with_its_own_unit_is_verified(self):
+        """El unit de nginx es de nginx-common y el binario de nginx: los une el paquete de origen."""
+        r = self._service()
+        self.assertTrue(r["verified"], r)
+        self.assertEqual(r["unit"], "nginx.service")
+
+    def test_each_missing_proof_is_named(self):
+        cases = [({"exe": "/usr/sbin/nginx (deleted)"}, "deleted"),
+                 ({"file": {"verified": False, "reason": "it does not belong to any package"}}, "any package"),
+                 ({"unit": None}, "system service"),
+                 ({"owners": {}}, "is not from any package"),
+                 ({"sources": {"nginx": "nginx", "nginx-common": "otro"}}, "different packages")]
+        for over, why in cases:
+            self.p.clear_cache()
+            r = self._service(**over)
+            self.assertFalse(r["verified"], over)
+            self.assertIn(why, r["reason"])
+
+    def test_socat_started_by_hand_is_not_a_service(self):
+        """Medido: socat es de un paquete firmado, pero si no lo arranca su unit no prueba nada."""
+        self.assertFalse(self._service(exe="/usr/bin/socat", unit=None)["verified"])
+
+    def test_an_interpreter_needs_its_script_packaged_too(self):
+        r = self._service(exe="/usr/bin/python3")
+        with mock.patch.object(self.p, "_script", lambda pid: "/opt/evil.py"):
+            self.p.clear_cache()
+            r = self._service(exe="/usr/bin/python3")
+        self.assertFalse(r["verified"])
+        self.assertIn("interpreter", r["reason"])
+
+    def test_without_a_package_database_nothing_is_verified(self):
+        self._patch(self.p, "available", lambda: False)
+        self.assertFalse(self.p.verify_file("/usr/bin/ls")["verified"])
+
+    def test_harm_signals(self):
+        from arx.modules import response
+        self._patch(self.p, "_exe", lambda pid: "/x")
+        self._patch(self.p, "_user_of", lambda pid: "alice")
+        self._patch(self.p, "_ppid", lambda pid: None)
+        self._patch(self.p, "_login_user", lambda pid: "alice")
+        self._patch(response, "load_findings", lambda: {})
+        real_exists = os.path.exists
+        self._patch(self.p.os.path, "exists", lambda path: path.startswith(("/opt/", "/home/a/", "/var/tmp/"))
+                    or real_exists(path))
+        self.assertEqual(self.p.harm_signals("/opt/app/server", [10], {}), [])
+        self.assertTrue(self.p.harm_signals("/home/a/.cache/.x/kworker", [10], {}))
+        self.assertTrue(self.p.harm_signals("/var/tmp/x", [10], {}))
+        self.assertTrue(self.p.harm_signals("/opt/a", [10], {"sandbox": {"verdict": "suspicious"}}))
+        self._patch(self.p, "_user_of", lambda pid: "www-data")
+        self.assertTrue(self.p.harm_signals("/opt/app/server", [10], {}))  # patrón de webshell
+        self._patch(self.p, "_user_of", lambda pid: "alice")
+        self._patch(response, "load_findings", lambda: {"f": {"kind": "login_users", "item": "alice@203.0.113.9"}})
+        self.assertTrue(self.p.harm_signals("/opt/app/server", [10], {}))  # de un acceso desconocido
+
+    def test_enrich_needs_every_listener_to_prove_it(self):
+        self._patch(self.p, "_listener_pids", lambda proto, port: [1, 2])
+        self._patch(self.p, "verify_process", lambda pid: {"verified": pid == 1, "reason": f"r{pid}"})
+        f = self.p.enrich({"kind": "listen_ports", "why": "w", "target": {"proto": "tcp", "port": 80}})
+        self.assertFalse(f["provenance"]["verified"])
+        self.assertEqual(f["provenance"]["pids"], [1, 2])
+
+    def test_an_unpackaged_binary_in_a_system_dir_is_no_longer_trusted_by_its_path(self):
+        from arx.modules import response
+        self._patch(self.p, "verify_file", lambda path: {"verified": False, "reason": "no paquete"})
+        self._patch(self.p, "harm_signals", lambda exe, pids, f: [])
+        self._patch(response, "_pids_for_exe", lambda exe: [])
+        f = self.p.enrich({"kind": "executables", "sev": "low", "why": "w",
+                           "target": {"exe": "/usr/local/bin/x"}})
+        self.assertEqual(f["sev"], "med")
+        self.assertEqual(response.classify(f)["tier"], 1)
+
+
+class ClassifyByProvenanceTests(unittest.TestCase):
+    def setUp(self):
+        from arx.modules import response
+        self.r = response
+
+    def test_verified_listener_only_alerts(self):
+        f = {"kind": "listen_ports", "target": {"exposed": "all"}, "provenance": {"verified": True, "reason": "ok"}}
+        self.assertEqual(self.r.classify(f)["tier"], 0)
+
+    def test_unverified_listener_is_still_blocked(self):
+        """Un programa desconocido que abre un puerto a la red: lo que haría una puerta trasera."""
+        f = {"kind": "listen_ports", "target": {"exposed": "all"}, "provenance": {"verified": False}}
+        self.assertEqual(self.r.classify(f)["tier"], 1)
+        self.assertNotIn("confine", self.r.classify(f))
+
+    def test_unverified_binary_without_harm_is_confined_and_with_harm_suspended(self):
+        base = {"kind": "executables", "sev": "med", "provenance": {"verified": False}}
+        self.assertTrue(self.r.classify(base).get("confine"))
+        self.assertFalse(self.r.classify({**base, "harm": ["hidden path"]}).get("confine"))
+        self.assertEqual(self.r.classify({**base, "harm": ["hidden path"]})["tier"], 1)
+
+    def test_without_provenance_nothing_changes(self):
+        self.assertEqual(self.r.classify({"kind": "executables", "sev": "low"})["tier"], 0)
+        self.assertFalse(self.r.classify({"kind": "executables", "sev": "med"}).get("confine"))
+
+
+class ConfinementTests(unittest.TestCase):
+    """Decisión E. Los comandos exactos aquí; el efecto, medido en un kernel real (lab Lima)."""
+
+    def setUp(self):
+        _isolate()
+        from arx import i18n
+        from arx.modules import provenance, response
+        self.r, self.p = response, provenance
+        self.calls, self.kills = [], []
+        i18n.set_lang("en")
+        self.addCleanup(i18n.set_lang, "es")
+        self.cgroups = {}
+
+        class R:
+            returncode, stderr, stdout = 0, "", ""
+
+        def fake_run(argv, **kw):
+            self.calls.append(argv)
+            if argv[:2] == ["busctl", "call"]:  # systemd mueve el proceso a su scope
+                pid = int(argv[13])
+                self.cgroups[pid] = f"arxconfine.slice/arxconfine-{pid}.scope"
+            res = R()
+            if argv[:3] == ["nft", "get", "element"]:
+                res.returncode = 1
+            return res
+        for target, value in [("_is_linux_root", lambda: True), ("_can_confine", lambda: True),
+                              ("_systemd_nftset", lambda: True), ("ssh_ports", lambda: {22}),
+                              ("_cgroup_of", lambda pid: self.cgroups.get(pid))]:
+            self._patch(response, target, value)
+        self._patch(response.subprocess, "run", fake_run)
+        self._patch(response.os, "kill", lambda pid, sig: self.kills.append((pid, sig)))
+        self._patch(response.time, "sleep", lambda s: None)
+
+    def _patch(self, obj, name, value):
+        p = mock.patch.object(obj, name, value)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _exe(self, exe, harm=None):
+        return {"kind": "executables", "sev": "med", "detail": f"new in executables: {exe}",
+                "fp_key": f"executables|nuevo en executables: {exe}", "target": {"exe": exe},
+                "set": "executables", "item": exe, "provenance": {"verified": False}, "harm": harm or []}
+
+    def _live(self, pids, units=None):
+        self._patch(self.r, "_pids_for_exe", lambda exe: list(pids))
+        self._patch(self.p, "unit_of", lambda pid: (units or {}).get(pid))
+
+    def test_a_service_is_confined_with_nftset_so_a_restart_does_not_free_it(self):
+        self._live([300], {300: ("system.slice/app.service", "app.service")})
+        o = self.r.handle(self._exe("/opt/app/server"), enforce=True, cfg={})
+        self.assertIn(["nft", "add", "element", "inet", "arx", "confined2", '{ "system.slice/app.service" }'], self.calls)
+        self.assertIn(["systemctl", "set-property", "app.service",
+                       "NFTSet=cgroup:inet:arx:confined2"], self.calls)
+        self.assertEqual(self.kills, [])  # sigue funcionando
+        self.assertIn("app.service", o["status"])
+        self.assertIsNone(self.r._load_blocks()[0]["expires_at"])  # no caduca: decides tú
+
+    def test_a_loose_process_is_adopted_into_its_own_scope(self):
+        self._live([4242])
+        self.r.handle(self._exe("/home/ana/bin/tool"), enforce=True, cfg={})
+        busctl = next(c for c in self.calls if c[:2] == ["busctl", "call"])
+        self.assertEqual(busctl[6:], ["ssa(sv)a(sa(sv))", "arxconfine-4242.scope", "fail", "2", "PIDs", "au",
+                                      "1", "4242", "Slice", "s", "arxconfine.slice", "0"])
+        self.assertIn(["nft", "add", "element", "inet", "arx", "confined2",
+                       '{ "arxconfine.slice/arxconfine-4242.scope" }'], self.calls)
+
+    def test_harm_signals_still_suspend(self):
+        import signal
+        self._live([4242])
+        self.r.handle(self._exe("/home/ana/.x/k", harm=["hidden path"]), enforce=True, cfg={})
+        self.assertEqual(self.kills, [(4242, signal.SIGSTOP)])
+        self.assertFalse(any(c[:2] == ["busctl", "call"] for c in self.calls))
+
+    def test_where_confinement_is_impossible_it_suspends(self):
+        import signal
+        self._patch(self.r, "_can_confine", lambda: False)
+        self._live([4242])
+        o = self.r.handle(self._exe("/opt/x"), enforce=True, cfg={})
+        self.assertEqual(self.kills, [(4242, signal.SIGSTOP)])
+        self.assertIn("suspended instead", o["status"])
+
+    def test_core_services_are_never_confined(self):
+        self._live([5], {5: ("system.slice/ssh.service", "ssh.service")})
+        o = self.r.handle(self._exe("/opt/x"), enforce=True, cfg={})
+        self.assertFalse(any(c[:3] == ["nft", "add", "element"] for c in self.calls))
+        self.assertIn("could not confine", o["status"])
+
+    def test_it_does_not_expire_and_is_not_an_account_lock(self):
+        self._live([4242])
+        self.r.handle(self._exe("/opt/x"), enforce=True, cfg={})
+        later = datetime.now(timezone.utc) + timedelta(days=30)
+        self.assertEqual(self.r.expire_blocks(now=later), [])
+        self.assertEqual(self.r.locked_accounts(), [])
+
+    def test_accepting_gives_the_network_back(self):
+        self._live([300], {300: ("system.slice/app.service", "app.service")})
+        o = self.r.handle(self._exe("/opt/app/server"), enforce=True, cfg={})
+        b = mock.patch("arx.modules.baseline.accept", lambda key, item: True)
+        b.start()
+        self.addCleanup(b.stop)
+        self.calls.clear()
+        self.assertIn("lifted", self.r.accept(o["fp"]))
+        self.assertIn(["nft", "delete", "element", "inet", "arx", "confined2", '{ "system.slice/app.service" }'], self.calls)
+        self.assertIn(["systemctl", "set-property", "app.service", "NFTSet="], self.calls)
+        self.assertEqual(self.r._load_blocks(), [])
+
+    def test_a_new_process_of_the_same_program_is_contained_too(self):
+        """Antes, un dropper que cron relanza quedaba libre: el bloqueo era de los pid de entonces."""
+        import signal
+        self._live([4242])
+        f = self._exe("/home/ana/.x/k", harm=["hidden path"])
+        self.r.handle(f, enforce=True, cfg={})
+        self._live([4242, 5151])
+        o = self.r.handle(f, enforce=True, cfg={})
+        self.assertIn((5151, signal.SIGSTOP), self.kills)
+        self.assertIn("new process", o["status"])
+        self._live([7000])
+        g = self._exe("/opt/y")
+        self.r.handle(g, enforce=True, cfg={})
+        self._live([7000, 7001])
+        self.r.handle(g, enforce=True, cfg={})
+        self.assertIn(["nft", "add", "element", "inet", "arx", "confined2",
+                       '{ "arxconfine.slice/arxconfine-7001.scope" }'], self.calls)
+
+    def test_after_a_reboot_or_flush_it_is_put_back(self):
+        self._live([300], {300: ("system.slice/app.service", "app.service")})
+        self.r.handle(self._exe("/opt/app/server"), enforce=True, cfg={})
+        self.calls.clear()
+        self._patch(self.r.os.path, "isdir", lambda p: True)
+        self.assertEqual(self.r._restore_confinements(), 1)
+        self.assertIn(["nft", "add", "element", "inet", "arx", "confined2", '{ "system.slice/app.service" }'], self.calls)
+
+    def test_at_boot_it_is_back_before_the_network(self):
+        """Medido en Lima: sin esto, tras reiniciar, el confinado salió una vez antes del primer barrido."""
+        self._live([300], {300: ("system.slice/app.service", "app.service")})
+        self.r.handle(self._exe("/opt/app/server"), enforce=True, cfg={})
+        self._patch(self.r, "_nft_available", lambda: True)
+        self._patch(self.r, "_nft_setup", lambda: True)
+        self._patch(self.r, "_nft_setup_confine", lambda: True)
+        self._patch(self.r, "restore_kernel_blocks", lambda now=None: None)
+        self._patch(self.r.os.path, "isdir", lambda p: True)
+        self.calls.clear()
+        self.assertIn("confinements: 1", self.r.boot_restore())
+        self.assertIn(["nft", "add", "element", "inet", "arx", "confined2", '{ "system.slice/app.service" }'], self.calls)
+
+    def test_the_boot_unit_runs_after_the_nftables_flush_and_before_the_network(self):
+        from arx.modules import service
+        text = service.early_unit_text("/usr/bin/arx")
+        for line in ("DefaultDependencies=no", "After=local-fs.target nftables.service",
+                     "Before=network-pre.target arx.service", "ExecStart=/usr/bin/arx service restore",
+                     "WantedBy=sysinit.target"):
+            self.assertIn(line, text)
+
+    def test_before_systemd_254_a_dropin_confines_it_before_the_program_starts(self):
+        """Ubuntu 22.04 y Debian 12 no tienen NFTSet=: sin esto, reiniciar el servicio lo liberaba."""
+        d = tempfile.mkdtemp()
+        self._patch(self.r, "_systemd_nftset", lambda: False)
+        self._patch(self.r, "_SYSTEMD_DIR", d)
+        self._patch(self.r.shutil, "which", lambda c: "/usr/sbin/nft" if c == "nft" else None)
+        self._live([300], {300: ("system.slice/app.service", "app.service")})
+        o = self.r.handle(self._exe("/opt/app/server"), enforce=True, cfg={})
+        dropin = os.path.join(d, "app.service.d", "90-arx-confine.conf")
+        text = open(dropin).read()
+        self.assertIn("""ExecStartPre=-/usr/sbin/nft add element inet arx confined2 '{ "system.slice/app.service" }'""", text)
+        self.assertIn(["systemctl", "daemon-reload"], self.calls)
+        b = mock.patch("arx.modules.baseline.accept", lambda key, item: True)
+        b.start()
+        self.addCleanup(b.stop)
+        self.r.accept(o["fp"])
+        self.assertFalse(os.path.exists(dropin))
+
+    def test_nothing_unsafe_reaches_nft(self):
+        self.calls.clear()
+        for path in ('a"; flush ruleset; "', "../../x", "a b", "system.slice"):
+            self.assertFalse(self.r._nft_cgroup("add", "confined2", path), path)
+        self.assertFalse(self.r._nft_cgroup("add", "block_tcp", "system.slice/x.service"))
+        self.assertEqual(self.calls, [])
+
+
+class AptTrustWatchTests(unittest.TestCase):
+    def test_an_older_baseline_adopts_the_new_watch_without_raising_an_alarm(self):
+        """Una base sellada antes de vigilar apt no puede convertir el estado actual en un hallazgo."""
+        _isolate()
+        from arx.modules import baseline, guard, response
+        now = {"passwd": "a", "apt_sources": "b", "apt_keys": "c"}
+        adopted = []
+        with mock.patch.object(baseline, "integrity_fingerprint", lambda include_suid=True: now), \
+                mock.patch.object(baseline, "accept", lambda k, i: adopted.append(i) or True):
+            found = guard._integrity_drift({"integrity": {"passwd": "a"}}, include_suid=False)
+        self.assertEqual(found, [])
+        self.assertEqual(sorted(adopted), ["apt_keys", "apt_sources"])
+        kinds = [json.loads(line)["kind"] for line in open(response._incidents_path())]
+        self.assertEqual(kinds.count("integrity_watch_added"), 2)
+
+    def test_a_new_repository_is_critical(self):
+        _isolate()
+        from arx.modules import baseline, guard
+        with mock.patch.object(baseline, "integrity_fingerprint",
+                               lambda include_suid=True: {"apt_sources": "nuevo"}):
+            found = guard._integrity_drift({"integrity": {"apt_sources": "viejo"}}, include_suid=False)
+        self.assertEqual([(f["sev"], f["target"]["file"]) for f in found], [("crit", "apt_sources")])
 
 
 if __name__ == "__main__":

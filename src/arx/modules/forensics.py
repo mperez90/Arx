@@ -37,7 +37,7 @@ from arx.redact import printable
 # Campos estables que entran en la cronología (orden canónico lo da _canonical).
 _TIMELINE_FIELDS = ("at", "kind", "sev", "detail", "tier", "status", "remediation",
                     "result", "reverted", "revert", "decided_by", "verdict", "closed", "survivors",
-                    "finding_kind")
+                    "finding_kind", "why")
 _SEV_RANK = {"crit": 0, "high": 1, "med": 2, "low": 3, "info": 4}
 # solo lo que señala a alguien de fuera; un login dice demasiado sobre este host
 _SHAREABLE_KINDS = ("port_scan", "auth_bruteforce", "reverse_shell", "intel_ip")

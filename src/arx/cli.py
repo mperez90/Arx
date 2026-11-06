@@ -482,6 +482,7 @@ def main(argv: list[str] | None = None) -> int:
                       help=tr("apply automatic Tier 1 actions (default: observe only)"))
     ssub.add_parser("uninstall", help=tr("remove the service"))
     ssub.add_parser("status", help=tr("service status"))
+    ssub.add_parser("restore", help=tr("put Arx's containment back in the kernel (runs at boot)"))
     p_acc = sub.add_parser("accept", help=tr("accept a legitimate change as normal (adds it to the "
                                              "baseline)"))
     p_acc.add_argument("fp", nargs="?", help=tr("finding id (no id: list acceptable findings)"))

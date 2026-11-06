@@ -212,6 +212,12 @@ def integrity_paths() -> dict[str, list[str]]:
                  *glob.glob("/var/spool/cron/crontabs/*")],
         "systemd_units": glob.glob("/etc/systemd/system/*.service")
                          + glob.glob("/etc/systemd/system/*.timer"),
+        # Un repositorio o una clave nuevos hacen pasar por "firmado" lo que traiga ese repositorio:
+        # la prueba de procedencia sería papel mojado sin esta vigilancia.
+        "apt_sources": ["/etc/apt/sources.list", *glob.glob("/etc/apt/sources.list.d/*"),
+                        *glob.glob("/etc/apt/apt.conf.d/*")],
+        "apt_keys": ["/etc/apt/trusted.gpg", *glob.glob("/etc/apt/trusted.gpg.d/*"),
+                     *glob.glob("/etc/apt/keyrings/*")],
     }
     out: dict[str, list[str]] = {}
     for key, paths in groups.items():

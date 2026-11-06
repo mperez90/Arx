@@ -19,6 +19,7 @@ from arx import config
 from arx.i18n import tr
 
 UNIT_PATH = "/etc/systemd/system/arx.service"
+EARLY_UNIT_PATH = "/etc/systemd/system/arx-firewall.service"
 
 
 def _is_root() -> bool:
@@ -66,6 +67,27 @@ WantedBy=multi-user.target
 """
 
 
+def early_unit_text(exec_start: str) -> str:
+    """Repone la contención antes de que haya red. Sin él, tras un reinicio, un programa confinado
+    salió una vez a la red antes del primer barrido de Arx (medido en Lima). Va después de
+    nftables.service: su configuración empieza con `flush ruleset` y borraría lo repuesto."""
+    return f"""[Unit]
+Description=Arx - put containment back in the kernel before the network comes up
+DefaultDependencies=no
+After=local-fs.target nftables.service
+Before=network-pre.target arx.service
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart={exec_start} service restore
+
+[Install]
+WantedBy=sysinit.target
+"""
+
+
 def _prereqs_ok() -> bool:
     from arx.modules import baseline
 
@@ -102,7 +124,9 @@ def install(exec_start: str | None = None, enforce: bool = False) -> int:
         _manual_instructions(dest)
         return 0
     Path(UNIT_PATH).write_text(text)
+    Path(EARLY_UNIT_PATH).write_text(early_unit_text(exec_start or _default_exec()))
     subprocess.run(["systemctl", "daemon-reload"], check=False)
+    subprocess.run(["systemctl", "enable", "arx-firewall"], check=False)
     r = subprocess.run(["systemctl", "enable", "--now", "arx"], check=False)
     if r.returncode == 0:
         print(tr("✓ Arx installed as a systemd service and started (enable --now)."))
@@ -114,13 +138,15 @@ def install(exec_start: str | None = None, enforce: bool = False) -> int:
 def uninstall() -> int:
     if not (_systemd_available() and _is_root()):
         print(tr("Requires Linux + root with systemd. On the server:"))
-        print(f"  sudo systemctl disable --now arx && sudo rm -f {UNIT_PATH} && sudo systemctl daemon-reload")
+        print(f"  sudo systemctl disable --now arx arx-firewall && sudo rm -f {UNIT_PATH} {EARLY_UNIT_PATH} "
+              "&& sudo systemctl daemon-reload")
         return 0
-    subprocess.run(["systemctl", "disable", "--now", "arx"], check=False)
-    try:
-        Path(UNIT_PATH).unlink()
-    except OSError:
-        pass
+    subprocess.run(["systemctl", "disable", "--now", "arx", "arx-firewall"], check=False)
+    for unit in (UNIT_PATH, EARLY_UNIT_PATH):
+        try:
+            Path(unit).unlink()
+        except OSError:
+            pass
     subprocess.run(["systemctl", "daemon-reload"], check=False)
     print(tr("✓ Arx service removed."))
     return 0
@@ -136,6 +162,10 @@ def status() -> int:
 
 
 def run(action: str, exec_start: str | None = None, enforce: bool = False) -> int:
+    if action == "restore":
+        from arx.modules import response
+        print(response.boot_restore())
+        return 0
     if action == "install":
         return install(exec_start, enforce)
     if action == "uninstall":

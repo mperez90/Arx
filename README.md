@@ -59,8 +59,10 @@ shown above. Both only need Docker.
 |---|---|---|
 | Port scan (`nmap -sS`) | Blocks the source IP | Lab |
 | SSH brute force | Blocks the source IP | Lab |
-| New listening port | Blocks the port | Lab |
-| Dropper running from `/tmp` | Suspends the process | Lab |
+| New service from a signed package (`apt install nginx`) | Alerts only: it proves it comes from a signed repository, intact, started by its own unit | VM |
+| New listening port from software that can't prove that (a stray `.deb`, a unit no package owns) | Blocks the port | VM |
+| New program of unproven origin, with no sign of harm | Confines it: it keeps running, but can't open connections. Survives restarts and reboots | VM |
+| Dropper in `/tmp`, a hidden path, or started by a web server | Suspends the process | Lab, VM |
 | Reverse shell from `bash`, `sh`, `nc` or `socat` | Cuts the channel and suspends only that process | Lab |
 | New SUID binary | Critical alert naming it; on your word, drops the bit | Lab |
 | Persistence planted in cron | On your word: restores from the vault and quarantines the planted file | Lab |
@@ -69,9 +71,9 @@ shown above. Both only need Docker.
 | A second root account (uid 0) | Critical alert; on your word, locks it without touching root | Lab |
 | Authentication log truncated | High-severity alert | Unit tests |
 
-Real systemd, real `ufw` and a simulated day of normal admin work have their own labs. None of
-this has run on a real VM yet, only in containers. The full test plan and its results are in
-[`lab/README.md`](lab/README.md).
+Real systemd, real `ufw` and a simulated day of normal admin work have their own labs. What needs
+a real kernel (cgroups, a reboot) runs on two VMs, the second one as the attacker:
+`bash lab/lima-lab.sh`. The full test plan and its results are in [`lab/README.md`](lab/README.md).
 
 ## Everything from the console
 
@@ -102,7 +104,7 @@ Output is in English; Arx also speaks Spanish. Pick it in `arx setup` or with `A
 | Tier | What happens | Authority |
 |------|---------|-----------|
 | **0** | Record evidence and alert | Automatic, always |
-| **1** | Block an IP, a port or a reverse-shell channel; suspend a suspicious process | Automatic with `--enforce`; each action undoes itself after 60 minutes |
+| **1** | Block an IP, a port or a reverse-shell channel; suspend a suspicious process; confine a program of unproven origin | Automatic with `--enforce`; each action undoes itself after 60 minutes, except confinement, which waits for you |
 | **2** | Restore critical files, quarantine what was planted, lock an account and close its sessions, end a process that came back | **You**, with your authorization word |
 
 **One exception, on purpose.** With a model configured and `--enforce`, if the model confirms as a
@@ -117,8 +119,10 @@ Guardrails against self-inflicted damage:
 
 - It never acts on your SSH port, PID 1, itself, the host's own IPs or an authenticated SSH
   session it has seen persist across checks. A connection that never logged in protects nobody.
-- A new binary in a system directory is only logged. A new binary elsewhere can be
-  suspended, and only with `--enforce`.
+- New software is judged by proof, not by its path. If it comes from a package in a signed
+  repository, intact, it's only logged. If it can't prove that, it's confined: it keeps working,
+  without network. Only signs of harm suspend it: a temporary or hidden path, a static-analysis hit,
+  being started by a web server, or coming from an unknown login. All of this needs `--enforce`.
 - After 5 automatic actions in an hour it stops acting and only observes. Critical findings keep a
   small reserve, so exhausting the brake on purpose doesn't leave a reverse shell unanswered.
 - An account can't be locked if it would leave nobody able to administer the server.
@@ -136,14 +140,25 @@ Read these before you rely on it.
 - **Reverse shells written in Python, Perl or PHP aren't caught yet.** Those interpreters
   are common in legitimate servers, so this detection is limited to shells and `nc`/`socat`.
   A legitimate long-lived `nc` client would be flagged; mark its IP out of bounds in setup.
-- **Containment expires by design, except accounts.** After 60 minutes a suspended process
-  resumes and its channel reopens. If the threat is still there, it is escalated to you, not
-  re-blocked. A locked account stays locked until you run `arx unlock`.
+- **Containment expires by design, except accounts and confinement.** After 60 minutes a suspended
+  process resumes and its channel reopens. If the threat is still there, it is escalated to you, not
+  re-blocked. A locked account stays locked until you run `arx unlock`, and a confined program stays
+  without network until you run `arx accept`.
 - **An attacker can exhaust the safety brake for non-critical findings.** Five actions in an hour
   trips it on purpose or by accident, and from then on Arx only alerts on those.
-- **Installing something new under `--enforce` gets it contained.** Arx can't tell your new app
-  from a planted one: a new exposed port is blocked and a new binary outside system directories is
-  suspended, until you run `arx accept`. Use observe mode while you're changing the server.
+- **Software that can't prove its origin is contained under `--enforce`.** A package from a signed
+  repository only raises an alert. Your own app in `/opt` keeps running, but without network, and a
+  port it exposes is blocked, until you run `arx accept`. That's deliberate: a planted program looks
+  exactly the same.
+- **The proof of origin trusts dpkg.** It only exists on Debian and Ubuntu; elsewhere nothing counts
+  as proven, so everything new is contained. An intruder who is already root can forge dpkg's
+  database, and can also stop Arx. A malicious version inside a signed repository passes the proof:
+  behavior profiling, still planned, is what covers that.
+- **Confining needs cgroup v2, nftables that can match by cgroup, and systemd.** Without them, Arx
+  suspends instead. Tested on Ubuntu 22.04 and 24.04 VMs, across service restarts and reboots.
+- **Inside a container that shares the host's cgroup tree, nothing new can prove its origin**, so
+  everything new is contained. LXC containers with their own cgroup namespace see the normal
+  layout, but haven't been tested.
 - **Blocks work best with `nftables`.** The package recommends it. With only `ufw`, a block doesn't
   cut connections already open and won't touch a port you already have a rule for. With neither,
   it reports that it can't block. Cutting a reverse-shell channel always needs `nftables`.

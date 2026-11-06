@@ -112,6 +112,20 @@ _USERNAME_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
 
 
 def classify(finding: dict) -> dict:
+    kind = finding.get("kind")
+    prov = finding.get("provenance")
+    # Procedencia probada (decisión D): paquete de un repositorio firmado, intacto y, si atiende la
+    # red, arrancado por su propio unit. Se avisa y no se toca.
+    if prov and prov.get("verified") and kind in ("listen_ports", "executables", "processes"):
+        return {"tier": 0, "action": tr("log and alert (verified package)"), "reversible": True,
+                "why": prov.get("reason", "")}
+    # Sin esa prueba y sin señales de daño (decisión E): sigue funcionando, pero sin salir a la red.
+    # Así una puerta trasera no llama a casa, y tu programa no se para. Lo decide una persona.
+    if kind in ("executables", "processes") and prov is not None and not finding.get("harm"):
+        return {"tier": 1, "confine": True, "reversible": True,
+                "action": tr("confine it: no outbound network, it keeps running (until you decide)"),
+                "why": tr("unproven origin and no sign of harm: cutting its network stops a backdoor "
+                          "from calling home without stopping your program")}
     # Desde fuera no se llega a un puerto solo en localhost: bloquearlo no protege nada y rompe
     # lo que lo use (una base de datos local, un panel detrás de un proxy).
     if finding.get("kind") == "listen_ports" and (finding.get("target") or {}).get("exposed") == "local":
@@ -119,7 +133,7 @@ def classify(finding: dict) -> dict:
                 "why": tr("not exposed to the network: a block would contain nothing")}
     # Un binario de sistema no visto al aprender es lo normal (un admin, una actualización).
     # Suspenderlo congelaría TODOS sus procesos, incluida la shell del operador (B9).
-    if finding.get("kind") in ("executables", "processes") and finding.get("sev") == "low":
+    if kind in ("executables", "processes") and finding.get("sev") == "low" and prov is None:
         return {"tier": 0, "action": tr("log and watch (new system binary)"),
                 "reversible": True, "why": tr("low-confidence signal: it does not justify "
                                               "suspending anything")}
@@ -405,6 +419,8 @@ def _apply_revert(revert) -> str | None:
             except OSError:
                 continue
         return tr("SIGCONT to {done} process(es) of {exe}", done=done, exe=exe)
+    if isinstance(revert, dict) and revert.get("tool") == "confine":
+        return _release_confinement(revert)
     if isinstance(revert, dict) and revert.get("tool") == "usermod":
         import pwd
 
@@ -435,11 +451,17 @@ def _apply_revert(revert) -> str | None:
     return None
 
 
-def _holds_until_human(block: dict) -> bool:
-    """Un bloqueo de cuenta no caduca: lo levanta una persona (`arx unlock`), nunca el reloj.
-    Se decide por el tipo y no por la fecha: la v0.0.2 los registró con caducidad."""
+def _is_account_lock(block: dict) -> bool:
     revert = block.get("revert")
     return isinstance(revert, dict) and revert.get("tool") == "usermod"
+
+
+def _holds_until_human(block: dict) -> bool:
+    """No caduca: lo levanta una persona, nunca el reloj. Un bloqueo de cuenta (`arx unlock`), y un
+    confinamiento (`arx accept`): este no para el programa, así que no hay prisa por soltarlo.
+    Se decide por el tipo y no por la fecha: la v0.0.2 registró los de cuenta con caducidad."""
+    revert = block.get("revert")
+    return _is_account_lock(block) or (isinstance(revert, dict) and revert.get("tool") == "confine")
 
 
 def _until(block: dict) -> str:
@@ -476,7 +498,7 @@ def _lock_of(finding: dict) -> dict | None:
     if finding.get("kind") != "login_users":
         return None
     user = str((finding.get("target") or {}).get("user") or "").partition("@")[0]
-    return next((b for b in _load_blocks() if _holds_until_human(b) and b["revert"].get("user") == user), None)
+    return next((b for b in _load_blocks() if _is_account_lock(b) and b["revert"].get("user") == user), None)
 
 
 def _active_block(fp: str, now=None) -> dict | None:
@@ -832,7 +854,7 @@ def _lock_account(user: str, finding: dict, allow_uid0: bool = False) -> tuple[b
         return False, tr("account '{user}' marked out-of-bounds: not locked", user=user)
     if not shutil.which("usermod"):
         return False, tr("no usermod on this host: no safe account-lock executor")
-    if any(b for b in _load_blocks() if _holds_until_human(b) and b["revert"].get("user") == user):
+    if any(b for b in _load_blocks() if _is_account_lock(b) and b["revert"].get("user") == user):
         # bloquear otra vez guardaría "bloqueada" como estado previo y nunca se restauraría
         return True, tr("account '{user}' was already locked by Arx. Your call:  arx unlock {user}",
                         user=user)
@@ -1104,7 +1126,7 @@ def apply_verdicts(pairs: list[tuple[dict, dict]], verdicts: list[dict], enforce
 def locked_accounts() -> list[dict]:
     """Cuentas que Arx mantiene bloqueadas a la espera de que una persona decida."""
     return [{"user": b["revert"].get("user"), "since": b.get("applied_at"), "detail": b.get("detail")}
-            for b in _load_blocks() if _holds_until_human(b)]
+            for b in _load_blocks() if _is_account_lock(b)]
 
 
 def revert_failed(done: str | None) -> bool:
@@ -1120,7 +1142,7 @@ def unlock_account(user: str) -> str | None:
     """
     with config.locked():
         blocks = _load_blocks()
-        mine = [b for b in blocks if _holds_until_human(b) and b["revert"].get("user") == user]
+        mine = [b for b in blocks if _is_account_lock(b) and b["revert"].get("user") == user]
         if not mine:
             return None
         done = _apply_revert(mine[0]["revert"]) if _is_linux_root() else tr("ready to run on the target")
@@ -1263,7 +1285,7 @@ def forget(fp: str) -> dict | None:
         _save_findings(st)
         _save_pending([p for p in _load_pending() if p["id"] != fp[:6]])
         blocks = _load_blocks()
-        lifted = [b for b in blocks if b.get("fp") == fp and not _holds_until_human(b)]
+        lifted = [b for b in blocks if b.get("fp") == fp and not _is_account_lock(b)]
         for b in lifted:
             if _is_linux_root():
                 _apply_revert(b.get("revert"))
@@ -1329,6 +1351,9 @@ def restore_kernel_blocks(now=None) -> dict | None:
     """
     if not (_is_linux_root() and _nft_available()):
         return None
+    if any(isinstance(b.get("revert"), dict) and b["revert"].get("tool") == "confine"
+           for b in _load_blocks()) and _nft_setup_confine() and (n := _restore_confinements()):
+        record({"kind": "confinement_restored", "detail": tr("{n} confinement(s) put back", n=n)})
     now = now or _now()
     active = [(b, exp) for b in _load_blocks() if (exp := _parse_dt(b.get("expires_at"))) and exp > now
               and isinstance(b.get("revert"), dict) and b["revert"].get("tool") in _NFT_ELEMENT]
@@ -1490,6 +1515,268 @@ def _nft_setup() -> bool:
     return True
 
 
+# ── confinamiento (decisión E): el programa sigue, pero no sale a la red ──────
+# Se mide en el kernel por cgroup v2: un servicio con todos sus procesos, o un proceso suelto que se
+# adopta en un scope propio (sus hijos lo heredan). Probado en kernel real (Lima, Ubuntu 24.04):
+#  · las respuestas a quien le habla siguen saliendo (`ct direction original` solo corta lo que él
+#    inicia), y el resto del host no se entera;
+#  · al reiniciar un servicio, systemd crea un cgroup nuevo y una regla con la ruta deja de casar en
+#    silencio. Con systemd ≥ 254, `NFTSet=` mete el cgroup nuevo en el set en cada arranque; antes,
+#    cada barrido lo repone (hueco: hasta el siguiente barrido);
+#  · un slice con guion se anida (`arx-x.slice` cuelga de `arx.slice`): por eso `arxconfine.slice`;
+#  · tras un reinicio, el servicio confinado salió una vez a la red antes del primer barrido de Arx.
+#    Por eso `NFTSet=` es persistente (no `--runtime`) y `arx-firewall.service` crea la tabla antes de
+#    que haya red: systemd mete al servicio en el set desde su primer arranque.
+# Sin DNS tampoco: por el resolutor local se puede sacar información.
+_CONFINE_SETS = {2: "confined2", 3: "confined3"}
+_CONFINE_SLICE = "arxconfine.slice"
+_SYSTEMD_DIR = "/etc/systemd/system"
+_CONFINE_DROPIN = "90-arx-confine.conf"
+_CGROUP_PATH_RE = re.compile(r"^[A-Za-z0-9@_.:\\-]{1,200}(?:/[A-Za-z0-9@_.:\\-]{1,200}){1,3}$")
+_PROTECTED_UNITS = re.compile(r"^(?:ssh|sshd|dbus|dbus-broker|arx|polkit|systemd-[\w-]+|"
+                              r"getty@[\w-]*|serial-getty@[\w-]*)\.service$")
+
+
+def _systemd_nftset() -> bool:
+    """¿systemd ≥ 254? Desde ahí repone el cgroup de un servicio en el set al reiniciarlo."""
+    out = recon._run(["systemctl", "--version"]) or ""
+    m = re.match(r"systemd (\d+)", out)
+    return bool(m) and int(m.group(1)) >= 254
+
+
+def _pin_confinement(name: str, path: str, set_name: str) -> None:
+    """Que el confinamiento de un servicio sobreviva a sus reinicios y a los de la máquina.
+
+    systemd ≥ 254: `NFTSet=`. Antes (Ubuntu 22.04, Debian 12): un drop-in con `ExecStartPre`. systemd
+    crea el cgroup antes de `ExecStartPre`, así que el set lo tiene antes de que arranque el programa
+    (probado en Ubuntu 22.04 real). El `-` hace que un fallo de nft no impida arrancar el servicio."""
+    if _systemd_nftset():
+        subprocess.run(["systemctl", "set-property", name, f"NFTSet=cgroup:inet:arx:{set_name}"],
+                       capture_output=True, timeout=15)
+        return
+    d = os.path.join(_SYSTEMD_DIR, f"{name}.d")
+    try:
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, _CONFINE_DROPIN), "w", encoding="utf-8") as f:
+            f.write("# Arx: confined without outbound network until you decide (arx accept).\n"
+                    f"[Service]\nExecStartPre=-{shutil.which('nft') or '/usr/sbin/nft'} add element inet "
+                    f"arx {set_name} '{{ \"{path}\" }}'\n")
+    except OSError:
+        return
+    subprocess.run(["systemctl", "daemon-reload"], capture_output=True, timeout=30)
+
+
+def _unpin_confinement(name: str) -> None:
+    if _systemd_nftset():
+        subprocess.run(["systemctl", "set-property", name, "NFTSet="], capture_output=True, timeout=15)
+        return
+    try:
+        os.unlink(os.path.join(_SYSTEMD_DIR, f"{name}.d", _CONFINE_DROPIN))
+    except OSError:
+        return
+    subprocess.run(["systemctl", "daemon-reload"], capture_output=True, timeout=30)
+
+
+def _nft_setup_confine() -> bool:
+    """Sets y reglas del confinamiento. Aparte de _nft_setup: un kernel o un nft sin `socket
+    cgroupv2` no debe dejar al host sin el resto de la contención."""
+    if not _nft_setup():
+        return False
+    try:
+        r = subprocess.run(["nft", "list", "table", "inet", "arx"], capture_output=True, text=True,
+                           timeout=15)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    listing = r.stdout or ""
+    cmds = []
+    for level, name in _CONFINE_SETS.items():
+        if f"set {name} " not in listing:
+            cmds.append(["nft", "add", "set", "inet", "arx", name,
+                         "{", "typeof", "socket", "cgroupv2", "level", f"{level};", "}"])
+        if f"@{name}" not in _nft_chain(listing, "output"):
+            cmds += [["nft", "add", "rule", "inet", "arx", "output", "meta", "oifname", "!=", "lo",
+                      "ct", "direction", "original", "socket", "cgroupv2", "level", str(level),
+                      f"@{name}", "drop"],
+                     ["nft", "add", "rule", "inet", "arx", "output", "ct", "direction", "original",
+                      "socket", "cgroupv2", "level", str(level), f"@{name}", "meta", "l4proto",
+                      "{", "tcp,", "udp", "}", "th", "dport", "53", "drop"]]
+    for argv in cmds:
+        try:
+            if subprocess.run(argv, capture_output=True, text=True, timeout=15).returncode != 0:
+                return False
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+    return True
+
+
+def _can_confine() -> bool:
+    return (_is_linux_root() and _nft_available() and bool(shutil.which("busctl"))
+            and os.path.exists("/sys/fs/cgroup/cgroup.controllers") and _nft_setup_confine())
+
+
+def _cgroup_of(pid: int) -> str | None:
+    try:
+        for line in open(f"/proc/{pid}/cgroup", encoding="utf-8"):
+            if line.startswith("0::"):
+                return line.strip()[3:].strip("/")
+    except OSError:
+        return None
+    return None
+
+
+def _nft_cgroup(action: str, set_name: str, path: str) -> bool:
+    if set_name not in _CONFINE_SETS.values() or not _CGROUP_PATH_RE.match(path) or ".." in path:
+        return False
+    try:
+        return subprocess.run(["nft", action, "element", "inet", "arx", set_name, f'{{ "{path}" }}'],
+                              capture_output=True, text=True, timeout=15).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def _confine_pid(pid: int) -> dict | None:
+    """Confina el servicio de `pid`, o a `pid` en un scope propio. Lo hecho, o None."""
+    from arx.modules import provenance  # perezoso: provenance importa este módulo
+
+    unit = provenance.unit_of(pid)
+    if unit:
+        path, name = unit
+        set_name = _CONFINE_SETS.get(path.count("/") + 1)
+        if not set_name or _PROTECTED_UNITS.match(name) or not provenance._UNIT_RE.match(name):
+            return None
+        if not _nft_cgroup("add", set_name, path):
+            return None
+        _pin_confinement(name, path, set_name)
+        return {"unit": name, "path": path, "set": set_name}
+    scope = f"arxconfine-{pid}.scope"
+    try:
+        r = subprocess.run(["busctl", "call", "org.freedesktop.systemd1", "/org/freedesktop/systemd1",
+                            "org.freedesktop.systemd1.Manager", "StartTransientUnit",
+                            "ssa(sv)a(sa(sv))", scope, "fail", "2", "PIDs", "au", "1", str(pid),
+                            "Slice", "s", _CONFINE_SLICE, "0"],
+                           capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    path = f"{_CONFINE_SLICE}/{scope}"
+    for _ in range(20):  # systemd mueve el proceso en segundo plano
+        if _cgroup_of(pid) == path:
+            break
+        time.sleep(0.1)
+    else:
+        return None
+    if r.returncode != 0 or not _nft_cgroup("add", "confined2", path):
+        return None
+    return {"scope": scope, "path": path, "set": "confined2", "pid": pid}
+
+
+def _already_confined(pid: int, revert: dict) -> bool:
+    cg = _cgroup_of(pid) or ""
+    return cg.startswith(_CONFINE_SLICE + "/") or any(
+        cg == u.get("path") or cg.startswith(str(u.get("path")) + "/") for u in revert.get("units") or [])
+
+
+def boot_restore() -> str:
+    """Al arrancar, antes de que haya red: lo contenido vuelve al kernel (`arx service restore`)."""
+    if not (_is_linux_root() and _nft_available()):
+        return tr("requires Linux + root with nftables")
+    if not _nft_setup():
+        return tr("nftables present but the arx table could not be prepared")
+    can_confine = _nft_setup_confine()  # el set debe existir cuando systemd arranque a los confinados
+    reset = restore_kernel_blocks()
+    confined = _restore_confinements() if can_confine else 0
+    msg = tr("containment back in the kernel: {blocks} · confinements: {confined}",
+             blocks=(reset or {}).get("detail") or tr("nothing was missing"), confined=confined)
+    record({"kind": "boot_restore", "detail": msg})
+    return msg
+
+
+def _confine(exe: str, pids: list[int], finding: dict) -> tuple[str, dict | None]:
+    revert = {"tool": "confine", "exe": exe, "units": [], "scopes": []}
+    for pid in pids:
+        if _already_confined(pid, revert):
+            continue
+        done = _confine_pid(pid)
+        if done:
+            revert["units" if "unit" in done else "scopes"].append(done)
+    if not (revert["units"] or revert["scopes"]):
+        return tr("could not confine it (no process could be moved): nothing was done"), None
+    register_block(finding, revert, ttl_min=None)
+    what = [u["unit"] for u in revert["units"]] + [f"pid {s['pid']}" for s in revert["scopes"]]
+    return (tr("confined without outbound network: {what}. It keeps running; it does not expire, "
+               "you decide", what=", ".join(what))), revert
+
+
+def _release_confinement(revert: dict) -> str:
+    done = []
+    for u in revert.get("units") or []:
+        name = str(u.get("unit", ""))
+        if not re.match(r"^[A-Za-z0-9@_.:\\-]{1,200}\.service$", name):
+            continue
+        _nft_cgroup("delete", str(u.get("set")), str(u.get("path", "")))
+        _unpin_confinement(name)
+        done.append(name)
+    for sc in revert.get("scopes") or []:
+        _nft_cgroup("delete", str(sc.get("set")), str(sc.get("path", "")))
+        done.append(f"pid {sc.get('pid')}")
+    return tr("network restored to: {what}", what=", ".join(done) or "—")
+
+
+def _extend_containment(blk: dict) -> int:
+    """Un proceso nuevo del mismo programa (cron, un reinicio) no se escapa de lo ya decidido."""
+    revert = blk.get("revert") if isinstance(blk.get("revert"), dict) else {}
+    exe, tool = revert.get("exe"), revert.get("tool")
+    if tool not in ("sigstop", "confine") or not isinstance(exe, str) or not _is_linux_root():
+        return 0
+    pids = [p for p in _pids_for_exe(exe) if p > 1 and p != os.getpid()]
+    new = []
+    if tool == "sigstop":
+        for pid in pids:
+            if pid in (revert.get("pids") or []):
+                continue
+            try:
+                os.kill(pid, signal.SIGSTOP)
+                new.append(pid)
+            except OSError:
+                continue
+        revert["pids"] = list(revert.get("pids") or []) + new
+    else:
+        for pid in pids:
+            if _already_confined(pid, revert):
+                continue
+            done = _confine_pid(pid)
+            if done:
+                revert["units" if "unit" in done else "scopes"].append(done)
+                new.append(pid)
+    if new:
+        _save_blocks([{**b, "revert": revert} if b.get("fp") == blk.get("fp") else b
+                      for b in _load_blocks()])
+        record({"kind": "containment_extended", "detail": blk.get("detail"), "result": new})
+    return len(new)
+
+
+def _restore_confinements() -> int:
+    """Tras un reinicio o un `flush`, los confinamientos vuelven: no caducan."""
+    restored = 0
+    for b in _load_blocks():
+        revert = b.get("revert")
+        if not (isinstance(revert, dict) and revert.get("tool") == "confine"):
+            continue
+        for entry in (revert.get("units") or []) + (revert.get("scopes") or []):
+            path, set_name = str(entry.get("path", "")), str(entry.get("set", ""))
+            if not os.path.isdir(f"/sys/fs/cgroup/{path}"):
+                continue  # el servicio está parado o el proceso ya no existe
+            try:
+                there = subprocess.run(["nft", "get", "element", "inet", "arx", set_name,
+                                        f'{{ "{path}" }}'], capture_output=True, timeout=15).returncode == 0
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+            if not there and _nft_cgroup("add", set_name, path):
+                restored += 1
+                if entry.get("unit"):
+                    _pin_confinement(str(entry["unit"]), path, set_name)
+    return restored
+
+
 def _execute_tier1(finding: dict, cfg: dict | None = None) -> tuple[str, dict | None]:
     """Ejecuta una remediación Tier 1 reversible SOLO en Linux+root.
 
@@ -1547,6 +1834,12 @@ def _execute_tier1(finding: dict, cfg: dict | None = None) -> tuple[str, dict | 
         pids = [p for p in _pids_for_exe(exe) if p > 1 and p != os.getpid()]
         if not pids:
             return tr("the process is no longer alive: nothing to suspend"), None
+        fallback = ""
+        if finding.get("provenance") is not None and not finding.get("harm"):
+            if _can_confine():
+                return _confine(exe, pids, finding)
+            # sin cgroup v2 + nftables + systemd no hay confinamiento real: lo seguro es suspender
+            fallback = tr(" (confinement is not possible on this host: suspended instead)")
         stopped = 0
         for pid in pids:
             try:
@@ -1559,7 +1852,8 @@ def _execute_tier1(finding: dict, cfg: dict | None = None) -> tuple[str, dict | 
         revert = {"tool": "sigstop", "exe": exe, "pids": pids}
         register_block(finding, revert)
         return (tr("process suspended ({stopped} pid): automatic SIGCONT on expiry "
-                   "({DEFAULT_TTL_MIN} min)", stopped=stopped, DEFAULT_TTL_MIN=DEFAULT_TTL_MIN)), revert
+                   "({DEFAULT_TTL_MIN} min)", stopped=stopped, DEFAULT_TTL_MIN=DEFAULT_TTL_MIN)
+                + fallback), revert
     if kind == "canary":
         return tr("alert level raised and context captured"), None
     if kind in ("port_scan", "auth_bruteforce", "intel_ip") and target.get("ip"):
@@ -1680,6 +1974,8 @@ def handle(finding: dict, enforce: bool = False, authorized: bool = False,
         "remediation": plan["action"],
         "reversible": plan["reversible"],
         "finding_kind": finding.get("kind"),
+        # el porqué viaja con el incidente: quien lee una alerta tiene que poder decidir con él
+        "why": finding.get("why"),
     }
     with config.locked():
         st = load_findings()
@@ -1700,6 +1996,8 @@ def handle(finding: dict, enforce: bool = False, authorized: bool = False,
             status = tr("protected ({reason}): observed only", reason=reason)
         elif tier == 1 and (blk := _active_block(fp, now)):
             status = tr("already contained (active block {blk})", blk=_until(blk))
+            if enforce and (n := _extend_containment(blk)):
+                status += tr(" · and {n} new process(es) of the same program", n=n)
         elif tier == 1 and entry.get("blocked_before"):
             outcome["tier"] = 2
             pid = _add_pending(finding, {"action": tr("{action}: REAPPEARED after the block expired",

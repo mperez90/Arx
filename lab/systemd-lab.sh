@@ -24,11 +24,22 @@ if reaches 22; then fail "el atacante ya no llega al SSH"; else pass "el atacant
 check "al momento lo explica en el journal" bash -c "docker exec $VIC journalctl -u arx --no-pager -q | grep -q 'scan from'"
 slate
 
-step "el servicio endurecido suspende un dropper en /tmp y en /home"
+step "el servicio endurecido: dropper en /tmp suspendido; programa sin señales de daño en /home, confinado"
 v bash -c 'cp /usr/bin/yes /tmp/minero; chmod +x /tmp/minero; systemd-run --quiet --unit=dropper1 --property=StandardOutput=null /tmp/minero
   cp /usr/bin/yes /home/bob/minero; chown bob: /home/bob/minero; chmod +x /home/bob/minero; systemd-run --quiet --uid=bob --unit=dropper2 --property=StandardOutput=null /home/bob/minero'
 if wait_for 70 bash -c "docker exec $VIC sh -c 'ps -o stat= -p \$(pgrep -f ^/tmp/minero | head -1)' 2>/dev/null | grep -q T"; then pass "dropper en /tmp suspendido"; else fail "dropper en /tmp suspendido"; fi
-if wait_for 40 bash -c "docker exec $VIC sh -c 'ps -o stat= -p \$(pgrep -f ^/home/bob/minero | head -1)' 2>/dev/null | grep -q T"; then pass "dropper en /home suspendido"; else fail "dropper en /home suspendido"; fi
+# sin paquete y sin señales de daño (decisión E): confinado sin red y sin suspender. Si el kernel no deja
+# confinar por cgroup (el de Docker Desktop no deja), lo seguro es suspenderlo y decirlo. Ninguna otra
+# salida vale. El confinamiento real se mide en lab/lima-lab.sh, en un kernel de verdad.
+home_contained() {
+  if docker exec "$VIC" nft list set inet arx confined2 2>/dev/null | grep -q dropper2.service; then
+    ! docker exec "$VIC" sh -c 'ps -o stat= -p $(pgrep -f ^/home/bob/minero | head -1)' 2>/dev/null | grep -q T
+  else
+    docker exec "$VIC" sh -c 'ps -o stat= -p $(pgrep -f ^/home/bob/minero | head -1)' 2>/dev/null | grep -q T \
+      && docker exec "$VIC" grep -q "confinement is not possible" /var/lib/arx/incidents.jsonl
+  fi
+}
+if wait_for 70 home_contained; then pass "programa de /home: confinado sin red (o suspendido, dicho, si aquí no se puede confinar)"; else fail "programa de /home contenido como corresponde"; fi
 v systemctl stop dropper1 dropper2 2>/dev/null
 slate
 

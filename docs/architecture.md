@@ -25,7 +25,7 @@ its answer.
 | Tier | Examples | Authority |
 |------|----------|-----------|
 | **0** | log evidence and alert | automatic, always |
-| **1** | block an IP, a port or a reverse shell channel; suspend a suspicious process | automatic with `--enforce`, **undoes itself after 60 min** |
+| **1** | block an IP, a port or a reverse shell channel; suspend a suspicious process; confine a program of unproven origin | automatic with `--enforce`, **undoes itself after 60 min** (confinement waits for you) |
 | **2** | restore critical files, quarantine what was planted, lock an account and close its sessions, kill a process that came back, remove a SUID bit | **human + word** |
 
 Tiers 0 and 1 are relentless and never tire. What's irreversible belongs to the human, with one
@@ -34,9 +34,12 @@ without waiting and you're told with the full context. Never on root, system acc
 last admin account, never without a verified live session, and no more than twice an hour. A
 locked account doesn't unlock on its own: a person decides with `arx unlock`.
 
-A new binary in a system directory is a low-confidence signal and is only logged (Tier 0):
-suspending it would freeze all of its processes. A reverse shell channel is cut with a DROP in
-nftables, not by destroying the socket: on expiry, the flow resumes.
+New software is judged by proof of origin, not by its path. A binary from a package in a signed
+repository, intact (and, if it listens, started by a unit from the same source package) is only
+logged. One that can't prove it is confined: its cgroup can't open connections (nftables matching by
+cgroup v2; systemd's `NFTSet=` keeps it after restarts), so it keeps serving but can't call home. Only
+signs of harm suspend it. A reverse shell channel is cut with a DROP in nftables, not by destroying
+the socket: on expiry, the flow resumes.
 
 ## 3. Behavior baseline
 

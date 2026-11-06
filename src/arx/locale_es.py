@@ -1,6 +1,78 @@
 """Arx · catálogo español. La clave es el texto fuente (inglés) tal como aparece en tr(...)."""
 
 ES = {
+    "requires Linux + root with nftables":
+        "requiere Linux + root con nftables",
+    "containment back in the kernel: {blocks} · confinements: {confined}":
+        "contención repuesta en el kernel: {blocks} · confinamientos: {confined}",
+    "nothing was missing":
+        "no faltaba nada",
+    "put Arx's containment back in the kernel (runs at boot)":
+        "reponer en el kernel la contención de Arx (corre al arrancar)",
+    "network restored to: {what}":
+        "red devuelta a: {what}",
+    "confined without outbound network: {what}. It keeps running; it does not expire, you decide":
+        "confinado sin red saliente: {what}. Sigue funcionando; no caduca, decides tú",
+    "log and alert (verified package)":
+        "registrar y avisar (paquete verificado)",
+    "confine it: no outbound network, it keeps running (until you decide)":
+        "confinarlo: sin red saliente, sigue funcionando (hasta que decidas)",
+    "unproven origin and no sign of harm: cutting its network stops a backdoor from calling home without stopping your program":
+        "procedencia sin probar y sin señales de daño: cortarle la red impide que una puerta trasera llame a casa sin parar tu programa",
+    "could not confine it (no process could be moved): nothing was done":
+        "no se pudo confinar (ningún proceso se pudo mover): no se hizo nada",
+    " (confinement is not possible on this host: suspended instead)":
+        " (en este host no se puede confinar: suspendido en su lugar)",
+    "{n} confinement(s) put back":
+        "{n} confinamiento(s) repuesto(s)",
+    " · and {n} new process(es) of the same program":
+        " · y {n} proceso(s) nuevo(s) del mismo programa",
+    "package {pkg} from a signed repository, intact":
+        "paquete {pkg} de un repositorio firmado, intacto",
+    "{unit} from package {pkg}, signed repository, intact":
+        "{unit} del paquete {pkg}, repositorio firmado, intacto",
+    "no package database to check it against":
+        "no hay base de paquetes contra la que comprobarlo",
+    "it does not belong to any package":
+        "no pertenece a ningún paquete",
+    "changed since its package installed it":
+        "cambió desde que lo instaló su paquete",
+    "dpkg has no checksum for it: it cannot be proven intact":
+        "dpkg no guarda su resumen: no se puede probar que esté intacto",
+    "the process is gone or cannot be read":
+        "el proceso ya no existe o no se puede leer",
+    "its executable was deleted from disk":
+        "su ejecutable se borró del disco",
+    "not started by a system service":
+        "no lo arranca un servicio del sistema",
+    "its unit {unit} is not from any package":
+        "su unit {unit} no es de ningún paquete",
+    "its unit and its binary come from different packages":
+        "su unit y su binario vienen de paquetes distintos",
+    "a drop-in changes what {unit} runs: {path}":
+        "un drop-in cambia lo que ejecuta {unit}: {path}",
+    "runs from a temporary directory":
+        "corre desde un directorio temporal",
+    "hidden path":
+        "ruta oculta",
+    "static analysis flagged it":
+        "el análisis estático lo marcó",
+    "its file was deleted while it runs":
+        "su fichero se borró mientras corre",
+    "comes from a session the baseline does not know":
+        "viene de una sesión que la línea base no conoce",
+    "apt does not know this package":
+        "apt no conoce este paquete",
+    "installed from a local package, not from a repository":
+        "instalado desde un paquete suelto, no desde un repositorio",
+    "its repository is marked trusted=yes: apt does not check its signature":
+        "su repositorio está marcado trusted=yes: apt no comprueba su firma",
+    "an interpreter running code that is not from any package":
+        "un intérprete que ejecuta código que no es de ningún paquete",
+    "started by a network service (webshell pattern)":
+        "lo lanzó un servicio de red (patrón de webshell)",
+    "no owning process found":
+        "no se encontró el proceso dueño",
     "No authorization word: setup cancelled, nothing was saved.":
         "Sin palabra de autorización: configuración cancelada, no se guardó nada.",
     "Arx cannot find a writable directory for its state ({v}). Use ARX_CONFIG_DIR / ARX_STATE_DIR.":
