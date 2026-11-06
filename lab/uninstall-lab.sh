@@ -15,7 +15,7 @@ v() { limactl shell "$VM" sudo "$@"; }
 check() { local d="$1"; shift; if "$@"; then pass "$d"; else fail "$d"; fi; }
 wait_for() { local n="$1"; shift; local i; for i in $(seq "$n"); do "$@" && return 0; sleep 1; done; return 1; }
 in_unit() { local u="$1"; shift; v sh -c "echo \$\$ > /sys/fs/cgroup/system.slice/$u/cgroup.procs && exec $*"; }
-leftovers() { v sh -c 'ls /etc/systemd/system/*.service.d/9[01]-arx-*.conf /etc/systemd/system/arx*.service 2>/dev/null
+leftovers() { v sh -c 'ls /etc/systemd/system/*.service.d/9[01]-arx-*.conf /etc/systemd/system/arx*.service /etc/systemd/system/arx*.timer 2>/dev/null
   grep -lsE "inet:arx:|inet arx confined" /etc/systemd/system.control/*.service.d/*.conf
   nft list table inet arx >/dev/null 2>&1 && echo "tabla inet arx"
   ls -d /etc/arx /var/lib/arx 2>/dev/null; true'; }
@@ -26,7 +26,7 @@ step "víctima limpia, Arx instalado desde su paquete"
 v bash -c 'systemctl disable --now arx arx-firewall loose 2>/dev/null; pkill -9 -f "[a]rx.pyz"
   apt-get -o DPkg::Lock::Timeout=300 purge -y -qq arx >/dev/null 2>&1
   rm -rf /etc/arx /var/lib/arx /tmp/arxsrc /opt/loose /etc/systemd/system/loose.service \
-    /etc/systemd/system/*.service.d/9[01]-arx-*.conf /etc/systemd/system/arx*.service
+    /etc/systemd/system/*.service.d/9[01]-arx-*.conf /etc/systemd/system/arx*.service /etc/systemd/system/arx*.timer
   grep -lsE "inet:arx:|inet arx confined" /etc/systemd/system.control/*.service.d/*.conf | xargs -r rm -f
   nft delete table inet arx 2>/dev/null; systemctl daemon-reload
   export DEBIAN_FRONTEND=noninteractive; apt-get -o DPkg::Lock::Timeout=300 install -y -qq socat nftables netcat-openbsd >/dev/null'
@@ -63,6 +63,19 @@ v bash -c 'mkdir -p /etc/systemd/system/arx.service.d && printf "[Service]\nEnvi
   systemctl daemon-reload; systemctl start arx'
 check "un drop-in ajeno en su unit da alerta crítica" wait_for 60 incident "someone added drop-ins to Arx"
 v bash -c 'rm -rf /etc/systemd/system/arx.service.d; systemctl daemon-reload; systemctl restart arx'
+
+step "si systemd deja de reiniciarlo: aviso de caído y relanzamiento (DEC#11)"
+check "el relanzador está programado" v systemctl is-active -q arx-revive.timer
+v bash -c 'mv /var/lib/arx/baseline.json /root/baseline.lab && systemctl restart arx'   # sin base sellada: sale con error
+failed() { v systemctl is-failed -q arx; }
+check "tras los reintentos, systemd lo da por caído" wait_for 240 failed
+check "y se avisa: Arx caído" wait_for 30 incident "self_down"
+v bash -c 'mv /root/baseline.lab /var/lib/arx/baseline.json && systemctl start arx-revive.service'
+check "el relanzador lo vuelve a arrancar" wait_for 30 v systemctl is-active -q arx
+v systemctl stop arx
+v systemctl start arx-revive.service
+check "pero no deshace una parada hecha a mano" sh -c "! limactl shell $VM systemctl is-active -q arx"
+v systemctl start arx
 
 step "desinstalar (purge)"
 v bash -c 'DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 purge -y -qq arx >/dev/null 2>&1'

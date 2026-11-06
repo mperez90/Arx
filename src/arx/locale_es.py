@@ -103,6 +103,14 @@ ES = {
         "servicio crítico ({unit}): no se confina solo",
     "invalid service: nothing confined":
         "servicio no válido: no se confina nada",
+    " (frozen {ms} ms after it started)":
+        " (congelado {ms} ms después de arrancar)",
+    "Arx is down: systemd gave up restarting it":
+        "Arx está caído: systemd dejó de reiniciarlo",
+    "🛑 Arx is down on {host}: systemd gave up restarting it. It will try again every 15 minutes; check: journalctl -u arx":
+        "🛑 Arx está caído en {host}: systemd dejó de reiniciarlo. Lo volverá a intentar cada 15 minutos; revisa: journalctl -u arx",
+    "report that systemd gave up restarting Arx (systemd runs it)":
+        "avisar de que systemd dejó de reiniciar Arx (lo ejecuta systemd)",
     "sshd's configuration could not be read with certainty: alert only, nothing frozen":
         "la configuración de sshd no se pudo leer con certeza: solo se avisa, no se congela nada",
     "Arx's unit {path} was changed or removed":

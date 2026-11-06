@@ -13,6 +13,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from arx import config
@@ -20,6 +21,9 @@ from arx.i18n import tr
 
 UNIT_PATH = "/etc/systemd/system/arx.service"
 EARLY_UNIT_PATH = "/etc/systemd/system/arx-firewall.service"
+DOWN_UNIT_PATH = "/etc/systemd/system/arx-down.service"
+REVIVE_UNIT_PATH = "/etc/systemd/system/arx-revive.service"
+REVIVE_TIMER_PATH = "/etc/systemd/system/arx-revive.timer"
 
 
 def _is_root() -> bool:
@@ -50,6 +54,8 @@ After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=600
 StartLimitBurst=10
+# if systemd gives up restarting it: a critical alert, and arx-revive.timer tries again every 15 min
+OnFailure=arx-down.service
 
 [Service]
 Type=simple
@@ -58,7 +64,8 @@ ExecStart={exec_start} guard{' --enforce' if enforce else ''}
 ExecStopPost=-{exec_start} service stopped
 Restart=always
 RestartSec=10
-# Arx never takes the host down: capped, low priority, and the first the kernel kills if memory runs out.
+# Arx never takes the host down: capped and at low priority. MemoryMax already keeps it from starving the
+# host; a positive OOMScoreAdjust would make it the first victim of memory pressure an attacker induces.
 MemoryHigh=384M
 MemoryMax=512M
 CPUQuota=50%
@@ -66,7 +73,7 @@ TasksMax=256
 Nice=5
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7
-OOMScoreAdjust=500
+OOMScoreAdjust=0
 # Runs as root: it contains threats (firewall, signals, system files).
 # Hardened without blocking its job. No ProtectHome: authorizing from the chat happens inside this
 # service, and restoring an authorized_keys or removing a dropper from /home would fail.
@@ -101,6 +108,44 @@ MemoryMax=256M
 
 [Install]
 WantedBy=sysinit.target
+"""
+
+
+def down_unit_text(exec_start: str) -> str:
+    return f"""[Unit]
+Description=Arx - report that systemd gave up restarting it
+
+[Service]
+Type=oneshot
+ExecStart={exec_start} service down
+TimeoutStartSec=60
+"""
+
+
+def revive_unit_text() -> str:
+    """Solo si quedó en fallo: una parada hecha a mano no se deshace."""
+    systemctl = shutil.which("systemctl") or "/usr/bin/systemctl"
+    return f"""[Unit]
+Description=Arx - start it again if it is down after a failure
+
+[Service]
+Type=oneshot
+ExecCondition={systemctl} is-failed -q arx.service
+ExecStart={systemctl} reset-failed arx.service
+ExecStart={systemctl} start arx.service
+"""
+
+
+def revive_timer_text() -> str:
+    return """[Unit]
+Description=Arx - every 15 minutes, start it again if it is down after a failure
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=15min
+
+[Install]
+WantedBy=timers.target
 """
 
 
@@ -141,9 +186,13 @@ def install(exec_start: str | None = None, enforce: bool = False) -> int:
         return 0
     Path(UNIT_PATH).write_text(text)
     Path(EARLY_UNIT_PATH).write_text(early_unit_text(exec_start or _default_exec()))
+    Path(DOWN_UNIT_PATH).write_text(down_unit_text(exec_start or _default_exec()))
+    Path(REVIVE_UNIT_PATH).write_text(revive_unit_text())
+    Path(REVIVE_TIMER_PATH).write_text(revive_timer_text())
     _seal_units()
     subprocess.run(["systemctl", "daemon-reload"], check=False)
     subprocess.run(["systemctl", "enable", "arx-firewall"], check=False)
+    subprocess.run(["systemctl", "enable", "--now", "arx-revive.timer"], check=False)
     r = subprocess.run(["systemctl", "enable", "--now", "arx"], check=False)
     if r.returncode == 0:
         print(tr("✓ Arx installed as a systemd service and started (enable --now)."))
@@ -154,7 +203,10 @@ def install(exec_start: str | None = None, enforce: bool = False) -> int:
 
 # ── autoprotección (DoD-6): parar o tocar a Arx se avisa fuera del host ───────
 PLANNED_STOP = "/run/arx/planned-stop"
-DROPIN_DIRS = ("/etc/systemd/system/arx.service.d", "/etc/systemd/system/arx-firewall.service.d")
+PLANNED_STOP_S = 300
+def _units() -> tuple:
+    return UNIT_PATH, EARLY_UNIT_PATH, DOWN_UNIT_PATH, REVIVE_UNIT_PATH, REVIVE_TIMER_PATH
+DROPIN_DIRS = tuple(f"{p}.d" for p in (UNIT_PATH, EARLY_UNIT_PATH, DOWN_UNIT_PATH, REVIVE_UNIT_PATH, REVIVE_TIMER_PATH))
 
 
 def _sha(path: str) -> str | None:
@@ -168,7 +220,7 @@ def _sha(path: str) -> str | None:
 
 def _seal_units() -> None:
     """La huella de las units que Arx acaba de escribir: otra cosa en su lugar es manipulación."""
-    config.write_json(config.state_dir() / "self.json", {p: _sha(p) for p in (UNIT_PATH, EARLY_UNIT_PATH)})
+    config.write_json(config.state_dir() / "self.json", {p: _sha(p) for p in _units()})
 
 
 def self_check(dropin_dirs=DROPIN_DIRS) -> list[dict]:
@@ -203,12 +255,27 @@ def _tamper(detail: str, key: str) -> dict:
             "why": tr("someone changed Arx itself: it may be an attempt to blind it"), "fp_key": f"self_tamper|{key}"}
 
 
+def down(notify_send=None) -> int:
+    """OnFailure: systemd dejó de reiniciarlo. Alerta crítica fuera del host; arx-revive.timer lo reintenta."""
+    import socket
+    from arx.modules import response
+    response.record({"kind": "self_down", "sev": "crit", "detail": tr("Arx is down: systemd gave up restarting it")})
+    from arx import notify
+    (notify_send or notify.send)(tr("🛑 Arx is down on {host}: systemd gave up restarting it. It will try again every "
+                                    "15 minutes; check: journalctl -u arx", host=socket.gethostname()))
+    return 0
+
+
 def stopped(env=None, notify_send=None) -> int:
     """ExecStopPost: Arx se ha parado. Fuera de su desinstalación o de un apagado, se avisa fuera del host."""
     import socket
     env = os.environ if env is None else env
-    if os.path.exists(PLANNED_STOP):
+    try:
+        planned = time.time() - os.stat(PLANNED_STOP).st_mtime < PLANNED_STOP_S
         os.unlink(PLANNED_STOP)
+    except OSError:
+        planned = False
+    if planned:  # una marca vieja no se traga una parada de verdad
         return 0
     try:
         state = subprocess.run(["systemctl", "is-system-running"], capture_output=True, text=True, timeout=5).stdout.strip()
@@ -236,7 +303,11 @@ def uninstall() -> int:
         Path(PLANNED_STOP).touch()
     except OSError:
         pass
-    subprocess.run(["systemctl", "disable", "--now", "arx", "arx-firewall"], check=False)
+    subprocess.run(["systemctl", "disable", "--now", "arx-revive.timer", "arx", "arx-firewall"], check=False)
+    try:  # la marca vale solo para esta parada: si Arx ya estaba parado, no puede tragarse la siguiente
+        os.unlink(PLANNED_STOP)
+    except OSError:
+        pass
     from arx.modules import profile, response
     profile.release_all()  # sin Arx, los drop-ins de vigilancia no tienen sentido
     released = response.release_all_confinements()
@@ -244,7 +315,7 @@ def uninstall() -> int:
         print(tr("  {n} confined service(s) or program(s) got their network back.", n=released))
     if shutil.which("nft"):  # bloqueos, sets y reglas: sin Arx, nadie los gestionaría
         subprocess.run(["nft", "delete", "table", "inet", "arx"], capture_output=True, check=False)
-    for unit in (UNIT_PATH, EARLY_UNIT_PATH):
+    for unit in _units():
         try:
             Path(unit).unlink()
         except OSError:
@@ -270,6 +341,8 @@ def run(action: str, exec_start: str | None = None, enforce: bool = False) -> in
         return 0
     if action == "stopped":
         return stopped()
+    if action == "down":
+        return down()
     if action == "install":
         return install(exec_start, enforce)
     if action == "uninstall":
