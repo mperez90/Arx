@@ -47,7 +47,7 @@ _SERVICE_USERS = {"www-data", "nginx", "apache", "http", "httpd", "tomcat", "jet
 
 _events: collections.deque = collections.deque(maxlen=MAX_EVENTS)
 _state = {"mode": None, "lost": 0}
-_allow = {"at": 0.0, "paths": set()}
+_allow = {"at": 0.0, "paths": set(), "sure": False}
 _seen: set = set()
 
 
@@ -128,7 +128,8 @@ def describe(pid: int, root: str = "") -> dict | None:
         pexe = os.readlink(f"/proc/{ppid}/exe").removesuffix(" (deleted)")
     except OSError:
         pexe = ""
-    return {"pid": pid, "start": start, "exe": exe, "unit": m.group(1), "ppid": ppid, "parent_exe": pexe,
+    argv = _read(f"/proc/{pid}/cmdline", 1024).split("\0")[:3]
+    return {"pid": pid, "start": start, "exe": exe, "argv": argv, "unit": m.group(1), "ppid": ppid, "parent_exe": pexe,
             "parent_title": _read(f"/proc/{ppid}/cmdline", 512).replace("\0", " ").strip(),
             "parent_user": _owner(ppid)}
 
@@ -142,20 +143,72 @@ def same_process(pid: int, exe: str, start: int) -> bool:
 
 
 # ── reglas ───────────────────────────────────────────────────────────────────
+SSHD_CONFIG = "/etc/ssh/sshd_config"
+_COMMAND_KEYS = ("authorizedkeyscommand", "authorizedprincipalscommand")
+_CONFIG_LINE_RE = re.compile(r"^(\S+?)(?:\s*=\s*|\s+)(.+)$")
+
+
+def config_commands(path: str | None = None, depth: int = 0, seen: set | None = None) -> tuple[set[str], bool]:
+    """(comandos, seguro) que sshd_config declara, también dentro de bloques Match y de sus Include. `sshd -T`
+    sin -C no ve los de un Match (lo típico con LDAP o sssd): solo con él, se congelarían esos logins."""
+    import glob
+    import shlex
+    seen = set() if seen is None else seen
+    path = path or SSHD_CONFIG
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            text = f.read(1 << 20)
+    except OSError:
+        return set(), False
+    commands, sure = set(), True
+    seen.add(path)
+    for raw in text.splitlines():
+        m = _CONFIG_LINE_RE.match(raw.split("#", 1)[0].strip())
+        if not m:
+            continue
+        key, value = m.group(1).lower(), m.group(2).strip()
+        try:
+            words = shlex.split(value)
+        except ValueError:
+            sure = False
+            continue
+        if key in _COMMAND_KEYS and words and words[0].lower() != "none":
+            commands.add(words[0])
+        elif key == "include":
+            if depth >= 8:
+                sure = False
+                continue
+            for pattern in words:
+                pattern = pattern if pattern.startswith("/") else os.path.join(os.path.dirname(SSHD_CONFIG), pattern)
+                for inc in sorted(glob.glob(pattern)):
+                    if inc not in seen:
+                        seen.add(inc)
+                        more, ok = config_commands(inc, depth + 1, seen)
+                        commands |= more
+                        sure = sure and ok
+    return commands, sure
+
+
 def sshd_allowed(refresh: bool = False) -> set[str]:
-    """Lo que sshd y PAM declaran que se ejecuta antes de autenticar. Se relee cada minuto."""
-    if not refresh and time.monotonic() - _allow["at"] < ALLOW_REFRESH_S and _allow["at"]:
+    """Lo que sshd y PAM declaran que se ejecuta antes de autenticar. Se relee cada minuto. Si algo de esto no
+    se pudo leer con certeza, `_allow["sure"]` queda en falso y la regla de sshd solo avisa (A#6)."""
+    if not refresh and _allow["at"] and time.monotonic() - _allow["at"] < ALLOW_REFRESH_S and not _changed():
         return _allow["paths"]
     paths = {"/usr/sbin/unix_chkpwd", "/sbin/unix_chkpwd"}
     sshd = shutil.which("sshd") or "/usr/sbin/sshd"
     try:
-        out = subprocess.run([sshd, "-T"], capture_output=True, text=True, timeout=10).stdout
+        r = subprocess.run([sshd, "-T"], capture_output=True, text=True, timeout=10)
+        out, sure = r.stdout, r.returncode == 0 and bool(r.stdout.strip())
     except (OSError, subprocess.TimeoutExpired):
-        out = ""
+        out, sure = "", False
     for line in out.splitlines():
         key, _, value = line.partition(" ")
-        if key in ("authorizedkeyscommand", "authorizedprincipalscommand") and value.strip() not in ("", "none"):
+        if key in _COMMAND_KEYS and value.strip() not in ("", "none"):
             paths.add(value.split()[0])
+    read: set = set()
+    declared, parsed = config_commands(seen=read)
+    paths |= declared
+    sure = sure and parsed
     for text in _pam_stack("sshd"):
         for line in text.splitlines():
             tokens = line.split("#", 1)[0].split()
@@ -166,11 +219,39 @@ def sshd_allowed(refresh: bool = False) -> set[str]:
     from arx.modules import profile  # lo que una persona aceptó
     paths |= set(profile.load().get("sshd_allowed") or [])
     paths |= {os.path.realpath(p) for p in paths}
-    _allow.update(at=time.monotonic(), paths=paths)
+    files = read | {f"/etc/pam.d/{n}" for n in _PAM_SEEN}
+    _allow.update(at=time.monotonic(), paths=paths, sure=sure, stamps=_stamps(files))
     return paths
 
 
+def _stamps(files) -> dict:
+    out = {}
+    for f in files:
+        try:
+            out[f] = os.stat(f).st_mtime_ns
+        except OSError:
+            out[f] = None
+    return out
+
+
+def _changed() -> bool:
+    """¿Cambió algo de lo que se leyó? Un admin que añade un AuthorizedKeysCommand no espera un minuto."""
+    stamps = _allow.get("stamps") or {}
+    return not stamps or _stamps(stamps) != stamps
+
+
+def sshd_sure() -> bool:
+    """¿Se leyó la configuración de sshd con certeza? Si no, la regla de sshd solo avisa: nunca un login
+    legítimo congelado por una lectura incompleta."""
+    sshd_allowed()
+    return bool(_allow.get("sure"))
+
+
+_PAM_SEEN: set = set()
+
+
 def _pam_stack(name: str, depth: int = 0) -> list[str]:
+    _PAM_SEEN.add(name)
     text = _read(f"/etc/pam.d/{name}", 65536)
     out = [text]
     if depth < 3:
@@ -180,11 +261,20 @@ def _pam_stack(name: str, depth: int = 0) -> list[str]:
     return out
 
 
-def sshd_preauth(ev: dict, allowed: set[str], sessions: bool | None = None) -> bool:
+def sshd_preauth(ev: dict, allowed: set[str] | None = None, sessions: bool | None = None) -> bool:
     """¿Es sshd, antes de autenticar, lanzando algo que no es suyo ni declarado? (el patrón de xz)"""
     if not SSH_UNIT_RE.match(ev["unit"]) or os.path.basename(ev["parent_exe"]) not in SSHD_PIECES:
         return False
-    if os.path.basename(ev["exe"]) in SSHD_PIECES or ev["exe"] in allowed or os.path.realpath(ev["exe"]) in allowed:
+    if os.path.basename(ev["exe"]) in SSHD_PIECES:
+        return False
+    allowed = sshd_allowed() if allowed is None else allowed  # solo aquí: el resto de eventos no la necesitan
+    if ev["exe"] in allowed or os.path.realpath(ev["exe"]) in allowed:
+        return False
+    # un comando declarado que es un script: el kernel ejecuta el intérprete con el script como primer
+    # argumento (`sh /usr/local/bin/akc`). Cuenta solo así, nunca `sh -c …`
+    argv = ev.get("argv") or []
+    script = argv[1] if len(argv) > 1 else ""
+    if script.startswith("/") and (script in allowed or os.path.realpath(script) in allowed):
         return False
     title = ev.get("parent_title") or ""
     if "@" in title:  # sesión ya autenticada (sin pam_systemd se queda en este cgroup)
@@ -218,8 +308,9 @@ def handle_pid(pid: int, root: str, enforce) -> dict | None:
     ev = describe(pid, root)
     if not ev:
         return None
-    ev["preauth"] = sshd_preauth(ev, sshd_allowed())
-    if ev["preauth"] and enforce():  # milisegundos: antes de que la orden de la puerta trasera haga nada
+    ev["preauth"] = sshd_preauth(ev)
+    ev["sure"] = sshd_sure() if ev["preauth"] else True
+    if ev["preauth"] and ev["sure"] and enforce():  # milisegundos: antes de que la orden de la puerta trasera haga nada
         ev["stopped"] = _freeze(ev)
     _events.append(ev)
     return ev
@@ -268,7 +359,8 @@ def _scan(root: str) -> list[dict]:
         if not ev or (pid, ev["start"]) in _seen:
             continue
         _seen.add((pid, ev["start"]))
-        ev["preauth"] = sshd_preauth(ev, sshd_allowed())
+        ev["preauth"] = sshd_preauth(ev)
+        ev["sure"] = sshd_sure() if ev["preauth"] else True
         out.append(ev)
     return out
 

@@ -103,6 +103,8 @@ ES = {
         "servicio crítico ({unit}): no se confina solo",
     "invalid service: nothing confined":
         "servicio no válido: no se confina nada",
+    "sshd's configuration could not be read with certainty: alert only, nothing frozen":
+        "la configuración de sshd no se pudo leer con certeza: solo se avisa, no se congela nada",
     "Arx's unit {path} was changed or removed":
         "la unit de Arx {path} se cambió o se borró",
     "someone added drop-ins to Arx's unit: {files}":

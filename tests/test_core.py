@@ -3808,12 +3808,71 @@ class ExecWatchTests(unittest.TestCase):
                    self._ev(parent_title="sshd: ana@pts/0"), self._ev(unit="system.slice/nginx.service"),
                    self._ev(parent_exe="/usr/lib/systemd/systemd-executor")):
             self.assertFalse(self.x.sshd_preauth(ev, allowed, sessions=True), ev)
+        # un comando declarado que es un script: el kernel ejecuta el intérprete con el script detrás
+        self.assertFalse(self.x.sshd_preauth(self._ev(argv=["/bin/sh", "/usr/local/bin/akc", "ana"]), allowed, sessions=True))
+        self.assertTrue(self.x.sshd_preauth(self._ev(argv=["sh", "-c", "evil", "/usr/local/bin/akc"]), allowed, sessions=True))
         # sin logind, solo con un título de antes de autenticar: lo de después (pam_motd en [priv]) no
         self.assertFalse(self.x.sshd_preauth(self._ev(parent_title="sshd: ana [priv]"), allowed, sessions=False))
         self.assertTrue(self.x.sshd_preauth(self._ev(parent_title="sshd: unknown [net]"), allowed, sessions=False))
 
-    def test_what_sshd_and_pam_declare_is_allowed(self):
+    def _sshd_config(self, main, included=""):
+        d = tempfile.mkdtemp()
+        os.makedirs(os.path.join(d, "sshd_config.d"))
+        open(os.path.join(d, "sshd_config"), "w").write(main)
+        open(os.path.join(d, "sshd_config.d", "50-ldap.conf"), "w").write(included)
+        p = mock.patch.object(self.x, "SSHD_CONFIG", os.path.join(d, "sshd_config"))
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_commands_inside_match_blocks_and_includes_count(self):
+        """A#6: `sshd -T` sin -C no ve un AuthorizedKeysCommand dentro de Match (LDAP, sssd)."""
+        self._sshd_config("Include sshd_config.d/*.conf\nPasswordAuthentication no\n",
+                          "Match Group ldapusers\n    AuthorizedKeysCommand \"/usr/bin/sss_ssh_authorizedkeys\" %u\n"
+                          "    AuthorizedPrincipalsCommand=/usr/local/bin/principals %u\n"
+                          "Match all\n    AuthorizedKeysCommand none\n")
+        commands, sure = self.x.config_commands()
+        self.assertEqual(commands, {"/usr/bin/sss_ssh_authorizedkeys", "/usr/local/bin/principals"})
+        self.assertTrue(sure)
+
+    def test_a_command_the_admin_just_added_counts_at_once(self):
+        """Sin esperar al minuto de relectura: un login justo después no se congela."""
+        self._sshd_config("Include sshd_config.d/*.conf\n")
+
         class R:
+            returncode, stdout = 0, "port 22\n"
+        with mock.patch.object(self.x.subprocess, "run", lambda *a, **k: R()), \
+                mock.patch.object(self.p, "load", lambda: {}):
+            self.assertNotIn("/usr/local/bin/akc", self.x.sshd_allowed(refresh=True))
+            inc = os.path.join(os.path.dirname(self.x.SSHD_CONFIG), "sshd_config.d", "50-ldap.conf")
+            open(inc, "w").write("Match Group staff\n  AuthorizedKeysCommand /usr/local/bin/akc %u\n")
+            os.utime(inc, ns=(time.time_ns() + 10**9, time.time_ns() + 10**9))
+            self.assertIn("/usr/local/bin/akc", self.x.sshd_allowed())
+
+    def test_when_sshd_cannot_be_read_for_sure_it_only_alerts(self):
+        self._sshd_config("PasswordAuthentication no\n")
+
+        class Broken:
+            returncode, stdout = 255, ""
+        with mock.patch.object(self.x.subprocess, "run", lambda *a, **k: Broken()), \
+                mock.patch.object(self.p, "load", lambda: {}):
+            self.x.sshd_allowed(refresh=True)
+            self.assertFalse(self.x.sshd_sure())
+            kills = []
+            with mock.patch.object(self.x, "describe", lambda pid, root: self._ev()), \
+                    mock.patch.object(self.x, "same_process", lambda pid, exe, start: True), \
+                    mock.patch.object(self.x.os, "kill", lambda pid, sig: kills.append(sig)):
+                ev = self.x.handle_pid(4242, "", lambda: True)
+        self.assertEqual(kills, [])  # nunca un login congelado por una lectura dudosa
+        self.x.drain()
+        f = self._events({}, ev)[0]
+        self.assertTrue(f["target"]["alert_only"])
+        self.assertIn("alert only, nothing frozen", self.r.protected_reason(f, {}))
+
+    def test_what_sshd_and_pam_declare_is_allowed(self):
+        self._sshd_config("PasswordAuthentication no\n")
+
+        class R:
+            returncode = 0
             stdout = "port 22\nauthorizedkeyscommand /usr/local/bin/akc %u\nauthorizedprincipalscommand none\n"
         pam = {"/etc/pam.d/sshd": "auth required pam_exec.so quiet /usr/local/sbin/otp-check\n@include common-auth\n",
                "/etc/pam.d/common-auth": "auth optional pam_exec.so expose_authtok /opt/hooks/notify # aviso\n"}
@@ -3837,6 +3896,7 @@ class ExecWatchTests(unittest.TestCase):
         for enforce in (True, False):
             with mock.patch.object(self.x, "describe", lambda pid, root: self._ev()), \
                     mock.patch.object(self.x, "sshd_allowed", lambda refresh=False: set()), \
+                    mock.patch.object(self.x, "sshd_sure", lambda: True), \
                     mock.patch.object(self.x, "same_process", lambda pid, exe, start: True), \
                     mock.patch.object(self.x.os, "kill", lambda pid, sig: kills.append((pid, sig))):
                 ev = self.x.handle_pid(4242, "", lambda: enforce)
