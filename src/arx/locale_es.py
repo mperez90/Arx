@@ -103,6 +103,8 @@ ES = {
         "servicio crítico ({unit}): no se confina solo",
     "invalid service: nothing confined":
         "servicio no válido: no se confina nada",
+    "could not prepare what {unit} needs to keep authenticating: not confined":
+        "no se pudo preparar lo que {unit} necesita para seguir autenticando: no se confina",
     "  process watch: {mode}":
         "  vigilancia de procesos: {mode}",
     "in the kernel, in real time":

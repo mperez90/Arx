@@ -290,7 +290,7 @@ def protected_reason(finding: dict, cfg: dict | None = None) -> str | None:
             return tr("critical process ({base}): observed only", base=base)
     if kind == "untrusted_update":
         unit = str(target.get("unit") or "")
-        if _PROTECTED_UNITS.match(unit):
+        if _PROTECTED_UNITS.match(unit) and not _SSH_UNIT_RE.match(unit):  # ssh: sin salida, con excepciones
             return tr("critical service ({unit}): it is not confined on its own", unit=unit)
         if target.get("alert_only"):
             return tr("updater, clock or container service ({unit}): alert only", unit=unit)
@@ -1609,6 +1609,153 @@ def _unpin_confinement(name: str) -> None:
     subprocess.run(["systemctl", "daemon-reload"], capture_output=True, timeout=30)
 
 
+# ── ssh: sin red de salida, salvo lo que necesita para autenticar (A#1) ─────────
+_SSH_UNIT_RE = re.compile(r"^sshd?\.service$")
+_ALLOW_DROPIN = "91-arx-confallow.conf"
+_AUTH_FILES = {  # (fichero, regex de la línea, puerto por defecto, protocolos)
+    "/etc/krb5.conf": (r"^\s*(?:kdc|master_kdc)\s*=\s*(\S+)", 88, ("udp", "tcp")),
+    "/etc/ldap/ldap.conf": (r"^\s*URI\s+(.+)$", 389, ("tcp",)),
+    "/etc/ldap.conf": (r"^\s*uri\s+(.+)$", 389, ("tcp",)),
+    "/etc/nslcd.conf": (r"^\s*uri\s+(.+)$", 389, ("tcp",)),
+    "/etc/sssd/sssd.conf": (r"^\s*ldap_(?:backup_)?uri\s*=\s*(.+)$", 389, ("tcp",)),
+    "/etc/pam_radius_auth.conf": (r"^\s*([^#\s]+)\s+\S+", 1812, ("udp",)),
+    "/etc/raddb/server": (r"^\s*([^#\s]+)\s+\S+", 1812, ("udp",)),
+}
+
+
+def _resolve(host: str) -> list[str]:
+    import concurrent.futures
+    import socket
+    try:
+        ipaddress.ip_address(host)
+        return [host]
+    except ValueError:
+        pass
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:  # getaddrinfo no tiene límite de tiempo: que un DNS lento no frene la contención
+        infos = pool.submit(socket.getaddrinfo, host, None).result(timeout=3)
+    except Exception:
+        return []
+    finally:
+        pool.shutdown(wait=False)
+    return sorted({i[4][0] for i in infos})
+
+
+def _read_text(path: str) -> str:
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read(65536)
+    except OSError:
+        return ""
+
+
+def auth_backends(read=_read_text, resolve=None) -> list[tuple[str, str, int]]:
+    """(protocolo, IP, puerto) que sshd necesita para seguir autenticando: DNS y los servidores de
+    Kerberos, LDAP o RADIUS de la configuración. Con sssd o nslcd los usa su propio servicio, no sshd:
+    sobran, pero no cuestan nada."""
+    out, resolve = set(), resolve or _resolve
+    resolv = read("/etc/resolv.conf")
+    for ip in re.findall(r"^\s*nameserver\s+(\S+)", resolv, re.M) + ["127.0.0.53"]:
+        out |= {("udp", ip, 53), ("tcp", ip, 53)}
+    for path, (pattern, default, protos) in _AUTH_FILES.items():
+        for value in re.findall(pattern, read(path), re.M | re.I):
+            for item in value.split():
+                m = re.match(r"^(?:(ldaps?)://)?\[?([A-Za-z0-9.:_-]+?)\]?(?::(\d+))?/?$", item.strip(",;"))
+                if not m:
+                    continue
+                port = int(m.group(3)) if m.group(3) else (636 if m.group(1) == "ldaps" else default)
+                for ip in resolve(m.group(2)):
+                    out |= {(p, ip, port) for p in protos}
+    return sorted(x for x in out if 0 < x[2] < 65536)
+
+
+def _valid_allow(items) -> list:
+    """Solo formas conocidas, venga de donde venga el estado: nunca texto libre a nft."""
+    out = []
+    for item in items if isinstance(items, list) else []:
+        try:
+            proto, ip, port = item
+            ipaddress.ip_address(str(ip))
+            if proto in ("tcp", "udp") and isinstance(port, int) and 0 < port < 65536:
+                out.append((proto, str(ip), port))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _allow_set(level: int, fam: int) -> str:
+    return f"confallow{level}v{fam}"
+
+
+def _ensure_allow_sets(level: int) -> bool:
+    """Sets de excepciones y su regla, ANTES del corte (se inserta al principio de la cadena)."""
+    try:
+        listing = subprocess.run(["nft", "list", "table", "inet", "arx"], capture_output=True, text=True,
+                                 timeout=15).stdout or ""
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    for fam, addr in ((4, "ip"), (6, "ip6")):
+        name = _allow_set(level, fam)
+        cmds = []
+        if f"set {name} " not in listing:
+            cmds.append(["nft", "add", "set", "inet", "arx", name, "{", "typeof", "socket", "cgroupv2", "level",
+                         str(level), ".", "meta", "l4proto", ".", addr, "daddr", ".", "th", "dport;", "}"])
+        if f"@{name}" not in _nft_chain(listing, "output"):
+            cmds.append(["nft", "insert", "rule", "inet", "arx", "output", "ct", "direction", "original", "socket",
+                         "cgroupv2", "level", str(level), ".", "meta", "l4proto", ".", addr, "daddr", ".", "th",
+                         "dport", f"@{name}", "accept"])
+        for argv in cmds:
+            try:
+                if subprocess.run(argv, capture_output=True, text=True, timeout=15).returncode != 0:
+                    return False
+            except (OSError, subprocess.TimeoutExpired):
+                return False
+    return True
+
+
+def _allow_elements(path: str, allow: list) -> dict[str, str]:
+    """{set: elementos nft} para las excepciones de un cgroup."""
+    level = path.count("/") + 1
+    by_set: dict[str, list[str]] = {}
+    for proto, ip, port in allow:
+        fam = ipaddress.ip_address(ip).version
+        by_set.setdefault(_allow_set(level, fam), []).append(f'"{path}" . {proto} . {ip} . {int(port)}')
+    return {name: ", ".join(items) for name, items in by_set.items()}
+
+
+def _pin_allow(unit: str, path: str, allow: list) -> bool:
+    """Carga las excepciones ahora y en cada arranque del servicio (su cgroup cambia al reiniciar)."""
+    if not allow or not _ensure_allow_sets(path.count("/") + 1):
+        return False
+    nft = shutil.which("nft") or "/usr/sbin/nft"
+    lines = []
+    for name, elements in _allow_elements(path, allow).items():
+        subprocess.run(["nft", "add", "element", "inet", "arx", name, f"{{ {elements} }}"], capture_output=True,
+                       text=True, timeout=15)
+        lines.append(f"ExecStartPre=-{nft} add element inet arx {name} '{{ {elements} }}'")
+    d = os.path.join(_SYSTEMD_DIR, f"{unit}.d")
+    try:
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, _ALLOW_DROPIN), "w", encoding="utf-8") as f:
+            f.write("# Arx: what this service needs to keep authenticating while confined.\n[Service]\n"
+                    + "\n".join(lines) + "\n")
+    except OSError:
+        return False
+    subprocess.run(["systemctl", "daemon-reload"], capture_output=True, timeout=30)
+    return True
+
+
+def _unpin_allow(unit: str, path: str, allow: list) -> None:
+    for name, elements in _allow_elements(path, allow).items():
+        subprocess.run(["nft", "delete", "element", "inet", "arx", name, f"{{ {elements} }}"], capture_output=True,
+                       text=True, timeout=15)
+    try:
+        os.unlink(os.path.join(_SYSTEMD_DIR, f"{unit}.d", _ALLOW_DROPIN))
+    except OSError:
+        return
+    subprocess.run(["systemctl", "daemon-reload"], capture_output=True, timeout=30)
+
+
 _SYSTEMD_CONTROL_DIR = "/etc/systemd/system.control"  # donde `systemctl set-property` deja NFTSet=
 
 
@@ -1650,6 +1797,14 @@ def release_all_confinements() -> int:
     for unit in _pinned_units():  # huérfanos: un estado borrado no puede dejar servicios sin red para siempre
         _unpin_confinement(unit)
         n += 1
+    try:
+        leftovers = [d for d in os.listdir(_SYSTEMD_DIR) if os.path.exists(os.path.join(_SYSTEMD_DIR, d, _ALLOW_DROPIN))]
+    except OSError:
+        leftovers = []
+    for d in leftovers:
+        os.unlink(os.path.join(_SYSTEMD_DIR, d, _ALLOW_DROPIN))
+    if leftovers:
+        subprocess.run(["systemctl", "daemon-reload"], capture_output=True, timeout=30)
     return n
 
 
@@ -1804,6 +1959,8 @@ def _release_confinement(revert: dict) -> str:
             continue
         _nft_cgroup("delete", str(u.get("set")), str(u.get("path", "")))
         _unpin_confinement(name)
+        if isinstance(u.get("allow"), list):
+            _unpin_allow(name, str(u.get("path", "")), _valid_allow(u["allow"]))
         done.append(name)
     for sc in revert.get("scopes") or []:
         _nft_cgroup("delete", str(sc.get("set")), str(sc.get("path", "")))
@@ -1881,6 +2038,8 @@ def _restore_confinements() -> int:
                 restored += 1
                 if entry.get("unit"):
                     _pin_confinement(str(entry["unit"]), path, set_name)
+                if entry.get("unit") and isinstance(entry.get("allow"), list):
+                    _pin_allow(str(entry["unit"]), path, _valid_allow(entry["allow"]))
     return restored
 
 
@@ -1895,10 +2054,14 @@ def _confine_unit(unit: str, cgroup: str, finding: dict) -> tuple[str, dict | No
     if not set_name or not _can_confine():
         return tr("confinement is not possible on this host: decide yourself (arx accept, or stop {unit})",
                   unit=unit), None
+    entry = {"unit": unit, "path": cgroup, "set": set_name}
+    if _SSH_UNIT_RE.match(unit):  # sin salida, pero con DNS y sus servidores de autenticación; la entrada, intacta
+        entry["allow"] = [list(x) for x in auth_backends()]
+        if not _pin_allow(unit, cgroup, _valid_allow(entry["allow"])):
+            return tr("could not prepare what {unit} needs to keep authenticating: not confined", unit=unit), None
     _nft_cgroup("add", set_name, cgroup)
     _pin_confinement(unit, cgroup, set_name)
-    revert = {"tool": "confine", "exe": None, "units": [{"unit": unit, "path": cgroup, "set": set_name}],
-              "scopes": []}
+    revert = {"tool": "confine", "exe": None, "units": [entry], "scopes": []}
     register_block(finding, revert, ttl_min=None)
     return tr("confined without outbound network: {what}. It keeps running; it does not expire, "
               "you decide", what=unit), revert

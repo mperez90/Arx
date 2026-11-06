@@ -458,10 +458,17 @@ def _investigate_later(pkg: str, why: str, cfg: dict) -> None:
     threading.Thread(target=run, name=f"arx-investigate-{pkg}", daemon=True).start()
 
 
-def _alert_only(unit: str) -> bool:
-    """Críticos (ssh, dbus, systemd), actualizadores, hora y contenedores: nunca se cortan solos."""
+def _critical(unit: str) -> bool:
+    """Críticos (ssh, dbus, systemd), actualizadores, hora y contenedores: nunca un corte preventivo."""
     from arx.modules import response
     return bool(_OBSERVE_ONLY.match(unit) or response._PROTECTED_UNITS.match(unit))
+
+
+def _alert_only(unit: str) -> bool:
+    """Ni con veredicto de no fiable: todos los críticos menos ssh, que se queda sin salida con
+    excepciones para autenticar (A#1)."""
+    from arx.modules import response
+    return _critical(unit) and not response._SSH_UNIT_RE.match(unit)
 
 
 def _updates(subjects: dict, cfg: dict, now: datetime, check_versions: bool = True,
@@ -513,7 +520,7 @@ def _updates(subjects: dict, cfg: dict, now: datetime, check_versions: bool = Tr
             users = radius.setdefault(p, [x for x in subjects.values()
                                           if x.get("package") == p or p in (x.get("libs") or {})])
             # radio amplio (libc6, libssl): un corte preventivo sería una caída de medio host
-            wide = len(users) > PREVENTIVE_MAX or any(_alert_only(x["unit"]) for x in users)
+            wide = len(users) > PREVENTIVE_MAX or any(_critical(x["unit"]) for x in users)
             t = trust.assess_async(p, deep=True, urgent=wide)  # en un hilo: el barrido no espera
             pv = version if p == pkg else (s.get("libs") or {}).get(p)
             key = f"untrusted_update|{path}|{p}={pv}"
@@ -532,7 +539,7 @@ def _updates(subjects: dict, cfg: dict, now: datetime, check_versions: bool = Tr
                                      "why": tr("an update is when a signed but poisoned version arrives")})
                 continue
             if t["state"] == "pending":
-                if enforce and not alert_only and key not in held:  # mientras se prueba, sin salida
+                if enforce and not _critical(s["unit"]) and key not in held:  # mientras se prueba, sin salida
                     held[key] = _iso(now)
                     findings.append({**base, "fp_key": key, "detail": tr(
                         "{unit}: {pkg} {version} was just updated; no outbound network while its trust is checked",

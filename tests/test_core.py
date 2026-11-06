@@ -5294,8 +5294,44 @@ class ConfinementTests(unittest.TestCase):
             self.assertFalse(any(c[:3] == ["nft", "add", "element"] for c in self.calls))
 
     def test_a_critical_service_is_never_confined_on_its_own(self):
+        f = self._update("dbus.service", "system.slice/dbus.service", "dbus=1.14")
+        self.assertIn("dbus.service", self.r.protected_reason(f, {}))
+
+    def test_ssh_loses_outbound_network_but_keeps_what_it_needs_to_authenticate(self):
+        """A#1: la entrada y las sesiones, intactas (las sesiones viven en session-N.scope)."""
+        d = tempfile.mkdtemp()
+        self._patch(self.r, "_SYSTEMD_DIR", d)
+        self._patch(self.r, "auth_backends", lambda: [("udp", "127.0.0.53", 53), ("tcp", "10.0.0.5", 88),
+                                                      ("tcp", "2001:db8::5", 389)])
         f = self._update("ssh.service", "system.slice/ssh.service", "openssh-server=1:9.6")
-        self.assertIn("ssh.service", self.r.protected_reason(f, {}))
+        self.assertIsNone(self.r.protected_reason(f, {}))
+        o = self.r.handle(f, enforce=True, cfg={})
+        self.assertIn("ssh.service", o["status"])
+        self.assertIn(["nft", "insert", "rule", "inet", "arx", "output", "ct", "direction", "original", "socket",
+                       "cgroupv2", "level", "2", ".", "meta", "l4proto", ".", "ip", "daddr", ".", "th", "dport",
+                       "@confallow2v4", "accept"], self.calls)
+        self.assertIn(["nft", "add", "element", "inet", "arx", "confallow2v4",
+                       '{ "system.slice/ssh.service" . udp . 127.0.0.53 . 53, "system.slice/ssh.service" . tcp . 10.0.0.5 . 88 }'],
+                      self.calls)
+        dropin = open(os.path.join(d, "ssh.service.d", "91-arx-confallow.conf")).read()
+        self.assertIn("confallow2v6", dropin)  # cada reinicio de sshd (cgroup nuevo) las vuelve a cargar
+        self.assertIn(["nft", "add", "element", "inet", "arx", "confined2", '{ "system.slice/ssh.service" }'], self.calls)
+        self.assertIn("✓", self.r.accept(o["fp"]))
+        self.assertTrue(any(c[:4] == ["nft", "delete", "element", "inet"] and c[5] == "confallow2v4" for c in self.calls))
+        self.assertFalse(os.path.exists(os.path.join(d, "ssh.service.d", "91-arx-confallow.conf")))
+
+    def test_the_backends_ssh_needs_come_from_its_configuration(self):
+        files = {"/etc/resolv.conf": "nameserver 127.0.0.53\nnameserver 192.0.2.1\n",
+                 "/etc/krb5.conf": "[realms]\n EX.COM = {\n  kdc = kdc1.ex.com\n  kdc = 192.0.2.9:750\n }\n",
+                 "/etc/sssd/sssd.conf": "ldap_uri = ldaps://ldap.ex.com, ldap://192.0.2.7\n",
+                 "/etc/pam_radius_auth.conf": "# server secret\n192.0.2.20:1645 s3cr3t 3\n"}
+        got = self.r.auth_backends(read=lambda p: files.get(p, ""),
+                                   resolve=lambda h: {"kdc1.ex.com": ["192.0.2.8"], "ldap.ex.com": ["192.0.2.6"]}.get(h, [h]))
+        for item in (("udp", "192.0.2.1", 53), ("tcp", "127.0.0.53", 53), ("udp", "192.0.2.8", 88),
+                     ("tcp", "192.0.2.9", 750), ("tcp", "192.0.2.6", 636), ("tcp", "192.0.2.7", 389),
+                     ("udp", "192.0.2.20", 1645)):
+            self.assertIn(item, got)
+        self.assertNotIn("s3cr3t", str(got))
 
     def test_accepting_it_trusts_that_exact_version_and_lifts_the_confinement(self):
         from arx.modules import trust
@@ -5734,7 +5770,10 @@ class BehaviorWatchTests(unittest.TestCase):
             self.trust = {"trusted": False, "score": 0.0, "reason": "trust 0.00 of 0.98: x"}
             found = {f["target"]["unit"]: f for f in self._sweep(12.01, enforce=True) if f["kind"] == "untrusted_update"}
         self.assertIsNone(self.r.protected_reason(found["app.service"], {}))
-        self.assertIn("sshd.service", self.r.protected_reason(found["sshd.service"], {}))
+        self.assertIsNone(self.r.protected_reason(found["sshd.service"], {}))  # A#1: sin salida, con excepciones
+        self.assertTrue(self.p._critical("sshd.service"))  # pero nunca un corte preventivo (A#5)
+        self.assertTrue(self.p._alert_only("unattended-upgrades.service"))
+        self.assertTrue(self.p._alert_only("dbus.service"))
 
     def test_an_untrusted_update_of_a_library_the_service_loads_counts_too(self):
         """xz: sshd no cambió; cambió liblzma, que sshd cargaba. Se confina a quien la carga."""
