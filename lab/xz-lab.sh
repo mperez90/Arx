@@ -21,7 +21,9 @@ wait_for() { local n="$1"; shift; local i; for i in $(seq "$n"); do "$@" && retu
 fresh_login() { ssh -F "$SSHCFG" -o ControlMaster=no -o ControlPath=none -o ConnectTimeout=10 "lima-$VM" true; }
 incident() { local out; out=$(v cat /var/lib/arx/incidents.jsonl 2>/dev/null); grep -q "$1" <<<"$out"; }
 unplant() { v bash -c 'rm -f /etc/systemd/system/ssh.service.d/xz-lab.conf; rmdir /etc/systemd/system/ssh.service.d 2>/dev/null
-  systemctl daemon-reload; systemctl restart ssh; pkill -KILL -f "xz-lab-ra[n]"; true'; }
+  systemctl daemon-reload; systemctl restart ssh
+  for c in /sys/fs/cgroup/arxconfine.slice/arxconfine-*.scope; do echo 1 > $c/cgroup.kill; done 2>/dev/null
+  pkill -KILL -f "xz-lab-payloa[d]"; true'; }
 
 limactl list --format '{{.Status}}' "$VM" 2>/dev/null | grep -q Running || limactl start "$VM" >/dev/null 2>&1
 
@@ -29,7 +31,7 @@ step "víctima limpia, Arx y la librería «envenenada»"
 unplant
 v bash -c 'systemctl disable --now arx arx-firewall arx-revive.timer 2>/dev/null; pkill -9 -f "[a]rx.pyz"
   apt-get -o DPkg::Lock::Timeout=300 purge -y -qq arx >/dev/null 2>&1
-  rm -rf /etc/arx /var/lib/arx /tmp/arxsrc /tmp/xz-lab-ran /etc/systemd/system/*.service.d/9[01]-arx-*.conf /etc/systemd/system/arx*.service /etc/systemd/system/arx*.timer
+  rm -rf /etc/arx /var/lib/arx /tmp/arxsrc /tmp/xz-lab-ran /tmp/xz-fork-ran /etc/systemd/system/*.service.d/9[01]-arx-*.conf /etc/systemd/system/arx*.service /etc/systemd/system/arx*.timer
   grep -lsE "inet:arx:|inet arx confined" /etc/systemd/system.control/*.service.d/*.conf | xargs -r rm -f
   nft delete table inet arx 2>/dev/null; systemctl daemon-reload
   export DEBIAN_FRONTEND=noninteractive; apt-get -o DPkg::Lock::Timeout=300 install -y -qq gcc libc6-dev >/dev/null'
@@ -51,12 +53,14 @@ __attribute__((constructor)) static void hook(void) {
         if (strcmp(buf + i, "-R") == 0) rexec = 1;
     if (!rexec) return;
     unsetenv("LD_PRELOAD");
-    system("/bin/sh -c 'sleep 0.2; touch /tmp/xz-lab-ran'");
+    system("/bin/sh /usr/local/lib/xz-lab-payload.sh");  /* la orden la decide el lab en cada escenario */
 }
 EOF
 gcc -shared -fPIC -o /usr/local/lib/xz-lab.so /tmp/xz-lab.c
 C
 check "librería compilada" v test -f /usr/local/lib/xz-lab.so
+payload() { v sh -c "printf '%s\n' '$1' > /usr/local/lib/xz-lab-payload.sh"; }
+payload 'sleep 0.2; touch /tmp/xz-lab-ran'
 v bash -c "mkdir -p /tmp/arxsrc && cp -r $PWD/src $PWD/packaging /tmp/arxsrc/ && cd /tmp/arxsrc && packaging/build-deb.sh >/dev/null 2>&1 && dpkg -i ./dist/arx_all.deb >/dev/null 2>&1"
 check "Arx instalado" v arx --version
 printf '%s\n' "en" "" "" "" "$WORD" "$WORD" "" "" "1" "" "core" "" "" "high" "block" | v arx setup >/dev/null 2>&1
@@ -72,7 +76,7 @@ v bash -c 'mkdir -p /etc/systemd/system/ssh.service.d
   printf "[Service]\nEnvironment=LD_PRELOAD=/usr/local/lib/xz-lab.so\n" > /etc/systemd/system/ssh.service.d/xz-lab.conf
   systemctl daemon-reload; systemctl restart ssh'
 ( fresh_login >/dev/null 2>&1 & )   # el atacante llama a la puerta; esta conexión se quedará colgada
-frozen() { local out; out=$(v sh -c 'for p in $(pgrep -f "xz-lab-ra[n]"); do ps -o stat= -p $p; done'); grep -q T <<<"$out"; }
+frozen() { local out; out=$(v sh -c 'for p in $(pgrep -f "xz-lab-payloa[d]"); do ps -o stat= -p $p; done'); grep -q T <<<"$out"; }
 check "la orden queda congelada" wait_for 30 frozen
 sleep 3
 check "en milisegundos: no llegó a dejar su marca (200 ms)" sh -c "! limactl shell $VM test -e /tmp/xz-lab-ran"
@@ -81,8 +85,30 @@ crit() { local out; out=$(v cat /var/lib/arx/incidents.jsonl); grep "before auth
 check "y es crítica" crit
 lat=$(v sh -c 'grep -o "frozen [0-9]* ms" /var/lib/arx/incidents.jsonl | head -1')
 echo "  latencia medida por el kernel: ${lat:-(sin dato)}"
-isolated() { local out; out=$(v sh -c 'for p in $(pgrep -f "xz-lab-ra[n]"); do cat /proc/$p/cgroup; done'); grep -q arxconfine <<<"$out"; }
+isolated() { local out; out=$(v sh -c 'for p in $(pgrep -f "xz-lab-payloa[d]"); do cat /proc/$p/cgroup; done'); grep -q arxconfine <<<"$out"; }
 check "y la orden queda aislada sin red" wait_for 30 isolated
+
+step "la orden hace forks en bucle: queda contenida y Arx no se cuelga (A#7)"
+v sh -c 'for c in /sys/fs/cgroup/arxconfine.slice/arxconfine-*.scope; do echo 1 > $c/cgroup.kill; done 2>/dev/null; pkill -KILL -f "xz-lab-payloa[d]"; true'   # lo del escenario anterior, fuera: no puede dar un PASS prestado
+sleep 2
+payload 'for i in 1 2 3 4; do (while :; do sleep 0.01 & done) & done; sleep 0.3; touch /tmp/xz-fork-ran'
+( fresh_login >/dev/null 2>&1 & )
+check "la orden queda congelada" wait_for 30 frozen
+spawned() { v sh -c 'pgrep -f "sleep 0.0[1]" | sort | tr "\n" " "'; }
+sleep 3
+A=$(spawned); sleep 3; B=$(spawned)
+check "nadie de su familia sigue creando procesos" test "$A" = "$B"
+check "no llegó a dejar su marca" sh -c "! limactl shell $VM test -e /tmp/xz-fork-ran"
+check "Arx sigue respondiendo" v sh -c 'timeout 30 arx status >/dev/null'
+check "y sigue en guardia" v systemctl is-active -q arx
+# el scope de ESTE escenario (el de su primer proceso), no uno cualquiera
+cg_frozen() { local out; out=$(v sh -c 'p=$(pgrep -of "xz-lab-payloa[d]"); c=$(cut -d: -f3 /proc/$p/cgroup); cat /sys/fs/cgroup$c/cgroup.freeze') ; test "$out" = 1; }
+check "su scope está congelado ya (lo hace el vigilante, no el barrido)" cg_frozen
+v sh -c 'pkill -CONT -f "xz-lab-payloa[d]"; pkill -CONT -f "sleep 0.0[1]"; true'   # el «vigilante» de la puerta trasera
+sleep 3
+C=$(spawned)
+check "un SIGCONT ajeno no la despierta: ni procesos nuevos" test "$B" = "$C"
+check "ni su marca" sh -c "! limactl shell $VM test -e /tmp/xz-fork-ran"
 
 step "retirada la librería, los logins vuelven"
 unplant

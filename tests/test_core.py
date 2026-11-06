@@ -4000,6 +4000,76 @@ class ExecWatchTests(unittest.TestCase):
             self.r._release_confinement(revert)
         self.assertEqual(resumed, [4242, 5000, 5001])  # cada uno, comprobado con su propio programa
 
+    def test_a_fork_loop_cannot_hang_arx(self):
+        """A#7: el repaso de /proc tiene tope de procesos y de tiempo; lo que quede lo atrapa el cgroup congelado."""
+        many = list(range(6000, 9000))
+        with mock.patch.object(self.x, "descendants", lambda pid: many), \
+                mock.patch.object(self.x, "_stat", lambda pid: (0, pid)), \
+                mock.patch.object(self.x.os, "readlink", lambda path: "/usr/bin/sleep"), \
+                mock.patch.object(self.x.os, "kill", lambda pid, sig: None):
+            start = time.monotonic()
+            family = self.x.freeze_family(4242)
+        self.assertLessEqual(len(family), self.x.MAX_FAMILY)
+        self.assertLess(time.monotonic() - start, self.x.FREEZE_BUDGET_S + 1)
+
+    def test_the_isolated_scope_is_frozen_so_no_outside_sigcont_wakes_it(self):
+        froze = []
+        for name, value in [("_is_linux_root", lambda: True), ("_can_confine", lambda: True),
+                            ("_cgroup_of", lambda pid: "system.slice/ssh.service"),
+                            ("_freeze_cgroup", lambda path, on: froze.append((path, on)) or True),
+                            ("_adopt_into_scope", lambda pid, also=None: {
+                                "scope": f"arxconfine-{pid}.scope", "path": f"arxconfine.slice/arxconfine-{pid}.scope",
+                                "set": "confined2", "pid": pid})]:
+            p = mock.patch.object(self.r, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+        with mock.patch.object(self.x, "same_process", lambda pid, exe, start: True), \
+                mock.patch.object(self.r.os, "kill", lambda pid, sig: None):
+            self.r.handle(self._events({}, self._ev(preauth=True, stopped=True))[0], enforce=True, cfg={})
+        self.assertEqual(froze, [("arxconfine.slice/arxconfine-4242.scope", True)])
+        revert = self.r._load_blocks()[0]["revert"]
+        self.assertEqual(revert["frozen_cgroups"], ["arxconfine.slice/arxconfine-4242.scope"])
+        with mock.patch.object(self.r.os, "readlink", lambda path: "/usr/bin/dash"), \
+                mock.patch.object(self.r.os, "kill", lambda pid, sig: None), \
+                mock.patch.object(self.r, "_nft_cgroup", lambda *a: True):
+            self.r._release_confinement(revert)
+        self.assertEqual(froze[-1], ("arxconfine.slice/arxconfine-4242.scope", False))
+
+    def test_the_watcher_freezes_the_scope_itself_and_the_sweep_only_records_it(self):
+        """Lab xz: entre el SIGSTOP y el barrido, un cómplice podía despertarlos con SIGCONT."""
+        scope = {"scope": "arxconfine-4242.scope", "path": "arxconfine.slice/arxconfine-4242.scope",
+                 "set": "confined2", "pid": 4242}
+        froze, adopted = [], []
+        with mock.patch.object(self.x, "describe", lambda pid, root: self._ev()), \
+                mock.patch.object(self.x, "sshd_allowed", lambda refresh=False, hot=False: set()), \
+                mock.patch.object(self.x, "sshd_sure", lambda: True), \
+                mock.patch.object(self.x, "same_process", lambda pid, exe, start: True), \
+                mock.patch.object(self.x, "freeze_family", lambda pid: []), \
+                mock.patch.object(self.x.os, "kill", lambda pid, sig: None), \
+                mock.patch.dict(self.x._state, {"confine": True}), \
+                mock.patch.object(self.r, "_adopt_into_scope", lambda pid, also=None: adopted.append(pid) or dict(scope)), \
+                mock.patch.object(self.r, "_freeze_cgroup", lambda path, on: froze.append((path, on)) or True):
+            ev = self.x.handle_pid(4242, "", lambda: True)
+        self.x.drain()
+        self.assertEqual((ev["scope"]["path"], ev["scope_frozen"]), (scope["path"], True))
+        self.assertEqual(froze, [(scope["path"], True)])
+        f = self._events({}, ev)[0]
+        for name, value in [("_is_linux_root", lambda: True), ("_can_confine", lambda: True),
+                            ("_cgroup_of", lambda pid: scope["path"]),
+                            ("_adopt_into_scope", lambda pid, also=None: adopted.append(pid))]:
+            p = mock.patch.object(self.r, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+        with mock.patch.object(self.x, "same_process", lambda pid, exe, start: True):
+            self.r.handle(f, enforce=True, cfg={})
+        self.assertEqual(adopted, [4242])  # el barrido no crea otro scope
+        revert = self.r._load_blocks()[0]["revert"]
+        self.assertEqual((revert["scopes"][0]["path"], revert["frozen_cgroups"]), (scope["path"], [scope["path"]]))
+
+    def test_only_arx_scopes_can_be_frozen(self):
+        for path in ("system.slice/ssh.service", "user.slice", "arxconfine.slice/../system.slice", "/"):
+            self.assertFalse(self.r._freeze_cgroup(path, True), path)
+
     def test_what_the_watcher_froze_is_registered_even_with_the_brake_on(self):
         for name, value in [("_is_linux_root", lambda: True), ("_can_confine", lambda: False),
                             ("_cgroup_of", lambda pid: "system.slice/ssh.service"),

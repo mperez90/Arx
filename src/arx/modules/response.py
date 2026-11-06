@@ -1972,6 +1972,9 @@ def _release_confinement(revert: dict) -> str:
     for sc in revert.get("scopes") or []:
         _nft_cgroup("delete", str(sc.get("set")), str(sc.get("path", "")))
         done.append(f"pid {sc.get('pid')}")
+    for path in revert.get("frozen_cgroups") or []:  # primero descongelar el scope, luego SIGCONT
+        if isinstance(path, str):
+            _freeze_cgroup(path, False)
     exe = revert.get("exe")
     exes = revert.get("stopped_exes") if isinstance(revert.get("stopped_exes"), dict) else {}
     for pid in revert.get("stopped") or []:
@@ -2076,6 +2079,19 @@ def _confine_unit(unit: str, cgroup: str, finding: dict) -> tuple[str, dict | No
               "you decide", what=unit), revert
 
 
+def _freeze_cgroup(path: str, on: bool) -> bool:
+    """cgroup.freeze del scope de Arx: lo que hay dentro, y lo que se cree después, queda congelado; a
+    diferencia de SIGSTOP, otro proceso no lo puede deshacer con un SIGCONT."""
+    if not (_CGROUP_PATH_RE.match(path) and ".." not in path and f"{_CONFINE_SLICE}/" in f"{path}/"):
+        return False
+    try:
+        with open(f"/sys/fs/cgroup/{path}/cgroup.freeze", "w") as f:
+            f.write("1" if on else "0")
+        return True
+    except OSError:
+        return False
+
+
 def _contained_pids(fp: str) -> set:
     pids = set()
     for b in _load_blocks():
@@ -2105,7 +2121,13 @@ def _contain_process(target: dict, finding: dict) -> tuple[str, dict | None]:
         except OSError:
             pass
         family += execwatch.freeze_family(pid)  # lo que ya lanzó, también
-    scope = _adopt_into_scope(pid, [m["pid"] for m in family]) if _can_confine() else None
+    given = target.get("scope") if isinstance(target.get("scope"), dict) else None
+    if given and _CGROUP_PATH_RE.match(str(given.get("path", ""))) and _cgroup_of(pid) == given.get("path"):
+        scope = {k: given[k] for k in ("scope", "path", "set", "pid") if k in given}  # ya lo hizo el vigilante
+        frozen = bool(target.get("scope_frozen")) or (stopped and _freeze_cgroup(scope["path"], True))
+    else:
+        scope = _adopt_into_scope(pid, [m["pid"] for m in family]) if _can_confine() else None
+        frozen = bool(scope and stopped and _freeze_cgroup(scope["path"], True))  # ni un SIGCONT ajeno lo despierta
     if not scope and not stopped:  # lo que no se puede aislar se congela: nunca libre y con red
         try:
             os.kill(pid, signal.SIGSTOP)
@@ -2114,7 +2136,8 @@ def _contain_process(target: dict, finding: dict) -> tuple[str, dict | None]:
             return tr("could not suspend (race or permissions)"), None
     revert = {"tool": "confine", "exe": exe, "pid_only": True, "units": [], "scopes": [scope] if scope else [],
               "stopped": ([pid] + [m["pid"] for m in family]) if stopped else [],
-              "stopped_exes": {str(m["pid"]): m["exe"] for m in family}}
+              "stopped_exes": {str(m["pid"]): m["exe"] for m in family},
+              "frozen_cgroups": [scope["path"]] if frozen else []}
     register_block(finding, revert, ttl_min=None)
     parts = [tr("pid {pid} ({exe}) without network", pid=pid, exe=exe)] if scope else []
     if stopped:
