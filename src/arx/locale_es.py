@@ -103,6 +103,8 @@ ES = {
         "servicio crítico ({unit}): no se confina solo",
     "invalid service: nothing confined":
         "servicio no válido: no se confina nada",
+    "  {n} confined service(s) or program(s) got their network back.":
+        "  {n} servicio(s) o programa(s) confinado(s) recuperaron la red.",
     "service marked out-of-bounds":
         "servicio marcado fuera de alcance",
     "accepted by a person for this exact version":

@@ -63,6 +63,7 @@ v bash -c 'systemctl disable --now arx arx-firewall acme-agent acme-relay 2>/dev
   for p in arx acme-agent acme-relay acme-libfoo; do apt-get -o DPkg::Lock::Timeout=300 purge -y -qq "$p" >/dev/null 2>&1; done
   rm -rf /etc/arx /var/lib/arx /srv/acme /tmp/acme* /etc/apt/sources.list.d/acme.list /etc/apt/keyrings/acme.gpg \
     /root/.gnupg /etc/systemd/system/*.service.d/90-arx-*.conf /etc/systemd/system/arx*.service /tmp/arxsrc
+  grep -lsE "inet:arx:|inet arx confined" /etc/systemd/system.control/*.service.d/*.conf | xargs -r rm -f
   sed -i "/acme-lab/d" /root/.ssh/authorized_keys 2>/dev/null; nft delete table inet arx 2>/dev/null; systemctl daemon-reload
   export DEBIAN_FRONTEND=noninteractive; apt-get -o DPkg::Lock::Timeout=300 update -qq >/dev/null
   apt-get -o DPkg::Lock::Timeout=300 install -y -qq socat nftables dpkg-dev apt-utils gnupg netcat-openbsd >/dev/null'

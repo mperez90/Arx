@@ -142,8 +142,11 @@ def uninstall() -> int:
               "&& sudo systemctl daemon-reload")
         return 0
     subprocess.run(["systemctl", "disable", "--now", "arx", "arx-firewall"], check=False)
-    from arx.modules import profile
+    from arx.modules import profile, response
     profile.release_all()  # sin Arx, los drop-ins de vigilancia no tienen sentido
+    released = response.release_all_confinements()
+    if released:
+        print(tr("  {n} confined service(s) or program(s) got their network back.", n=released))
     for unit in (UNIT_PATH, EARLY_UNIT_PATH):
         try:
             Path(unit).unlink()

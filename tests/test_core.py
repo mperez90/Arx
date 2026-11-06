@@ -5144,6 +5144,23 @@ class ConfinementTests(unittest.TestCase):
             self.assertFalse(trust.assess("app")["trusted"])  # la siguiente versión se vuelve a probar
         self.assertFalse(trust.accept("app=2.0; rm -rf /"))
 
+    def test_uninstalling_releases_every_confinement_even_orphaned_ones(self):
+        self.r.handle(self._update(), enforce=True, cfg={})
+        control = tempfile.mkdtemp()
+        os.makedirs(os.path.join(control, "lost.service.d"))
+        with open(os.path.join(control, "lost.service.d", "50-NFTSet.conf"), "w") as f:
+            f.write("[Service]\nNFTSet=cgroup:inet:arx:confined2\n")  # de un estado que ya no existe
+        os.makedirs(os.path.join(control, "other.service.d"))
+        with open(os.path.join(control, "other.service.d", "50-NFTSet.conf"), "w") as f:
+            f.write("[Service]\nNFTSet=cgroup:inet:mine:allowed\n")  # del admin: no se toca
+        self._patch(self.r, "_SYSTEMD_CONTROL_DIR", control)
+        self._patch(self.r, "_SYSTEMD_DIR", tempfile.mkdtemp())
+        self.assertEqual(self.r.release_all_confinements(), 2)
+        self.assertEqual(self.r._load_blocks(), [])
+        self.assertIn(["systemctl", "set-property", "app.service", "NFTSet="], self.calls)
+        self.assertIn(["systemctl", "set-property", "lost.service", "NFTSet="], self.calls)
+        self.assertNotIn(["systemctl", "set-property", "other.service", "NFTSet="], self.calls)
+
     def test_a_loose_process_is_adopted_into_its_own_scope(self):
         self._live([4242])
         self.r.handle(self._exe("/home/ana/bin/tool"), enforce=True, cfg={})

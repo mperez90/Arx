@@ -1597,6 +1597,50 @@ def _unpin_confinement(name: str) -> None:
     subprocess.run(["systemctl", "daemon-reload"], capture_output=True, timeout=30)
 
 
+_SYSTEMD_CONTROL_DIR = "/etc/systemd/system.control"  # donde `systemctl set-property` deja NFTSet=
+
+
+def _pinned_units() -> list[str]:
+    """Servicios atados a un set de confinamiento de Arx, se sepa o no por qué (un estado perdido)."""
+    found = set()
+    for base, fname in ((_SYSTEMD_CONTROL_DIR, None), (_SYSTEMD_DIR, _CONFINE_DROPIN)):
+        try:
+            dirs = [d for d in os.listdir(base) if d.endswith(".service.d")]
+        except OSError:
+            continue
+        for d in dirs:
+            names = [fname] if fname else [n for n in os.listdir(os.path.join(base, d)) if n.endswith(".conf")]
+            for n in names:
+                try:
+                    with open(os.path.join(base, d, n), encoding="utf-8", errors="replace") as f:
+                        text = f.read(4096)
+                except OSError:
+                    continue
+                if re.search(r"NFTSet=cgroup:inet:arx:confined\d|inet arx confined\d", text):
+                    found.add(d[:-2])
+    return sorted(u for u in found if re.match(r"^[A-Za-z0-9@_.:\\-]{1,200}\.service$", u))
+
+
+def release_all_confinements() -> int:
+    """Al desinstalar Arx: lo que confinó vuelve a tener red (lo decide quien lo desinstala) y ningún
+    servicio queda atado a un set que ya nadie gestiona, ni que una reinstalación volvería a cerrar."""
+    n = 0
+    with config.locked():
+        keep = []
+        for b in _load_blocks():
+            revert = b.get("revert")
+            if isinstance(revert, dict) and revert.get("tool") == "confine":
+                _release_confinement(revert)
+                n += 1
+            else:
+                keep.append(b)
+        _save_blocks(keep)
+    for unit in _pinned_units():  # huérfanos: un estado borrado no puede dejar servicios sin red para siempre
+        _unpin_confinement(unit)
+        n += 1
+    return n
+
+
 def _nft_setup_confine() -> bool:
     """Sets y reglas del confinamiento. Aparte de _nft_setup: un kernel o un nft sin `socket
     cgroupv2` no debe dejar al host sin el resto de la contención."""
