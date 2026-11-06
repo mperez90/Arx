@@ -60,6 +60,7 @@ _FEATURE_TIER = {
     "advanced_detections": "pro",
     "self_pentest": "pro",
     "incident_reports": "pro",
+    "consensus": "pro",  # votar; recibir lo aprobado es de todos, también de Core
     "fleet": "business",
     "console": "business",
     "cross_host": "business",

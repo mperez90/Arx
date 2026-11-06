@@ -17,7 +17,6 @@ una descarga y nada más. Lo que se comparte, solo a mano (`arx forensics --indi
 """
 from __future__ import annotations
 
-import base64
 import hashlib
 import ipaddress
 import json
@@ -27,9 +26,9 @@ import socket
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
-from arx import __version__, config, ed25519
+from arx import __version__, config, consensus
 from arx.i18n import tr
 from arx.modules import recon, response, sandbox, sensors
 from arx.redact import printable
@@ -46,6 +45,17 @@ MAX_HASHES = 20000
 MAX_RULES = 50
 MAX_SAMPLE = 4096
 FP_ROLLBACK = 3              # desmentida tantas veces por el operador, se retira sola
+# Canal automático: lo firma el servidor de consenso con una clave que la maestra delega por poco
+# tiempo. Lo que llega por él tiene límites que pone cada Arx, no el servidor: si ese servidor cae en
+# malas manos, lo peor que puede hacer es poco, a pocos hosts y por pocos días.
+AUTO_FEED_URL = ""           # vacía: el canal automático aún no está abierto (no hay servidor)
+AUTO_MAX_DELEGATION_DAYS = 30
+AUTO_MAX_NEW = 5
+AUTO_MAX_ROLLOUT = 25        # % de hosts, como mucho
+AUTO_MAX_DAYS = 7            # caducidad máxima de una vacuna automática
+AUTO_MAX_IPS = 256
+AUTO_MAX_HASHES = 1000
+AUTO_MIN_PREFIX = {4: 24, 6: 48}
 HOST_SWEEP_BUDGET_S = 5.0
 HOST_SWEEP_FILES = 200
 HOST_SWEEP_READ = 128 * 1024
@@ -86,23 +96,9 @@ def _parse(s) -> datetime | None:
 # ── abrir el paquete: primero la firma, después todo lo demás ─────────────────
 def open_feed(raw: bytes, pubkey: str) -> dict | None:
     """El contenido del paquete si la firma es válida; si no, None y no se interpreta nada."""
-    try:
-        outer = json.loads(raw)
-        payload = base64.b64decode(outer["payload"], validate=True)
-        signature = bytes.fromhex(outer["sig"])
-        public = bytes.fromhex(pubkey)
-    except (ValueError, KeyError, TypeError):
-        return None
-    if not ed25519.verify(public, payload, signature):
-        return None
-    try:
-        feed = json.loads(payload)
-    except ValueError:
-        return None
-    return feed if isinstance(feed, dict) else None
+    return consensus.unseal(raw, pubkey)
 
 
-# ── validación local: cada receptor comprueba por sí mismo ────────────────────
 def _unsafe_regex(pattern: str) -> str | None:
     """Por qué esta regex podría colgar a Arx. Estas reglas corren en el bucle de guardia sobre
     ficheros que controla el atacante: solo cuantificadores acotados y nunca sobre un grupo."""
@@ -307,6 +303,14 @@ def update(fetch=_fetch, pubkey: str | None = None, cfg: dict | None = None, now
                 out["revoked"].append(vid)
                 response.record({"kind": "vaccine_revoked", "detail": tr("vaccine {vid} withdrawn by ASL",
                                                                          vid=printable(vid))})
+        revoked_keys = [k for k in feed.get("auto_revoked") or [] if isinstance(k, str)]
+        if revoked_keys:
+            st["auto_revoked"] = sorted(set(st.get("auto_revoked") or []) | set(revoked_keys))
+            for vid in [vid for vid, a in applied.items() if a.get("key") in revoked_keys]:
+                del applied[vid]
+                out["revoked"].append(vid)
+                response.record({"kind": "vaccine_revoked", "detail": tr("vaccine {vid} withdrawn by ASL",
+                                                                         vid=printable(vid))})
         samples = None
         vaccines = feed.get("vaccines") if isinstance(feed.get("vaccines"), list) else []
         for v in vaccines:
@@ -345,13 +349,143 @@ def update(fetch=_fetch, pubkey: str | None = None, cfg: dict | None = None, now
     return out
 
 
+def auto_problem(v: dict) -> str | None:
+    """Por qué esta vacuna no puede llegar por el canal automático (o None si puede).
+
+    Solo indicadores concretos: una regla es código que casa con texto, y eso lo revisa una persona."""
+    if not isinstance(v, dict):
+        return tr("unexpected structure")
+    if v.get("rules"):
+        return tr("the automatic channel carries indicators only, not rules")
+    iocs = v.get("iocs") if isinstance(v.get("iocs"), dict) else {}
+    ips, hashes = iocs.get("ips") or [], iocs.get("sha256") or []
+    if not isinstance(ips, list) or not isinstance(hashes, list):
+        return tr("unexpected structure")
+    if len(ips) > AUTO_MAX_IPS or len(hashes) > AUTO_MAX_HASHES:
+        return tr("more indicators than the automatic channel allows")
+    for ip in ips:
+        try:
+            net = ipaddress.ip_network(str(ip), strict=False)
+        except ValueError:
+            return tr("invalid IP: {ip}", ip=printable(ip))
+        if net.prefixlen < AUTO_MIN_PREFIX[net.version]:
+            return tr("network too broad for the automatic channel: {net}", net=net)
+    return None
+
+
+def _delegation(outer: dict, master: str, st: dict, now: datetime) -> tuple[dict | None, str]:
+    """La clave automática vigente, si la maestra la firmó, por poco tiempo y sin revocar."""
+    d = consensus.unseal(outer.get("delegation") or {}, master)
+    if d is None or d.get("kind") != "auto-delegation":  # nunca un paquete de vacunas leído como otra cosa
+        return None, tr("invalid delegation signature")
+    key, serial = d.get("auto_key"), d.get("serial")
+    start, end = consensus._parse(d.get("not_before")), consensus._parse(d.get("not_after"))
+    if not (isinstance(key, str) and len(key) == 64 and type(serial) is int and start and end
+            and isinstance(d.get("roster"), dict)):
+        return None, tr("malformed delegation")
+    if end - start > timedelta(days=AUTO_MAX_DELEGATION_DAYS):
+        return None, tr("delegation longer than {days} days", days=AUTO_MAX_DELEGATION_DAYS)
+    if not start <= now <= end:
+        return None, tr("delegation not in force")
+    if key in (st.get("auto_revoked") or []):
+        return None, tr("automatic key revoked by ASL")
+    if serial < st.get("auto_delegation_serial", 0):
+        return None, tr("delegation older than the one in force: possible replay")
+    return d, ""
+
+
+def update_auto(fetch=_fetch, pubkey: str | None = None, cfg: dict | None = None,
+                now: datetime | None = None) -> dict:
+    """El canal automático: lo que el consenso aprobó, con los límites de este host. Nunca lanza."""
+    cfg = cfg if cfg is not None else config.load_config()
+    now = now or _now()
+    master = ASL_PUBKEY if pubkey is None else pubkey
+    url = cfg.get("vaccine_auto_url") or AUTO_FEED_URL
+    if cfg.get("vaccines_enabled") is False or cfg.get("vaccines_auto") is False:
+        return {"ok": False, "reason": tr("disabled in the configuration (vaccines_enabled)")}
+    if not master or not url:
+        return {"ok": False, "unavailable": True, "reason": tr("the automatic channel is not open yet")}
+    try:
+        raw = fetch(url)
+        outer = json.loads(raw)
+    except (urllib.error.URLError, OSError, ValueError, TimeoutError) as e:
+        return {"ok": False, "unavailable": True, "reason": tr("no channel right now ({name}); defense carries on the "
+                                          "same", name=type(e).__name__)}
+    with config.locked("vaccines"):
+        st = _load()
+        d, why = _delegation(outer if isinstance(outer, dict) else {}, master, st, now)
+        feed = consensus.unseal(outer.get("feed") or {}, d["auto_key"]) if d else None
+        if d and (feed is None or feed.get("kind") != "auto-feed"):
+            why = tr("invalid signature: discarded unopened")
+        if not d or feed is None or feed.get("kind") != "auto-feed":
+            response.record({"kind": "vaccine_rejected", "sev": "high",
+                             "detail": tr("automatic channel package rejected: {why}", why=why)})
+            return {"ok": False, "reason": why}
+        serial = feed.get("serial")
+        if type(serial) is not int or serial < st.get("auto_serial", 0):
+            response.record({"kind": "vaccine_rejected", "sev": "high",
+                             "detail": tr("old package (serial {serial} < {serial2}): possible "
+                                          "replay", serial=serial, serial2=st.get("auto_serial"))})
+            return {"ok": False, "reason": tr("package older than the one applied: possible replay "
+                                              "attack")}
+        applied, disabled = st.setdefault("applied", {}), st.setdefault("disabled", {})
+        rejected = st.setdefault("rejected", {})
+        out = {"ok": True, "serial": serial, "applied": [], "rejected": [], "waiting": []}
+        samples = None
+        limit = now + timedelta(days=AUTO_MAX_DAYS)
+        items = feed.get("items") if isinstance(feed.get("items"), list) else []
+        for item in items:
+            v, why = consensus.verify_item(item, d["roster"], now)  # el servidor no es de fiar: se recuenta aquí
+            if v is None or not _ID_RE.fullmatch(str(v.get("id", ""))):
+                response.record({"kind": "vaccine_rejected", "sev": "high",
+                                 "detail": tr("automatic channel package rejected: {why}", why=why or "id")})
+                continue
+            vid = f"auto.{v['id']}"[:64]
+            known = applied.get(vid) or {}
+            version = v.get("version") if type(v.get("version")) is int else 0
+            if vid in disabled or (known and known.get("version", 0) >= version):
+                continue
+            rollout = v.get("rollout", 100) if type(v.get("rollout", 100)) is int else 0
+            if _host_bucket(vid) >= min(rollout, AUTO_MAX_ROLLOUT) or len(out["applied"]) >= AUTO_MAX_NEW:
+                out["waiting"].append(vid)
+                continue
+            problem = auto_problem(v)
+            if problem:
+                status, reason = "hostile", problem
+            else:
+                if samples is None:
+                    samples = _host_samples()
+                status, reason = validate(v, samples)
+            if status != "valid":
+                rejected[vid] = {"status": status, "reason": reason, "at": _iso(now)}
+                out["rejected"].append({"id": vid, "status": status, "reason": reason})
+                response.record({"kind": "vaccine_rejected", "sev": "high" if status == "hostile" else "low",
+                                 "detail": tr("vaccine {vid} {status} on this host", vid=vid, status=status),
+                                 "result": reason})
+                continue
+            exp = consensus._parse(item["closed"]) + timedelta(days=AUTO_MAX_DAYS)
+            applied[vid] = {"version": version, "description": v["description"], "attack": v.get("attack") or [],
+                            "iocs": v.get("iocs") or {}, "rules": [], "expires": _iso(min(exp, limit)),
+                            "applied_at": _iso(now), "channel": "auto", "key": d["auto_key"]}
+            rejected.pop(vid, None)
+            out["applied"].append(vid)
+            response.record({"kind": "vaccine_applied", "detail": tr("vaccine {vid} v{version} validated and "
+                                                                     "applied (automatic channel)",
+                                                                     vid=vid, version=version)})
+        st["auto_serial"], st["auto_delegation_serial"] = serial, d["serial"]
+        _save(st)
+    _reset_index()
+    return out
+
+
 def update_safely() -> None:
     """Para el hilo de guardia: nada de esto puede tumbar la defensa local."""
-    try:
-        update()
-    except Exception as e:
-        response.record({"kind": "vaccine_error", "detail": tr("vaccine update failed ({name})",
-                                                               name=type(e).__name__)})
+    for step in (update, update_auto):
+        try:
+            step()
+        except Exception as e:
+            response.record({"kind": "vaccine_error", "detail": tr("vaccine update failed ({name})",
+                                                                   name=type(e).__name__)})
 
 
 def due(now: datetime | None = None) -> bool:

@@ -1,13 +1,16 @@
-"""Arx · ed25519 — verificación de firmas Ed25519 (RFC 8032), solo con la stdlib.
+"""Arx · ed25519 — firmas Ed25519 (RFC 8032), solo con la stdlib.
 
 La biblioteca estándar de Python no verifica firmas asimétricas, y un HMAC no sirve para vacunas:
-con la misma clave, cualquier receptor podría firmar. Aquí solo se VERIFICA: no hay ningún secreto
-en juego, así que tiempo constante no aplica. La firma se hace fuera del agente, con la clave
-offline (scripts/vaccine_tool.py). Probado contra los vectores de la RFC y contra OpenSSL.
+con la misma clave, cualquier receptor podría firmar. Verificar no toca ningún secreto. Firmar sí:
+lo hace ASL con su clave offline (scripts/vaccine_tool.py) y cada nodo con la suya, para sus votos
+del consenso. Python no da tiempo constante, así que la multiplicación con secreto da siempre el
+mismo número de pasos y el escalar va cegado con un múltiplo aleatorio del orden: lo que se pudiera
+medir no corresponde a los bits del secreto. Probado contra los vectores de la RFC y contra OpenSSL.
 """
 from __future__ import annotations
 
 import hashlib
+import secrets
 
 _P = 2**255 - 19
 _Q = 2**252 + 27742317777372353535851937790883648493
@@ -81,3 +84,41 @@ def verify(public: bytes, message: bytes, signature: bytes) -> bool:
     left, right = mul(s, G), add(r, mul(h, a))
     return (left[0] * right[2] - right[0] * left[2]) % _P == 0 \
         and (left[1] * right[2] - right[1] * left[2]) % _P == 0
+
+
+_BLIND_BITS = 64
+_LADDER_BITS = 256 + _BLIND_BITS
+
+
+def _mul_secret(scalar: int, point: tuple) -> tuple:
+    """Como `mul`, para escalares secretos: cegado y con los mismos pasos sea cual sea el valor."""
+    scalar += secrets.randbits(_BLIND_BITS) * _Q  # mismo punto (Q·P = identidad), otros bits
+    acc = [(0, 1, 1, 0), point]
+    for i in range(_LADDER_BITS - 1, -1, -1):  # escalera de Montgomery: una suma y un doble por bit
+        bit = (scalar >> i) & 1
+        acc[1 - bit] = add(acc[0], acc[1])
+        acc[bit] = add(acc[bit], acc[bit])
+    return acc[0]
+
+
+def _expand(secret: bytes) -> tuple[int, bytes]:
+    h = hashlib.sha512(secret).digest()
+    a = int.from_bytes(h[:32], "little")
+    a &= (1 << 254) - 8
+    a |= 1 << 254
+    return a, h[32:]
+
+
+def public_key(secret: bytes) -> bytes:
+    """La clave pública (32 bytes) de una semilla secreta de 32 bytes."""
+    return compress(_mul_secret(_expand(secret)[0], G))
+
+
+def sign(secret: bytes, message: bytes) -> bytes:
+    """Firma determinista de la RFC 8032 (la misma entrada da la misma firma)."""
+    a, prefix = _expand(secret)
+    pub = public_key(secret)
+    r = hash_mod_q(prefix + message)
+    big_r = compress(_mul_secret(r, G))
+    h = hash_mod_q(big_r + pub + message)
+    return big_r + ((r + h * a) % _Q).to_bytes(32, "little")

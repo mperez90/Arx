@@ -1,6 +1,82 @@
 """Arx · catálogo español. La clave es el texto fuente (inglés) tal como aparece en tr(...)."""
 
 ES = {
+    "{k} appeared since the baseline was sealed":
+        "{k} apareció después de sellar la línea base",
+    "{k} disappeared since the baseline was sealed":
+        "{k} desapareció después de sellar la línea base",
+    "local_url must be http(s)":
+        "local_url debe ser http(s)",
+    "service {unit} was updated from {old} to {new}":
+        "el servicio {unit} se actualizó de {old} a {new}",
+    "{unit} was updated to {new} and cannot be trusted: {reason}":
+        "{unit} se actualizó a {new} y no es de fiar: {reason}",
+    "an update is when a signed but poisoned version arrives":
+        "una actualización es cuando llega una versión firmada pero envenenada",
+    "trust {score:.2f} of {min:.2f}":
+        "confianza {score:.2f} de {min:.2f}",
+    "touches SSH authorized keys":
+        "toca las llaves SSH autorizadas",
+    "sets a SUID/SGID bit":
+        "pone un bit SUID/SGID",
+    "installs a scheduled task":
+        "instala una tarea programada",
+    "creates a second root account":
+        "crea una segunda cuenta root",
+    "downloads from a bare IP":
+        "descarga desde una IP directa",
+    "injects a library into every program":
+        "inyecta una librería en todos los programas",
+    "every file matches what dpkg installed":
+        "todos los ficheros coinciden con lo que instaló dpkg",
+    "nothing known against this version":
+        "nada conocido contra esta versión",
+    "its install scripts do nothing suspicious":
+        "sus scripts de instalación no hacen nada sospechoso",
+    "not reproducible ({status})":
+        "no reproducible ({status})",
+    "installed {days:.1f} days ago":
+        "instalado hace {days:.1f} días",
+    "dpkg --verify did not answer":
+        "dpkg --verify no respondió",
+    "changed since installed: {files}":
+        "cambiado desde que se instaló: {files}",
+    "apt is not available":
+        "apt no está disponible",
+    "{n} files identical to the official package":
+        "{n} ficheros idénticos al paquete oficial",
+    "no vulnerability database for this distribution":
+        "no hay base de vulnerabilidades para esta distribución",
+    "known as malicious: {ids}":
+        "conocido como malicioso: {ids}",
+    "{n} known vulnerabilities, none malicious":
+        "{n} vulnerabilidades conocidas, ninguna maliciosa",
+    "no independent rebuilder for this distribution":
+        "no hay reconstrucción independiente para esta distribución",
+    "the rebuilder has not seen this version":
+        "la reconstrucción independiente no ha visto esta versión",
+    "independently rebuilt from source, identical":
+        "reconstruido de forma independiente desde el código fuente, idéntico",
+    "installed long ago":
+        "instalado hace tiempo",
+    "unknown package":
+        "paquete desconocido",
+    "could not download the official package":
+        "no se pudo descargar el paquete oficial",
+    "package too large to compare":
+        "paquete demasiado grande para comparar",
+    "differs from the official package: {files}":
+        "difiere del paquete oficial: {files}",
+    "no connection to the vulnerability database":
+        "sin conexión con la base de vulnerabilidades",
+    "no connection to the rebuilder":
+        "sin conexión con la reconstrucción independiente",
+    "no install log":
+        "sin registro de instalación",
+    "unreadable install log":
+        "registro de instalación ilegible",
+    "could not open the official package":
+        "no se pudo abrir el paquete oficial",
     "the model flagged {dest} of {unit} against its documentation: {reason}":
         "el modelo marcó {dest} de {unit} frente a su documentación: {reason}",
     "it will be cut the first time it is used; accept it if it is legitimate":
@@ -11,6 +87,26 @@ ES = {
         "el modelo contrastó lo que hizo con su documentación",
     "  observation    {observing} services being learned · {watching} watched":
         "  observación    {observing} servicios aprendiendo · {watching} vigilados",
+    "a watched service that has restarted since":
+        "un servicio vigilado que ya se reinició",
+    "library package {lib}, loaded by {unit}, was updated from {old} to {new}":
+        "el paquete de librería {lib}, que carga {unit}, se actualizó de {old} a {new}",
+    "{unit} loads {lib} {new}, just updated, which cannot be trusted: {reason}":
+        "{unit} carga {lib} {new}, recién actualizada, y no es de fiar: {reason}",
+    "a signed update below the minimum trust: cutting its network stops a backdoor from calling home without stopping the service":
+        "una actualización firmada por debajo de la confianza mínima: cortarle la red impide que una puerta trasera llame a casa sin parar el servicio",
+    "confine the service: no outbound network, it keeps running (until you decide)":
+        "confinar el servicio: sin red de salida, sigue funcionando (hasta que decidas)",
+    "confinement is not possible on this host: decide yourself (arx accept, or stop {unit})":
+        "en este host no se puede confinar: decide tú (arx accept, o para {unit})",
+    "critical service ({unit}): it is not confined on its own":
+        "servicio crítico ({unit}): no se confina solo",
+    "invalid service: nothing confined":
+        "servicio no válido: no se confina nada",
+    "service marked out-of-bounds":
+        "servicio marcado fuera de alcance",
+    "accepted by a person for this exact version":
+        "aceptada por una persona para esta versión exacta",
     "{unit} tried to reach {ip}:{port}/{proto}, outside its usual behavior: cut":
         "{unit} intentó llegar a {ip}:{port}/{proto}, fuera de su comportamiento habitual: cortado",
     "{unit} reached {ip}:{port}/{proto}, outside its usual behavior: it would be cut with --enforce":
@@ -733,6 +829,30 @@ ES = {
         "desactivadas en la configuración (vaccines_enabled)",
     "the channel is not open yet: the ASL key is missing":
         "el canal aún no está abierto: falta la clave de ASL",
+    "the automatic channel is not open yet":
+        "el canal automático aún no está abierto",
+    "the automatic channel carries indicators only, not rules":
+        "el canal automático solo lleva indicadores, no reglas",
+    "more indicators than the automatic channel allows":
+        "más indicadores de los que admite el canal automático",
+    "network too broad for the automatic channel: {net}":
+        "red demasiado amplia para el canal automático: {net}",
+    "invalid delegation signature":
+        "firma de delegación no válida",
+    "malformed delegation":
+        "delegación mal formada",
+    "delegation longer than {days} days":
+        "delegación de más de {days} días",
+    "delegation not in force":
+        "delegación fuera de vigencia",
+    "automatic key revoked by ASL":
+        "clave automática revocada por ASL",
+    "delegation older than the one in force: possible replay":
+        "delegación anterior a la vigente: posible repetición",
+    "automatic channel package rejected: {why}":
+        "paquete del canal automático rechazado: {why}",
+    "vaccine {vid} v{version} validated and applied (automatic channel)":
+        "vacuna {vid} v{version} validada y aplicada (canal automático)",
     "no channel right now ({name}); defense carries on the same":
         "sin canal ahora mismo ({name}); la defensa sigue igual",
     "vaccine package with an invalid signature: discarded unopened":

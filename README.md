@@ -63,6 +63,8 @@ shown above. Both only need Docker.
 | New listening port from software that can't prove that (a stray `.deb`, a unit no package owns) | Blocks the port | VM |
 | New program of unproven origin, with no sign of harm | Confines it: it keeps running, but can't open connections. Survives restarts and reboots | VM |
 | Dropper in `/tmp`, a hidden path, or started by a web server | Suspends the process | Lab, VM |
+| A signed update whose install script plants an SSH key | Confines the service: it keeps serving, without network. The key raises its own critical alert | VM |
+| A signed update of a library a service loads, like the xz backdoor (the service itself didn't change) | Confines the services that load it; they keep serving | VM |
 | A trusted service starts doing something it never did, like a tampered update calling home | Cuts that action in the kernel and tells you; the service keeps running | VM |
 | Reverse shell from `bash`, `sh`, `nc` or `socat` | Cuts the channel and suspends only that process | Lab |
 | New SUID binary | Critical alert naming it; on your word, drops the bit | Lab |
@@ -151,10 +153,11 @@ Read these before you rely on it.
   repository only raises an alert. Your own app in `/opt` keeps running, but without network, and a
   port it exposes is blocked, until you run `arx accept`. That's deliberate: a planted program looks
   exactly the same.
-- **The proof of origin trusts dpkg.** It only exists on Debian and Ubuntu; elsewhere nothing counts
-  as proven, so everything new is contained. An intruder who is already root can forge dpkg's
-  database, and can also stop Arx. A malicious version inside a signed repository passes the proof:
-  behavior profiling, still planned, is what covers that.
+- **The proof of origin starts from dpkg.** It only exists on Debian and Ubuntu; elsewhere nothing
+  counts as proven, so everything new is contained. A signature alone isn't enough: after an update,
+  Arx also checks the package against a fresh copy from its repository, known-malicious databases
+  and its install scripts, and watches what the service does. Still hard: a backdoor that only uses
+  destinations the service already used. And an intruder who is already root can stop Arx.
 - **Confining needs cgroup v2, nftables that can match by cgroup, and systemd.** Without them, Arx
   suspends instead. Tested on Ubuntu 22.04 and 24.04 VMs, across service restarts and reboots.
 - **Run Arx on the host, not inside a container that shares the host's cgroup tree.** There, proof

@@ -20,6 +20,7 @@ intended, not what you can buy now. Every paid ✅ must exist and be tested befo
 | Control from Telegram, with a one-time code | ✅ | ✅ | ✅ |
 | Proposals (normalize, harden SSH): Arx proposes, you approve | ✅ | + autonomous with rollback | + autonomous with rollback |
 | Signed vaccines, validated on each host (the channel isn't open yet) | ✅ | ✅ | ✅ |
+| Vaccines approved by a consensus of paid hosts, validated again on each host (opens with Pro) | ✅ receives | ✅ receives and votes | ✅ receives and votes |
 | Static file analysis (`arx scan`) | ✅ | ✅ | ✅ |
 | Sealed forensic report (`arx forensics`) | ✅ | ✅ | ✅ |
 | Threat intel | community, through vaccines (the channel isn't open yet) | **managed, real time** | managed + private |

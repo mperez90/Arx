@@ -25,6 +25,9 @@ OPENAI_LIKE = {
     "openai": "https://api.openai.com/v1/chat/completions",
     "kimi": "https://api.moonshot.ai/v1/chat/completions",
 }
+# "local": cualquier servidor compatible con OpenAI en tu red (Ollama, LM Studio, llama.cpp). Tu telemetría
+# no sale del sitio. La URL es de la configuración; por defecto, la de Ollama.
+LOCAL_DEFAULT_URL = "http://127.0.0.1:11434/v1/chat/completions"
 ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_VERSION = "2023-06-01"
 
@@ -43,14 +46,21 @@ def _http_post(url: str, headers: dict, payload: dict, timeout: int = 180) -> di
         return json.loads(r.read().decode())
 
 
+def _local_url(cfg: dict) -> str:
+    url = str(cfg.get("local_url") or LOCAL_DEFAULT_URL)
+    if not url.startswith(("http://", "https://")):
+        raise ProviderError(tr("local_url must be http(s)"))
+    return url
+
+
 def _build(prov: str, key: str, model: str, system: str | None,
-           messages: list[dict], max_tokens: int) -> tuple[str, dict, dict]:
+           messages: list[dict], max_tokens: int, cfg: dict | None = None) -> tuple[str, dict, dict]:
     if prov == "anthropic":
         payload = {"model": model, "max_tokens": max_tokens, "messages": messages}
         if system:
             payload["system"] = system
         return ANTHROPIC_URL, {"x-api-key": key, "anthropic-version": ANTHROPIC_VERSION}, payload
-    base = OPENAI_LIKE.get(prov)
+    base = _local_url(cfg or {}) if prov == "local" else OPENAI_LIKE.get(prov)
     if not base:
         raise ProviderError(tr("unknown provider: {prov}", prov=prov))
     msgs = ([{"role": "system", "content": system}] if system else []) + messages
@@ -58,7 +68,7 @@ def _build(prov: str, key: str, model: str, system: str | None,
     # Los modelos de razonamiento gastan tokens pensando: un tope bajo devuelve respuesta vacía.
     # OpenAI (serie gpt-5) usa max_completion_tokens; Kimi (compatible OpenAI) usa max_tokens.
     payload["max_completion_tokens" if prov == "openai" else "max_tokens"] = max_tokens
-    return base, {"Authorization": f"Bearer {key}"}, payload
+    return base, ({"Authorization": f"Bearer {key}"} if key else {}), payload
 
 
 def _parse(prov: str, resp: dict) -> str:
@@ -87,13 +97,13 @@ class Engine:
         """Devuelve (respuesta, proveedor_usado). Lanza ProviderError si todos fallan."""
         errors: list[str] = []
         for prov in self.providers_in_order():
-            key = config.get_api_key(prov)
+            key = config.get_api_key(prov) or ("" if prov == "local" else None)  # un servidor local puede no pedir clave
             model = self.cfg.get("providers", {}).get(prov)
-            if not key or not model:
+            if key is None or not model:
                 errors.append(tr("{prov}: no key or model", prov=prov))
                 continue
             try:
-                url, headers, payload = _build(prov, key, model, system, messages, self.max_tokens)
+                url, headers, payload = _build(prov, key, model, system, messages, self.max_tokens, self.cfg)
                 return _parse(prov, self._post(url, headers, payload)), prov
             except (urllib.error.URLError, KeyError, IndexError, ProviderError, TimeoutError, OSError) as e:
                 errors.append(f"{prov}: {e}")

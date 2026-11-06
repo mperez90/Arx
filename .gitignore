@@ -25,6 +25,8 @@ docs/*
 
 # Tooling de negocio y tiers cerrados — NUNCA en el Core (source-available)
 scripts/polar_*.py
+# Puente local a la suscripción de Claude: solo para el lab en este Mac, nunca producción
+scripts/claude_bridge.py
 pro/
 backend/
 arsenal/

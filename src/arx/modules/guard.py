@@ -25,7 +25,7 @@ import threading
 import time
 from datetime import datetime, timezone
 
-from arx import config, engine, notify, redact
+from arx import config, consensus, engine, notify, redact
 from arx import license as lic
 from arx.i18n import lang, tr
 from arx.modules import (baseline, canaries, fleet, profile, provenance, recon, response, sandbox,
@@ -67,34 +67,56 @@ ENRICH_SWEEP_BUDGET_S = 10   # análisis estático por barrido: nunca retrasa la
 
 
 # ── integridad ───────────────────────────────────────────────────────────────
+_LATE_WATCHES = ("apt_sources", "apt_keys")  # vigilancias que una base sellada antes no tenía
+_CRIT_INTEGRITY = ("authorized_keys_root", "authorized_keys_users", "sudoers", "sudoers_d", "ld_preload",
+                   "apt_sources", "apt_keys")
+
+
+def _integrity_finding(k: str, detail: str, fp_key: str) -> dict:
+    return {"sev": "crit" if k in _CRIT_INTEGRITY else "high", "kind": "integrity", "detail": detail,
+            "fp_key": fp_key, "why": tr("critical file altered → possible tampering or persistence"),
+            "target": {"file": k}, "set": "integrity", "item": k}
+
+
 def _integrity_drift(base: dict, include_suid: bool) -> list[dict]:
-    """Compara la huella actual de ficheros críticos contra la sellada en la base."""
+    """Compara la huella actual de ficheros críticos contra la sellada en la base.
+
+    Un grupo que no existía al sellar y aparece (el primer `authorized_keys` de root, un primer cron.d)
+    es justo lo que planta un intruso: antes no se miraba, solo se comparaba lo sellado. La única
+    excepción, una vez: las vigilancias que una base sellada por una versión anterior no tenía."""
     sealed = base.get("integrity") or {}
+    if not sealed:
+        return []  # una base sin nada sellado (formato antiguo): no hay contra qué comparar
     now = baseline.integrity_fingerprint(include_suid=include_suid)
-    for k in sorted(set(now) - set(sealed) - {"suid_set"}):
-        # vigilancia nueva (p. ej. los repositorios de apt): se adopta lo que hay, una vez, y se dice
-        if baseline.accept("integrity", k):
-            sealed[k] = now[k]
-            response.record({"kind": "integrity_watch_added", "detail": k})
+    late = (base.get("meta") or {}).get("late_watches")
     findings = []
+    for k in sorted(set(now) - set(sealed) - {"suid_set"}):
+        if k in _LATE_WATCHES and not late:
+            if baseline.accept("integrity", k):  # se adopta lo que hay, y se dice
+                sealed[k] = now[k]
+                response.record({"kind": "integrity_watch_added", "detail": k})
+            continue
+        findings.append(_integrity_finding(k, tr("{k} appeared since the baseline was sealed", k=k),
+                                           f"integrity|apareció {k}"))
+    if not late:
+        baseline.mark_late_watches()
+        base.setdefault("meta", {})["late_watches"] = True
     known_suid = (base.get("sets") or {}).get("suid_binaries")
     for k, v in sealed.items():
-        if k in now and now[k] != v:
-            if k == "suid_set" and known_suid is not None:
-                findings += _new_suid(known_suid)
-                continue
-            findings.append(
-                {
-                    "sev": "crit" if k in ("authorized_keys_root", "authorized_keys_users",
-                                           "sudoers", "sudoers_d", "ld_preload", "apt_sources",
-                                           "apt_keys") else "high",
-                    "kind": "integrity",
-                    "detail": tr("{k} changed since the baseline was sealed", k=k),
-                    "fp_key": f"integrity|cambió {k} desde el sellado de la línea base",
-                    "why": tr("critical file altered → possible tampering or persistence"),
-                    "target": {"file": k}, "set": "integrity", "item": k,
-                }
-            )
+        if k == "suid_set":
+            if k in now and now[k] != v:
+                if known_suid is not None:
+                    findings += _new_suid(known_suid)
+                else:  # base antigua, sin la lista: al menos el aviso genérico
+                    findings.append(_integrity_finding(k, tr("{k} changed since the baseline was sealed", k=k),
+                                                       f"integrity|cambió {k} desde el sellado de la línea base"))
+            continue
+        if k not in now:
+            findings.append(_integrity_finding(k, tr("{k} disappeared since the baseline was sealed", k=k),
+                                               f"integrity|desapareció {k}"))
+        elif now[k] != v:
+            findings.append(_integrity_finding(k, tr("{k} changed since the baseline was sealed", k=k),
+                                               f"integrity|cambió {k} desde el sellado de la línea base"))
     return findings
 
 
@@ -459,6 +481,8 @@ def run(once: bool = False, interval: int = 30, chat: bool = False, enforce: boo
             last_val = time.monotonic()
         if not once and vaccines.due():  # en un hilo: la capa rápida no espera a la red
             threading.Thread(target=vaccines.update_safely, daemon=True).start()
+        if not once and _quietly(lambda: consensus.due(cfg), False):  # Pro/Business con servidor
+            threading.Thread(target=consensus.participate_safely, args=(cfg,), daemon=True).start()
         expired = response.expire_blocks()  # auto-expira bloqueos Tier 1 vencidos
         if expired:
             print(tr("  ⏱ {n} Tier 1 block(s) expired and were reverted.", n=len(expired)))

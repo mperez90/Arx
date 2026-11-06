@@ -377,6 +377,14 @@ def save(baseline: dict) -> None:
     config.write_json(_baseline_path(), baseline)
 
 
+def mark_late_watches() -> None:
+    with config.locked("baseline"):
+        b = load()
+        if b and not b.get("meta", {}).get("late_watches"):
+            b["meta"]["late_watches"] = True
+            save(b)
+
+
 def accept(key: str, item: str) -> bool:
     """Incorpora a la base un cambio legítimo (p. ej. instalaste nginx → 'tcp 80 all')."""
     with config.locked("baseline"):
@@ -442,6 +450,7 @@ def run(samples: int = 1, interval: int = 0, seal: bool = False, status: bool = 
             print(tr("You cannot seal an empty baseline. Run `arx learn` first."))
             return 1
         baseline["meta"]["sealed"] = True
+        baseline["meta"]["late_watches"] = True  # sellada con todas las vigilancias: nada se adopta solo
         # la huella dice QUE cambió el conjunto SUID, no cuál: sin la lista no se sabe qué hay de nuevo
         suid = recon.collect_users().get("suid_binaries")
         if suid is not None:

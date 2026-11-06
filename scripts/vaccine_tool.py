@@ -7,50 +7,36 @@ sin conexión: quien la tenga puede repartir reglas a todos los Arx del mundo.
     python3 scripts/vaccine_tool.py genkey asl-vaccines.key    # crea la clave (0600) y dice la pública
     python3 scripts/vaccine_tool.py pubkey asl-vaccines.key    # la pública, para ASL_PUBKEY en vaccines.py
     python3 scripts/vaccine_tool.py sign feed.json asl-vaccines.key -o feed.signed.json
+    python3 scripts/vaccine_tool.py delegate <pública-auto> asl-vaccines.key --serial 7 \\
+        --roster roster.json -o delegation.json
 
-El firmado no es de tiempo constante: es Python puro, para una máquina offline y sin atacante
-midiendo tiempos. Por eso esto no vive en el agente, que solo verifica.
+`delegate` autoriza la clave automática del servidor de consenso por pocos días (30 como mucho: cada
+Arx rechaza más) y firma con ella la lista de votantes (revísala: es la que usan los Arx para
+recontar). Para cortarla antes, `auto_revoked` en el paquete firmado con la maestra.
+
+La firma es la de `arx.ed25519` (cegada y con pasos fijos). Aun así, la clave maestra se usa en una
+máquina offline: nadie mide tiempos donde no hay red.
 """
 from __future__ import annotations
 
 import argparse
-import base64
-import hashlib
 import json
 import os
 import secrets
 import sys
+from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
-from arx import ed25519  # noqa: E402
+from arx import consensus, ed25519  # noqa: E402
 
 
-def _expand(secret: bytes) -> tuple[int, bytes]:
-    h = hashlib.sha512(secret).digest()
-    a = int.from_bytes(h[:32], "little")
-    a &= (1 << 254) - 8
-    a |= 1 << 254
-    return a, h[32:]
-
-
-def public_key(secret: bytes) -> bytes:
-    return ed25519.compress(ed25519.mul(_expand(secret)[0], ed25519.G))
-
-
-def sign(secret: bytes, message: bytes) -> bytes:
-    a, prefix = _expand(secret)
-    pub = public_key(secret)
-    r = ed25519.hash_mod_q(prefix + message)
-    big_r = ed25519.compress(ed25519.mul(r, ed25519.G))
-    h = ed25519.hash_mod_q(big_r + pub + message)
-    return big_r + ((r + h * a) % ed25519._Q).to_bytes(32, "little")
+public_key, sign = ed25519.public_key, ed25519.sign
 
 
 def signed_feed(feed: dict, secret: bytes) -> dict:
     """El receptor verifica estos bytes exactos ANTES de interpretar nada de su contenido."""
-    payload = json.dumps(feed, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()
-    return {"payload": base64.b64encode(payload).decode(), "sig": sign(secret, payload).hex()}
+    return consensus.seal(feed, secret)
 
 
 def _read_key(path: str) -> bytes:
@@ -66,6 +52,13 @@ def main() -> int:
     s.add_argument("feed")
     s.add_argument("key")
     s.add_argument("-o", "--out", required=True)
+    d = sub.add_parser("delegate")
+    d.add_argument("auto_pubkey")
+    d.add_argument("key")
+    d.add_argument("--serial", type=int, required=True)
+    d.add_argument("--days", type=int, default=30)
+    d.add_argument("--roster", required=True, help="votantes exportados por el servidor (roster)")
+    d.add_argument("-o", "--out", required=True)
     args = ap.parse_args()
     if args.cmd == "genkey":
         secret = secrets.token_bytes(32)
@@ -75,6 +68,16 @@ def main() -> int:
         print(f"Clave en {args.key}. Guárdala sin conexión.\nPública: {public_key(secret).hex()}")
     elif args.cmd == "pubkey":
         print(public_key(_read_key(args.key)).hex())
+    elif args.cmd == "delegate":
+        start = datetime.now(timezone.utc)
+        with open(args.roster, encoding="utf-8") as f:
+            voters = json.load(f)
+        claim = {"kind": "auto-delegation", "auto_key": args.auto_pubkey, "serial": args.serial, "roster": voters,
+                 "not_before": start.isoformat(timespec="seconds"),
+                 "not_after": (start + timedelta(days=args.days)).isoformat(timespec="seconds")}
+        with open(args.out, "w", encoding="utf-8") as f:
+            json.dump(consensus.seal(claim, _read_key(args.key)), f)
+        print(f"Delegación: {args.out} (serial {args.serial}, hasta {claim['not_after']})")
     else:
         with open(args.feed, encoding="utf-8") as f:
             feed = json.load(f)

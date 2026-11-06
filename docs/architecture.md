@@ -41,6 +41,12 @@ cgroup v2; systemd's `NFTSet=` keeps it after restarts), so it keeps serving but
 signs of harm suspend it. A reverse shell channel is cut with a DROP in nftables, not by destroying
 the socket: on expiry, the flow resumes.
 
+An update isn't trusted on its signature alone. Arx scores the package in layers: signed repository,
+files intact, a fresh copy from the repository compared file by file (a root intruder can forge
+dpkg's database, not the mirror), known-malicious databases, its install scripts, and reproducible
+builds where the distribution publishes them. Below the minimum, the service is confined. With a
+model configured, it can investigate with read-only tools of its choice; it can only lower the score.
+
 ## 3. Behavior baseline
 
 **Software** (executables by real path, services), **network** (listening ports), **users**
@@ -71,6 +77,12 @@ you (the attacking IP is often another victim).
   console chat. Customers bring their **own** model keys → zero inference cost, and their telemetry
   doesn't leave the machine beyond the model they choose.
 - **On the service side (higher tiers):** managed intelligence, licensing and the fleet console.
+- **Vaccine consensus** (Pro and Business vote, every tier receives): a proposal goes out on its own
+  only with more than two thirds of the paid organizations that vote, from several networks, and only
+  if it carries plain indicators. Model reviewers can stop it, never approve it. The server isn't
+  trusted: each host recounts the signed votes against a voter list signed offline, validates the
+  vaccine again, caps how much it can change and lets it expire within days. Everything else goes to
+  a person and to the offline master key.
 
 ## 6. Config and secrets on the host
 

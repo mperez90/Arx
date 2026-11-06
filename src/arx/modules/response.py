@@ -97,6 +97,9 @@ _PLAN: dict[str, tuple[int, str, bool, str]] = {
     "gauge": (0, tr("log and watch the trend"), True, tr("weak signal; observe first")),
     "egress_profile": (0, tr("cut in the kernel at its first packet; the service keeps running"), True,
                        tr("outside the behavior Arx observed for it; if it is legitimate, accept it")),
+    "untrusted_update": (1, tr("confine the service: no outbound network, it keeps running (until you decide)"),
+                         True, tr("a signed update below the minimum trust: cutting its network stops a backdoor "
+                                  "from calling home without stopping the service")),
     "profile_extended": (0, tr("log and alert"), True, tr("Arx keeps observing while it has doubts")),
     "profile_doc": (0, tr("log and alert"), True, tr("the model compared what it did with its documentation")),
     "firewall_reset": (0, tr("log and alert: active containment was already put back"), True,
@@ -281,6 +284,12 @@ def protected_reason(finding: dict, cfg: dict | None = None) -> str | None:
         base = exe.rsplit("/", 1)[-1]
         if base in _PROTECTED_EXES or exe == sys.executable:
             return tr("critical process ({base}): observed only", base=base)
+    if kind == "untrusted_update":
+        unit = str(target.get("unit") or "")
+        if _PROTECTED_UNITS.match(unit):
+            return tr("critical service ({unit}): it is not confined on its own", unit=unit)
+        if any(t and t in unit for t in oob):
+            return tr("service marked out-of-bounds")
     if kind in ("executables", "processes"):
         name = str(target.get("exe") or target.get("process") or "")
         base = name.rsplit("/", 1)[-1]
@@ -1265,7 +1274,9 @@ def accept(fp: str) -> str | None:
     e = load_findings().get(fp)
     if not e or not e.get("set"):
         return None
+    from arx.modules import trust
     accepted = (profile.accept(e["item"]) if e["set"] == "egress_profile"
+                else trust.accept(e["item"]) if e["set"] == "untrusted_update"
                 else baseline.accept(e["set"], e["item"]))
     if not accepted:
         return tr("Could not update the baseline (does it exist and contain that set?).")
@@ -1811,6 +1822,26 @@ def _restore_confinements() -> int:
     return restored
 
 
+def _confine_unit(unit: str, cgroup: str, finding: dict) -> tuple[str, dict | None]:
+    """Confina un servicio entero por su cgroup: lo que arranque dentro, también un intérprete compartido
+    (sh, python), queda sin red, y solo eso. Si no está corriendo, `NFTSet=` lo confina al arrancar."""
+    from arx.modules import provenance  # perezoso: provenance importa este módulo
+    if not (provenance._UNIT_RE.match(unit) and _CGROUP_PATH_RE.match(cgroup)
+            and cgroup.rsplit("/", 1)[-1] == unit):
+        return tr("invalid service: nothing confined"), None
+    set_name = _CONFINE_SETS.get(cgroup.count("/") + 1)
+    if not set_name or not _can_confine():
+        return tr("confinement is not possible on this host: decide yourself (arx accept, or stop {unit})",
+                  unit=unit), None
+    _nft_cgroup("add", set_name, cgroup)
+    _pin_confinement(unit, cgroup, set_name)
+    revert = {"tool": "confine", "exe": None, "units": [{"unit": unit, "path": cgroup, "set": set_name}],
+              "scopes": []}
+    register_block(finding, revert, ttl_min=None)
+    return tr("confined without outbound network: {what}. It keeps running; it does not expire, "
+              "you decide", what=unit), revert
+
+
 def _execute_tier1(finding: dict, cfg: dict | None = None) -> tuple[str, dict | None]:
     """Ejecuta una remediación Tier 1 reversible SOLO en Linux+root.
 
@@ -1857,6 +1888,8 @@ def _execute_tier1(finding: dict, cfg: dict | None = None) -> tuple[str, dict | 
             # `ufw deny` "funciona" con ufw apagado pero no filtra nada → no fingir contención
             return tr("ufw is INACTIVE: a block would have no effect (enable it or decide yourself)"), None
         return tr("no ufw or nftables: no safe block executor on this host"), None
+    if kind == "untrusted_update":
+        return _confine_unit(str(target.get("unit") or ""), str(target.get("cgroup") or ""), finding)
     if kind in ("executables", "processes"):
         exe = str(target.get("exe") or target.get("process") or "")
         if not exe.startswith("/"):

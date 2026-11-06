@@ -325,7 +325,7 @@ def _script(pid: int) -> str | None:
     return None
 
 
-def verify_file(path: str) -> dict:
+def verify_file(path: str, deep: bool = False) -> dict:
     """¿Este binario es de un paquete firmado y está intacto? No dice nada de quién lo ejecuta."""
     if not available():
         return {"verified": False, "reason": tr("no package database to check it against")}
@@ -340,7 +340,11 @@ def verify_file(path: str) -> dict:
     signed, where = signed_origin(pkg)
     if not signed:
         return {"verified": False, "package": pkg, "reason": where}
-    return {"verified": True, "package": pkg, "origin": where,
+    from arx.modules import trust  # perezoso: trust importa este módulo
+    t = trust.assess(pkg, deep=deep)
+    if not t["trusted"]:  # firmado pero envenenado: la procedencia sola no lo ve
+        return {"verified": False, "package": pkg, "origin": where, "trust": t["score"], "reason": t["reason"]}
+    return {"verified": True, "package": pkg, "origin": where, "trust": t["score"],
             "reason": tr("package {pkg} from a signed repository, intact", pkg=pkg)}
 
 
@@ -351,7 +355,7 @@ def verify_process(pid: int) -> dict:
         return {"verified": False, "reason": tr("the process is gone or cannot be read")}
     if exe.endswith(" (deleted)"):
         return {"verified": False, "reason": tr("its executable was deleted from disk")}
-    base = verify_file(exe)
+    base = verify_file(exe, deep=True)  # atiende la red: la prueba completa, también contra el repositorio
     if not base["verified"]:
         return base
     pkg = base["package"]
