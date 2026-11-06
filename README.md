@@ -43,6 +43,8 @@ When you trust what it reports, switch on the automatic responses with
 `sudo arx guard --enforce`, or run it 24/7 under systemd with
 `sudo arx service install --enforce`. On other distros, download `arx.pyz` from
 [Releases](https://github.com/mperez90/Arx/releases) and run it with Python 3.10 or newer.
+From v0.0.7 each release also carries signed build provenance:
+`gh attestation verify arx.pyz -R mperez90/Arx`.
 
 **What observe mode does change on your system:** its config and state (`/etc/arx`,
 `/var/lib/arx`), a backup of your critical files in its vault when you seal the baseline,
@@ -66,6 +68,10 @@ shown above. Both only need Docker.
 | A signed update whose install script plants an SSH key | Confines the service: it keeps serving, without network. The key raises its own critical alert | VM |
 | A signed update of a library a service loads, like the xz backdoor (the service itself didn't change) | Confines the services that load it; they keep serving | VM |
 | A trusted service starts doing something it never did, like a tampered update calling home | Cuts that action in the kernel and tells you; the service keeps running | VM |
+| A watched service starts a program it never started | That process loses its network in a scope of its own; the service keeps running | VM |
+| A web server or database starts a shell or a downloader as its service user (webshell) | Freezes that process; the server keeps running | VM |
+| An untrusted OpenSSH update | sshd loses outbound network except DNS and its authentication servers; open sessions and new logins keep working | VM |
+| Someone stops Arx or edits its unit or files | Alert through your channels | VM |
 | Reverse shell from `bash`, `sh`, `nc` or `socat` | Cuts the channel and suspends only that process | Lab |
 | New SUID binary | Critical alert naming it; on your word, drops the bit | Lab |
 | Persistence planted in cron | On your word: restores from the vault and quarantines the planted file | Lab |
@@ -156,8 +162,10 @@ Read these before you rely on it.
 - **The proof of origin starts from dpkg.** It only exists on Debian and Ubuntu; elsewhere nothing
   counts as proven, so everything new is contained. A signature alone isn't enough: after an update,
   Arx also checks the package against a fresh copy from its repository, known-malicious databases
-  and its install scripts, and watches what the service does. Still hard: a backdoor that only uses
-  destinations the service already used. And an intruder who is already root can stop Arx.
+  and its install scripts, and watches what the service does and what it starts. sshd running anything
+  before authenticating (the xz backdoor's pattern) is frozen on the spot. Still hard: a backdoor that
+  neither starts a program nor talks somewhere new. An intruder who is already root can stop Arx; you
+  get told.
 - **Confining needs cgroup v2, nftables that can match by cgroup, and systemd.** Without them, Arx
   suspends instead. Tested on Ubuntu 22.04 and 24.04 VMs, across service restarts and reboots.
 - **Run Arx on the host, not inside a container that shares the host's cgroup tree.** There, proof
@@ -203,17 +211,21 @@ already have them, and falls back to `/proc` if you don't. The lifecycle is four
 setup  →  recon  →  learn  →  guard
 ```
 
+## When it alerts
+
+[docs/runbook.md](docs/runbook.md): what each alert means, what Arx already did and what you decide.
+
 ## Removing it
 
 ```bash
 sudo arx canaries list       # note any decoys you planted, then delete them
 sudo arx unlock              # unlock any account you left locked
 sudo arx proposals           # undo any applied change: arx proposals revert <id>
-sudo arx service uninstall
-sudo apt remove arx
-sudo nft delete table inet arx
-sudo rm -rf /etc/arx /var/lib/arx    # also deletes its evidence and vault
+sudo apt purge arx           # also deletes /etc/arx and /var/lib/arx (its evidence and vault)
 ```
+
+Removing the package gives the network back to everything Arx confined and takes its units, drop-ins
+and nftables table with it (`apt remove` keeps the configuration and state).
 
 Its auditd watch rules, if any, disappear on reboot.
 

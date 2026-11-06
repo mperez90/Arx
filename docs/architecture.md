@@ -41,6 +41,12 @@ cgroup v2; systemd's `NFTSet=` keeps it after restarts), so it keeps serving but
 signs of harm suspend it. A reverse shell channel is cut with a DROP in nftables, not by destroying
 the socket: on expiry, the flow resumes.
 
+What services start is watched in real time through the kernel's process connector. sshd running
+anything before authenticating that isn't its own or declared in its configuration (the xz backdoor's
+pattern) is frozen within milliseconds; a web server or database starting a shell as its service user
+is frozen; a watched service starting a program it never started loses that process's network in a
+scope of its own. Arx acts on that process, never on every process of the same program.
+
 An update isn't trusted on its signature alone. Arx scores the package in layers: signed repository,
 files intact, a fresh copy from the repository compared file by file (a root intruder can forge
 dpkg's database, not the mirror), known-malicious databases, its install scripts, and reproducible

@@ -21,6 +21,7 @@ secrets/
 docs/*
 !docs/architecture.md
 !docs/tiers.md
+!docs/runbook.md
 !docs/assets/
 
 # Tooling de negocio y tiers cerrados — NUNCA en el Core (source-available)
