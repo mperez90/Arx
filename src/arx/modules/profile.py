@@ -794,6 +794,8 @@ def _exec_finding(ev: dict, why: str) -> dict:
     if why == "sshd":
         sev, harm = "crit", [tr("sshd ran a program before authentication (the xz backdoor pattern)")]
         detail = tr("{unit}: sshd, before authenticating anyone, ran {exe}", unit=unit, exe=exe)
+        if ev.get("stopped") and ev.get("latency_ms") is not None:
+            detail += tr(" (frozen {ms} ms after it started)", ms=ev["latency_ms"])
     elif why == "webshell":
         sev, harm = "high", [tr("a web or database service started a shell or a downloader")]
         detail = tr("{unit} started {exe} as {user}", unit=unit, exe=exe, user=ev.get("parent_user") or "?")
@@ -803,7 +805,7 @@ def _exec_finding(ev: dict, why: str) -> dict:
     return {"sev": sev, "kind": "unexpected_exec", "detail": detail, "harm": harm,
             "why": tr("a compromised program shows itself by what it starts"),
             "target": {"pid": ev["pid"], "start": ev["start"], "exe": exe, "unit": unit,
-                       "stopped": bool(ev.get("stopped")),
+                       "stopped": bool(ev.get("stopped")), "family": ev.get("family") or [],
                        **({"alert_only": True} if why == "sshd" and ev.get("sure") is False else {})},
             "set": "unexpected_exec", "item": f"{ev['unit']}|{exe}",
             # uno por servicio y programa: los procesos siguientes se contienen bajo el mismo aviso

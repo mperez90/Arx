@@ -3895,7 +3895,7 @@ class ExecWatchTests(unittest.TestCase):
         kills = []
         for enforce in (True, False):
             with mock.patch.object(self.x, "describe", lambda pid, root: self._ev()), \
-                    mock.patch.object(self.x, "sshd_allowed", lambda refresh=False: set()), \
+                    mock.patch.object(self.x, "sshd_allowed", lambda refresh=False, hot=False: set()), \
                     mock.patch.object(self.x, "sshd_sure", lambda: True), \
                     mock.patch.object(self.x, "same_process", lambda pid, exe, start: True), \
                     mock.patch.object(self.x.os, "kill", lambda pid, sig: kills.append((pid, sig))):
@@ -3946,7 +3946,7 @@ class ExecWatchTests(unittest.TestCase):
         kills, scopes = [], []
         for name, value in [("_is_linux_root", lambda: True), ("_can_confine", lambda: True),
                             ("_cgroup_of", lambda pid: "system.slice/app.service"),
-                            ("_adopt_into_scope", lambda pid: scopes.append(pid) or {
+                            ("_adopt_into_scope", lambda pid, also=None: scopes.append(pid) or {
                                 "scope": f"arxconfine-{pid}.scope", "path": f"arxconfine.slice/arxconfine-{pid}.scope",
                                 "set": "confined2", "pid": pid})]:
             p = mock.patch.object(self.r, name, value)
@@ -3979,6 +3979,26 @@ class ExecWatchTests(unittest.TestCase):
         with mock.patch.object(self.x, "same_process", lambda pid, exe, start: False):
             gone = {**f, "fp_key": "otro", "target": {**f["target"], "pid": 5000}}
             self.assertIn("no longer alive", self.r.handle(gone, enforce=True, cfg={})["status"])
+
+    def test_what_it_already_started_is_frozen_too(self):
+        """Lab xz: `sh -c` crea su hijo en menos de un milisegundo; congelar solo al padre no basta."""
+        import signal
+        tree = {4242: [5000], 5000: [5001]}
+        stopped = []
+        with mock.patch.object(self.x, "descendants", lambda pid: [c for p in (4242, 5000) for c in tree.get(p, [])]), \
+                mock.patch.object(self.x, "_stat", lambda pid: (0, 100 + pid)), \
+                mock.patch.object(self.x.os, "readlink", lambda path: "/usr/bin/sleep" if "5001" in path else "/usr/bin/dash"), \
+                mock.patch.object(self.x.os, "kill", lambda pid, sig: stopped.append((pid, sig))):
+            family = self.x.freeze_family(4242)
+        self.assertEqual([m["pid"] for m in family], [5000, 5001])
+        self.assertEqual(stopped, [(5000, signal.SIGSTOP), (5001, signal.SIGSTOP)])
+        revert = {"tool": "confine", "exe": "/usr/bin/dash", "pid_only": True, "units": [], "scopes": [],
+                  "stopped": [4242, 5000, 5001], "stopped_exes": {"5000": "/usr/bin/dash", "5001": "/usr/bin/sleep"}}
+        resumed = []
+        with mock.patch.object(self.r.os, "readlink", lambda path: "/usr/bin/sleep" if "5001" in path else "/usr/bin/dash"), \
+                mock.patch.object(self.r.os, "kill", lambda pid, sig: resumed.append(pid)):
+            self.r._release_confinement(revert)
+        self.assertEqual(resumed, [4242, 5000, 5001])  # cada uno, comprobado con su propio programa
 
     def test_what_the_watcher_froze_is_registered_even_with_the_brake_on(self):
         for name, value in [("_is_linux_root", lambda: True), ("_can_confine", lambda: False),
@@ -4057,6 +4077,9 @@ class SelfProtectionTests(unittest.TestCase):
         self.addCleanup(i18n.set_lang, "es")
         self.unit, self.early = os.path.join(self.d, "arx.service"), os.path.join(self.d, "arx-firewall.service")
         for name, value in [("UNIT_PATH", self.unit), ("EARLY_UNIT_PATH", self.early),
+                            ("DOWN_UNIT_PATH", os.path.join(self.d, "arx-down.service")),
+                            ("REVIVE_UNIT_PATH", os.path.join(self.d, "arx-revive.service")),
+                            ("REVIVE_TIMER_PATH", os.path.join(self.d, "arx-revive.timer")),
                             ("PLANNED_STOP", os.path.join(self.d, "planned-stop"))]:
             p = mock.patch.object(service, name, value)
             p.start()
@@ -4073,6 +4096,19 @@ class SelfProtectionTests(unittest.TestCase):
 
     def test_stopping_arx_runs_a_report(self):
         self.assertIn("ExecStopPost=-/usr/bin/arx service stopped", self.s.unit_text("/usr/bin/arx"))
+
+    def test_if_systemd_gives_up_it_alerts_and_retries_only_after_a_failure(self):
+        """DEC#11: sin ser la primera víctima de la presión de memoria; caído, se avisa y se reintenta."""
+        unit = self.s.unit_text("/usr/bin/arx")
+        self.assertIn("OOMScoreAdjust=0", unit)
+        self.assertIn("OnFailure=arx-down.service", unit)
+        self.assertIn("ExecStart=/usr/bin/arx service down", self.s.down_unit_text("/usr/bin/arx"))
+        revive = self.s.revive_unit_text()
+        self.assertIn("is-failed -q arx.service", revive.split("ExecStart")[0])  # una parada a mano no se deshace
+        self.assertIn("OnUnitActiveSec=15min", self.s.revive_timer_text())
+        sent = []
+        self.s.down(notify_send=sent.append)
+        self.assertIn("Arx is down", sent[0])
 
     def test_an_untouched_arx_says_nothing(self):
         self.assertEqual(self._check(), [])
@@ -4098,16 +4134,23 @@ class SelfProtectionTests(unittest.TestCase):
             self.s.stopped(env, notify_send=sent.append)
         self.assertEqual(len(sent), 1)
         self.assertIn("signal (killed KILL)", sent[0])
+        open(self.s.PLANNED_STOP, "w").close()
+        old = time.time() - 3600
+        os.utime(self.s.PLANNED_STOP, (old, old))  # una marca vieja (de una desinstalación con Arx ya parado)
+        with mock.patch.object(self.s.subprocess, "run", lambda *a, **k: R()):
+            self.s.stopped(env, notify_send=sent.append)
+        self.assertEqual(len(sent), 2)  # no se traga una parada de verdad
+        self.assertFalse(os.path.exists(self.s.PLANNED_STOP))
         open(self.s.PLANNED_STOP, "w").close()  # su propia desinstalación
         with mock.patch.object(self.s.subprocess, "run", lambda *a, **k: R()):
             self.s.stopped(env, notify_send=sent.append)
         R.stdout = "stopping\n"  # un apagado
         with mock.patch.object(self.s.subprocess, "run", lambda *a, **k: R()):
             self.s.stopped(env, notify_send=sent.append)
-        self.assertEqual(len(sent), 1)
+        self.assertEqual(len(sent), 2)
         from arx.modules import response
         log = open(response._incidents_path()).read()
-        self.assertEqual(log.count("self_stopped"), 2)  # lo planificado no se anota; el apagado, sí (sin avisar)
+        self.assertEqual(log.count("self_stopped"), 3)  # lo planificado no se anota; el apagado, sí (sin avisar)
 
 
 class TotpTests(unittest.TestCase):

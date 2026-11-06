@@ -54,6 +54,11 @@ _seen: set = set()
 # ── el conector de procesos ──────────────────────────────────────────────────
 def parse(data: bytes) -> list[int]:
     """Los tgid de los `exec` que trae un datagrama del conector (puede traer varios mensajes)."""
+    return [tgid for tgid, _ in parse_events(data)]
+
+
+def parse_events(data: bytes) -> list[tuple[int, int]]:
+    """(tgid, instante del kernel en ns, reloj monotónico) de cada `exec` del datagrama."""
     out, off = [], 0
     while off + 16 <= len(data):
         length = struct.unpack_from("=I", data, off)[0]
@@ -61,9 +66,9 @@ def parse(data: bytes) -> list[int]:
             break
         body = data[off + 16:off + length]
         if len(body) >= 44 and struct.unpack_from("=I", body, 0)[0] == CN_IDX_PROC:
-            what = struct.unpack_from("=I", body, 20)[0]  # cn_msg (20 bytes) y luego proc_event
+            what, _, ts = struct.unpack_from("=IIQ", body, 20)  # cn_msg (20 bytes) y luego proc_event
             if what == PROC_EVENT_EXEC:
-                out.append(struct.unpack_from("=I", body, 40)[0])  # process_tgid
+                out.append((struct.unpack_from("=I", body, 40)[0], ts))  # process_tgid
         off += (length + 3) & ~3
     return out
 
@@ -189,10 +194,11 @@ def config_commands(path: str | None = None, depth: int = 0, seen: set | None = 
     return commands, sure
 
 
-def sshd_allowed(refresh: bool = False) -> set[str]:
+def sshd_allowed(refresh: bool = False, hot: bool = False) -> set[str]:
     """Lo que sshd y PAM declaran que se ejecuta antes de autenticar. Se relee cada minuto. Si algo de esto no
     se pudo leer con certeza, `_allow["sure"]` queda en falso y la regla de sshd solo avisa (A#6)."""
-    if not refresh and _allow["at"] and time.monotonic() - _allow["at"] < ALLOW_REFRESH_S and not _changed():
+    # en el camino caliente (un exec de sshd) solo se relee si cambió la configuración; por edad, en el barrido
+    if not refresh and _allow["at"] and (hot or time.monotonic() - _allow["at"] < ALLOW_REFRESH_S) and not _changed():
         return _allow["paths"]
     paths = {"/usr/sbin/unix_chkpwd", "/sbin/unix_chkpwd"}
     sshd = shutil.which("sshd") or "/usr/sbin/sshd"
@@ -243,7 +249,7 @@ def _changed() -> bool:
 def sshd_sure() -> bool:
     """¿Se leyó la configuración de sshd con certeza? Si no, la regla de sshd solo avisa: nunca un login
     legítimo congelado por una lectura incompleta."""
-    sshd_allowed()
+    sshd_allowed(hot=True)
     return bool(_allow.get("sure"))
 
 
@@ -267,7 +273,7 @@ def sshd_preauth(ev: dict, allowed: set[str] | None = None, sessions: bool | Non
         return False
     if os.path.basename(ev["exe"]) in SSHD_PIECES:
         return False
-    allowed = sshd_allowed() if allowed is None else allowed  # solo aquí: el resto de eventos no la necesitan
+    allowed = sshd_allowed(hot=True) if allowed is None else allowed  # solo aquí: el resto de eventos no la necesitan
     if ev["exe"] in allowed or os.path.realpath(ev["exe"]) in allowed:
         return False
     # un comando declarado que es un script: el kernel ejecuta el intérprete con el script como primer
@@ -294,17 +300,59 @@ def webshell(ev: dict) -> bool:
 
 
 # ── el hilo y la cola ────────────────────────────────────────────────────────
+def descendants(pid: int) -> list[int]:
+    """Los procesos que cuelgan de `pid` (hijos, nietos…), leídos de /proc."""
+    children: dict[int, list[int]] = {}
+    try:
+        names = [int(n) for n in os.listdir("/proc") if n.isdigit()]
+    except OSError:
+        return []
+    for p in names:
+        st = _stat(p)
+        if st:
+            children.setdefault(st[0], []).append(p)
+    out, todo = [], [pid]
+    while todo:
+        for c in children.get(todo.pop(), []):
+            if c not in out:
+                out.append(c)
+                todo.append(c)
+    return out
+
+
+def freeze_family(pid: int) -> list[dict]:
+    """Congela a `pid` y a lo que ya hubiera lanzado: un `sh -c` crea su hijo en menos de un milisegundo,
+    antes de que nadie lo pare. Se repasa hasta que no aparezca nadie nuevo. Devuelve los descendientes."""
+    family: list[dict] = []
+    seen = {pid}
+    for _ in range(5):
+        new = [c for c in descendants(pid) if c not in seen]
+        if not new:
+            break
+        for c in new:
+            seen.add(c)
+            st = _stat(c)
+            try:
+                exe = os.readlink(f"/proc/{c}/exe").removesuffix(" (deleted)")
+                os.kill(c, signal.SIGSTOP)
+            except OSError:
+                continue
+            family.append({"pid": c, "exe": exe, "start": st[1] if st else None})
+    return family
+
+
 def _freeze(ev: dict) -> bool:
     if ev["pid"] in (os.getpid(), 1) or not same_process(ev["pid"], ev["exe"], ev["start"]):
         return False
     try:
         os.kill(ev["pid"], signal.SIGSTOP)
-        return True
     except OSError:
         return False
+    ev["family"] = freeze_family(ev["pid"])
+    return True
 
 
-def handle_pid(pid: int, root: str, enforce) -> dict | None:
+def handle_pid(pid: int, root: str, enforce, ts: int | None = None) -> dict | None:
     ev = describe(pid, root)
     if not ev:
         return None
@@ -312,6 +360,8 @@ def handle_pid(pid: int, root: str, enforce) -> dict | None:
     ev["sure"] = sshd_sure() if ev["preauth"] else True
     if ev["preauth"] and ev["sure"] and enforce():  # milisegundos: antes de que la orden de la puerta trasera haga nada
         ev["stopped"] = _freeze(ev)
+        if ts:  # el kernel fecha el exec con el mismo reloj monotónico
+            ev["latency_ms"] = max(0, (time.monotonic_ns() - ts) // 1_000_000)
     _events.append(ev)
     return ev
 
@@ -323,9 +373,9 @@ def _listen(sock: socket.socket, root: str, enforce) -> None:
         except OSError:  # ENOBUFS: el kernel tiró eventos; se cuenta y se sigue
             _state["lost"] += 1
             continue
-        for pid in parse(data):
+        for pid, ts in parse_events(data):
             try:
-                handle_pid(pid, root, enforce)
+                handle_pid(pid, root, enforce, ts)
             except Exception:
                 continue
 
@@ -340,6 +390,10 @@ def start(enforce) -> str:
     except (OSError, AttributeError):  # sin el conector: se mira /proc en cada barrido
         _state["mode"] = "scan"
         return "scan"
+    try:  # la lista de sshd, ya leída: nunca un `sshd -T` entre un exec y su congelación
+        sshd_allowed(refresh=True)
+    except Exception:
+        pass
     threading.Thread(target=_listen, args=(sock, provenance.system_root(), enforce), name="arx-exec",
                      daemon=True).start()
     _state["mode"] = "netlink"
@@ -366,7 +420,11 @@ def _scan(root: str) -> list[dict]:
 
 
 def drain() -> list[dict]:
-    """Lo ocurrido desde el barrido anterior."""
+    """Lo ocurrido desde el barrido anterior. De paso, la lista de sshd se renueva aquí, fuera del camino caliente."""
+    try:
+        sshd_allowed()
+    except Exception:
+        pass
     out = []
     while _events:
         out.append(_events.popleft())
