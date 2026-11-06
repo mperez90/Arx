@@ -1,0 +1,7 @@
+# Las Actions van fijadas por SHA: Dependabot propone las actualizaciones como PR, que pasan por CI y revisión.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
