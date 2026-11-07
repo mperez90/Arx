@@ -3913,6 +3913,24 @@ class ExecWatchTests(unittest.TestCase):
         self.assertTrue(self.x.sshd_preauth(other, allowed, sessions=True))  # un programa cualquiera con el script detrás
         self.assertEqual(other["akc_learn"], os.path.realpath("/tmp/x"))
 
+    def test_a_keys_command_chain_that_already_ended_is_not_an_alert(self):
+        """Lab (Ubuntu): exe leído como dash y argv ya de cat, y el proceso terminado. Con el intérprete de su
+        comando, en silencio; con otro programa, aviso."""
+        allowed = {"user:nobody", "akc:/usr/local/bin/akc", "akc:/usr/bin/cat", f"akci:{os.path.realpath('/bin/sh')}"}
+        ended = self._ev(exe=os.path.realpath("/bin/sh"), argv=["cat", "/etc/keys"], user="nobody", gone=True)
+        self.assertFalse(self.x.sshd_preauth(ended, allowed, sessions=True))
+        alive = self._ev(exe=os.path.realpath("/bin/sh"), argv=["cat", "/etc/keys"], user="nobody", pid=6100)
+        self.assertTrue(self.x.sshd_preauth(alive, allowed, sessions=True))  # vivo: se pudo leer, y no cuadra
+        other = self._ev(exe="/tmp/x", argv=[""], user="nobody", pid=6101, gone=True)
+        self.assertTrue(self.x.sshd_preauth(other, allowed, sessions=True))
+        d = tempfile.mkdtemp()
+        py = os.path.join(d, "k.py")
+        open(py, "w").write("#!/usr/bin/env python3\n")
+        found = self.x._interpreters(py)
+        self.assertIn(os.path.realpath("/usr/bin/env"), found)
+        if shutil.which("python3", path=self.x._SEARCH_PATH):
+            self.assertIn(os.path.realpath(shutil.which("python3", path=self.x._SEARCH_PATH)), found)
+
     def test_a_shebang_with_an_argument_or_env_is_still_the_declared_script(self):
         """Lockout: con `#!/bin/sh -e` el kernel ejecuta `sh -e /ruta`; con `#!/usr/bin/env python3`, env y luego
         python3. Un programa cualquiera con el script detrás, o `sh -c`, no."""

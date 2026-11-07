@@ -74,6 +74,7 @@ OK=$(logins 20)
 check "ya vigilado: envoltorio → real → cat, 20 logins, los 20 entran (hechos: $OK)" test "$OK" = 20
 sleep 35
 check "y en silencio: ninguna alarma de «sshd antes de autenticar»" sh -c "! limactl shell $VM sudo grep -q 'before authenticating anyone' /var/lib/arx/incidents.jsonl"
+v sh -c 'grep "before authenticating anyone" /var/lib/arx/incidents.jsonl | cut -c1-400' || true
 v bash -c 'cp /usr/bin/cat /usr/local/bin/arx-lab-tool
   printf "#!/bin/sh\nT=/usr/local/bin/arx-lab-tool\nexec \"\$T\" /etc/arx-lab-keys\n" > /usr/local/bin/arx-lab-akc-real'
 OK=$(logins 3)
