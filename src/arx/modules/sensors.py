@@ -225,7 +225,7 @@ def accepted_logins(path: str | None = None, limit: int = 16 * 1024 * 1024) -> s
             pass
     elif shutil.which("journalctl"):  # sin auth.log (Debian 12, instalación mínima)
         text = recon._run(["journalctl", "--no-pager", "-q", "-o", "cat", "--since", "-30d",
-                           "_COMM=sshd", "_COMM=sshd-session"], timeout=30) or ""
+                           "_COMM=sshd", "_COMM=sshd-session", "_COMM=sshd-auth"], timeout=30) or ""
     return {f"{m.group(1)}@{m.group(2)}" for m in AUTH_OK_RE.finditer(text)}
 
 
@@ -272,7 +272,7 @@ def _journal_sshd_lines() -> list[str] | None:
     if not (shutil.which("journalctl") and os.path.exists("/run/systemd/journal/socket")):
         return None
     base = ["journalctl", "--no-pager", "-q", "-o", "cat"]
-    match = ["_COMM=sshd", "_COMM=sshd-session"]
+    match = ["_COMM=sshd", "_COMM=sshd-session", "_COMM=sshd-auth"]  # OpenSSH 10 separa la parte de antes de autenticar
     cursor = config.state_dir() / "journal-sshd.cursor"
     fresh = config.state_dir() / "journal-sshd.fresh"  # sshd aún no había escrito nada
     try:

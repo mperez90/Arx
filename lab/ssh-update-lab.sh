@@ -6,7 +6,7 @@
 #   bash lab/ssh-update-lab.sh
 set -uo pipefail
 cd "$(dirname "$0")/.."
-VM=arx-victim
+VM=${ARX_LIMA_VICTIM:-arx-victim}
 WORD=palabra-del-lab
 FAILED=0
 SSHCFG="$HOME/.lima/$VM/ssh.config"

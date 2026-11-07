@@ -2768,6 +2768,7 @@ class JournalSourceTests(unittest.TestCase):
         self.assertEqual(self._lines(), ["Failed password for x from 1.2.3.4 port 1 ssh2"])
         self.assertIn("_COMM=sshd", self.seen[-1])
         self.assertIn("_COMM=sshd-session", self.seen[-1])
+        self.assertIn("_COMM=sshd-auth", self.seen[-1])  # OpenSSH 10
 
     def test_the_first_cursor_uses_the_same_filter(self):
         """Con un cursor sin filtro, journalctl se come la primera línea que casa: el `Accepted`."""
