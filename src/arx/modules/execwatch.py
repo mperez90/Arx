@@ -141,9 +141,18 @@ def describe(pid: int, root: str = "") -> dict | None:
         pexe = os.readlink(f"/proc/{ppid}/exe").removesuffix(" (deleted)")
     except OSError:
         pexe = ""
-    argv = _read(f"/proc/{pid}/cmdline", 1024).split("\0")[:3]
+    argv, gone = _read(f"/proc/{pid}/cmdline", 1024).split("\0")[:3], False
+    for _ in range(3):  # una cadena de exec rápida: que exe y argv sean del mismo programa
+        try:
+            now = os.readlink(f"/proc/{pid}/exe").removesuffix(" (deleted)")
+        except OSError:
+            gone = True  # ya terminó: argv puede ser del programa siguiente de la cadena
+            break
+        if now == exe:
+            break
+        exe, argv = now, _read(f"/proc/{pid}/cmdline", 1024).split("\0")[:3]
     return {"pid": pid, "start": start, "exe": exe, "argv": argv, "user": user, "unit": m.group(1), "ppid": ppid,
-            "parent_exe": pexe,
+            "parent_exe": pexe, **({"gone": True} if gone else {}),
             "parent_title": _read(f"/proc/{ppid}/cmdline", 512).replace("\0", " ").strip(),
             "parent_user": _owner(ppid)}
 
@@ -269,6 +278,20 @@ def _shebang(path: str) -> tuple[str, str]:
     return (parts[0], parts[1].strip() if len(parts) > 1 else "") if parts else ("", "")
 
 
+def _interpreters(path: str) -> set[str]:
+    """Lo que el kernel ejecuta para un script: su intérprete y, con env, lo que env lanza."""
+    interp, arg = _shebang(path)
+    if not interp:
+        return set()
+    out = {os.path.realpath(interp)}
+    if os.path.basename(interp) == "env":
+        prog = next((w for w in arg.split() if not w.startswith("-") and "=" not in w), "")
+        found = prog if prog.startswith("/") else shutil.which(prog, path=_SEARCH_PATH) if prog else None
+        if found:
+            out.add(os.path.realpath(found))
+    return out
+
+
 def _script_arg(exe: str, argv: list, known) -> str:
     """El script conocido que corre un intérprete: el de su shebang (`sh /ruta`, o `sh -e /ruta` con
     `#!/bin/sh -e` y solo ese argumento; con `#!/usr/bin/env python3`, env y luego python3) o un intérprete
@@ -282,13 +305,7 @@ def _script_arg(exe: str, argv: list, known) -> str:
         interp, arg = _shebang(script)
         if i == 2 and (not interp or argv[1] != arg):
             continue
-        runs = {os.path.realpath(interp)} if interp else set()
-        if interp and os.path.basename(interp) == "env":  # y luego lo que env lanza
-            prog = next((w for w in arg.split() if not w.startswith("-") and "=" not in w), "")
-            found = prog if prog.startswith("/") else shutil.which(prog, path=_SEARCH_PATH) if prog else None
-            if found:
-                runs.add(os.path.realpath(found))
-        if real in runs or (i == 1 and (_INTERPRETER_RE.match(os.path.basename(exe))
+        if real in _interpreters(script) or (i == 1 and (_INTERPRETER_RE.match(os.path.basename(exe))
                                         or _INTERPRETER_RE.match(os.path.basename(real)))):
             return script
     return ""
@@ -355,6 +372,8 @@ def sshd_allowed(refresh: bool = False, hot: bool = False) -> set[str]:
     st = profile.load()
     paths |= set(st.get("sshd_allowed") or [])
     paths |= {f"akc:{x}" for x in st.get("sshd_akc_seen") or []}
+    # los intérpretes de esos scripts: solo para un proceso que terminó antes de poder leer sus argumentos
+    paths |= {f"akci:{i}" for p in [p[4:] for p in paths if p.startswith("akc:")] for i in _interpreters(p)}
     paths |= {os.path.realpath(p) for p in paths}
     files = read | {f"/etc/pam.d/{n}" for n in _PAM_SEEN}
     _allow.update(at=time.monotonic(), paths=paths, sure=sure, stamps=_stamps(files))
@@ -417,7 +436,10 @@ def sshd_preauth(ev: dict, allowed: set[str] | None = None, sessions: bool | Non
         def akc(p):
             return f"akc:{p}" in allowed or f"akc:{os.path.realpath(p)}" in allowed
         exe = ev["exe"]
-        if not (akc(exe) or _script_arg(exe, argv, akc)):
+        # terminó antes de leerlo entero (una cadena breve: envoltorio → real → cat): con el intérprete de su
+        # comando no se puede decir más, y no se avisa de cada login
+        gone = ev.get("gone") and f"akci:{os.path.realpath(exe)}" in allowed
+        if not (akc(exe) or _script_arg(exe, argv, akc) or gone):
             interp = _INTERPRETER_RE.match(os.path.basename(exe)) or \
                 _INTERPRETER_RE.match(os.path.basename(os.path.realpath(exe)))
             script = argv[1] if len(argv) > 1 and argv[1].startswith("/") else ""

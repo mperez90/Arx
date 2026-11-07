@@ -142,9 +142,14 @@ check "sin congelar: un login entra" fresh_login
 v sh -c 'rm -f /etc/ssh/sshd_config.d/50-arxlab-akcuser.conf /usr/local/lib/xz-lab-as-nobody /usr/local/bin/arx-lab-akc-nadie'
 
 step "retirada la librería, los logins vuelven"
+alarms() { v sh -c "grep -c 'before authenticating anyone' /var/lib/arx/incidents.jsonl" | tr -d ' '; }
+sleep 35   # que lo pendiente del escenario anterior ya esté contado
+N=$(alarms)
 unplant
 check "un login nuevo funciona" fresh_login
-check "y ninguna alarma nueva de sshd con sshd limpio" sh -c "test \$(limactl shell $VM sudo grep -c 'before authenticating anyone' /var/lib/arx/incidents.jsonl) -le 1"
+sleep 35   # el barrido siguiente
+M=$(alarms)
+check "y ninguna alarma nueva de sshd con sshd limpio (antes $N, después $M)" test "$M" = "$N"
 
 echo
 [ "$FAILED" = 0 ] && echo "══ LAB DEL PATRÓN XZ COMPLETO ══" || echo "══ LAB DEL PATRÓN XZ CON FALLOS (ver [FAIL]) ══"
