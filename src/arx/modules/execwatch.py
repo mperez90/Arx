@@ -51,6 +51,7 @@ _SERVICE_USERS = {"www-data", "nginx", "apache", "http", "httpd", "tomcat", "jet
 _events: collections.deque = collections.deque(maxlen=MAX_EVENTS)
 _state = {"mode": None, "lost": 0}
 _allow = {"at": 0.0, "paths": set(), "sure": False}
+_declared: dict = {}  # (pid, inicio) de comandos declarados: lo que ejecuten en sí mismos sigue siendo suyo
 _seen: set = set()
 
 
@@ -137,7 +138,8 @@ def describe(pid: int, root: str = "") -> dict | None:
     except OSError:
         pexe = ""
     argv = _read(f"/proc/{pid}/cmdline", 1024).split("\0")[:3]
-    return {"pid": pid, "start": start, "exe": exe, "argv": argv, "unit": m.group(1), "ppid": ppid, "parent_exe": pexe,
+    return {"pid": pid, "start": start, "exe": exe, "argv": argv, "user": _owner(pid), "unit": m.group(1), "ppid": ppid,
+            "parent_exe": pexe,
             "parent_title": _read(f"/proc/{ppid}/cmdline", 512).replace("\0", " ").strip(),
             "parent_user": _owner(ppid)}
 
@@ -153,6 +155,7 @@ def same_process(pid: int, exe: str, start: int) -> bool:
 # ── reglas ───────────────────────────────────────────────────────────────────
 SSHD_CONFIG = "/etc/ssh/sshd_config"
 _COMMAND_KEYS = ("authorizedkeyscommand", "authorizedprincipalscommand")
+_USER_KEYS = ("authorizedkeyscommanduser", "authorizedprincipalscommanduser")
 _CONFIG_LINE_RE = re.compile(r"^(\S+?)(?:\s*=\s*|\s+)(.+)$")
 
 
@@ -182,12 +185,15 @@ def config_commands(path: str | None = None, depth: int = 0, seen: set | None = 
             continue
         if key in _COMMAND_KEYS and words and words[0].lower() != "none":
             commands.add(words[0])
+        elif key in _USER_KEYS and words and words[0] not in ("root", "0", "none"):
+            commands.add(f"user:{words[0]}")  # con quién corre ese comando: nunca root
         elif key == "include":
             if depth >= 8:
                 sure = False
                 continue
             for pattern in words:
                 pattern = pattern if pattern.startswith("/") else os.path.join(os.path.dirname(SSHD_CONFIG), pattern)
+                seen.add(os.path.dirname(pattern))  # su directorio también: un fichero nuevo cambia su mtime
                 for inc in sorted(glob.glob(pattern)):
                     if inc not in seen:
                         seen.add(inc)
@@ -214,7 +220,9 @@ def sshd_allowed(refresh: bool = False, hot: bool = False) -> set[str]:
         key, _, value = line.partition(" ")
         if key in _COMMAND_KEYS and value.strip() not in ("", "none"):
             paths.add(value.split()[0])
-    read: set = set()
+        elif key in _USER_KEYS and value.strip() not in ("", "none", "root", "0"):
+            paths.add(f"user:{value.split()[0]}")
+    read: set = {"/etc/pam.d"}
     declared, parsed = config_commands(seen=read)
     paths |= declared
     sure = sure and parsed
@@ -277,13 +285,24 @@ def sshd_preauth(ev: dict, allowed: set[str] | None = None, sessions: bool | Non
     if os.path.basename(ev["exe"]) in SSHD_PIECES:
         return False
     allowed = sshd_allowed(hot=True) if allowed is None else allowed  # solo aquí: el resto de eventos no la necesitan
-    if ev["exe"] in allowed or os.path.realpath(ev["exe"]) in allowed:
+    key = (ev["pid"], ev.get("start"))
+    if key in _declared:  # un comando declarado que se reemplaza (`exec` del binario real, o su última orden)
         return False
-    # un comando declarado que es un script: el kernel ejecuta el intérprete con el script como primer
-    # argumento (`sh /usr/local/bin/akc`). Cuenta solo así, nunca `sh -c …`
+    # El comando de claves corre con su AuthorizedKeysCommandUser (nunca root): esa señal no la cambia la
+    # carrera de una cadena de exec rápida (envoltorio → programa real → cat), que al leer /proc ya va por el
+    # final. Lo que ejecute una puerta trasera dentro de sshd corre como root.
+    user = ev.get("user") or ""
+    if user and user != "root" and f"user:{user}" in allowed:
+        return False
     argv = ev.get("argv") or []
     script = argv[1] if len(argv) > 1 else ""
-    if script.startswith("/") and (script in allowed or os.path.realpath(script) in allowed):
+    # un comando declarado, o uno que es un script: el kernel ejecuta el intérprete con el script como primer
+    # argumento (`sh /usr/local/bin/akc`). Cuenta solo así, nunca `sh -c …`
+    if ev["exe"] in allowed or os.path.realpath(ev["exe"]) in allowed or \
+            (script.startswith("/") and (script in allowed or os.path.realpath(script) in allowed)):
+        _declared[key] = True
+        while len(_declared) > 4096:
+            _declared.pop(next(iter(_declared)))
         return False
     title = ev.get("parent_title") or ""
     if "@" in title:  # sesión ya autenticada (sin pam_systemd se queda en este cgroup)

@@ -21,7 +21,7 @@ incident() { local out; out=$(v cat /var/lib/arx/incidents.jsonl 2>/dev/null); g
 logins() { local ok=0 i; for i in $(seq "$1"); do fresh_login && ok=$((ok + 1)); done; echo "$ok"; }
 no_frozen() { local out; out=$(v sh -c 'for p in $(cat /sys/fs/cgroup/system.slice/ssh.service/cgroup.procs); do ps -o stat= -p $p; done')
   ! grep -q T <<<"$out"; }
-cleanup() { v bash -c 'rm -f /etc/ssh/sshd_config.d/50-arxlab.conf /usr/local/bin/arx-lab-akc /usr/local/sbin/sshd /tmp/arx-akc-calls /etc/arx-lab-keys
+cleanup() { v bash -c 'rm -f /etc/ssh/sshd_config.d/50-arxlab.conf /usr/local/bin/arx-lab-akc /usr/local/bin/arx-lab-akc-real /usr/local/sbin/sshd /tmp/arx-akc-calls /etc/arx-lab-keys
   gpasswd -d "$1" arxlab >/dev/null 2>&1; groupdel arxlab 2>/dev/null; systemctl reload ssh' _ "$U"; }
 
 limactl list --format '{{.Status}}' "$VM" 2>/dev/null | grep -q Running || limactl start "$VM" >/dev/null 2>&1
@@ -43,10 +43,13 @@ check "Arx en guardia con --enforce" v systemctl is-active -q arx
 kernel_watch() { local out; out=$(v journalctl -u arx --no-pager -n 200); grep -q "process watch: in the kernel" <<<"$out"; }
 check "vigila cada exec desde el kernel" wait_for 20 kernel_watch
 
-step "un AuthorizedKeysCommand (script) dentro de Match Group, recién añadido"
+step "un AuthorizedKeysCommand (envoltorio con exec) dentro de Match Group, recién añadido"
 v bash -c 'groupadd -f arxlab && usermod -aG arxlab "$1"
   install -m 644 "$(getent passwd "$1" | cut -d: -f6)/.ssh/authorized_keys" /etc/arx-lab-keys
-  printf "#!/bin/sh\necho \"\$1\" >> /tmp/arx-akc-calls\ncat /etc/arx-lab-keys\n" > /usr/local/bin/arx-lab-akc && chmod 755 /usr/local/bin/arx-lab-akc
+  # un envoltorio declarado que hace exec del programa real (no declarado), como con sssd
+  printf "#!/bin/sh\necho \"\$1\" >> /tmp/arx-akc-calls\nexec /usr/local/bin/arx-lab-akc-real \"\$@\"\n" > /usr/local/bin/arx-lab-akc
+  printf "#!/bin/sh\nexec cat /etc/arx-lab-keys\n" > /usr/local/bin/arx-lab-akc-real
+  chmod 755 /usr/local/bin/arx-lab-akc /usr/local/bin/arx-lab-akc-real
   : > /tmp/arx-akc-calls && chmod 666 /tmp/arx-akc-calls
   # sin AuthorizedKeysFile: sshd solo llama al comando si la clave no está ya en el fichero
   printf "Match Group arxlab\n    AuthorizedKeysFile none\n    AuthorizedKeysCommand /usr/local/bin/arx-lab-akc %%u\n    AuthorizedKeysCommandUser nobody\n" > /etc/ssh/sshd_config.d/50-arxlab.conf
