@@ -101,6 +101,10 @@ _PLAN: dict[str, tuple[int, str, bool, str]] = {
                         tr("a program its service never started: the service keeps running")),
     "self_tamper": (0, tr("log and alert outside the host"), True,
                     tr("someone changed Arx itself: it may be an attempt to blind it")),
+    "injected_library": (1, tr("confine the service: no outbound network, it keeps running (until you decide)"), True,
+                         tr("a library injected into a service: cutting its network stops it from calling home")),
+    "sensitive_read": (1, tr("confine the service: no outbound network, it keeps running (until you decide)"), True,
+                       tr("whatever it read cannot leave: the service keeps running")),
     "dns_new": (0, tr("log and alert"), True,
                 tr("a domain this service never used: its connection is cut by the behavior profile")),
     "update_check": (0, tr("log and alert"), True,
@@ -297,7 +301,7 @@ def protected_reason(finding: dict, cfg: dict | None = None) -> str | None:
     if kind == "unexpected_exec" and target.get("alert_only") and not target.get("stopped"):
         return str(target.get("alert_reason") or "") or \
             tr("sshd's configuration could not be read with certainty: alert only, nothing frozen")
-    if kind == "untrusted_update":
+    if kind in ("untrusted_update", "injected_library", "sensitive_read"):
         unit = str(target.get("unit") or "")
         if _PROTECTED_UNITS.match(unit) and not _SSH_UNIT_RE.match(unit):  # ssh: sin salida, con excepciones
             return tr("critical service ({unit}): it is not confined on its own", unit=unit)
@@ -1293,6 +1297,8 @@ def accept(fp: str, scope: str | None = None) -> str | None:
     accepted = (profile.accept(e["item"]) if e["set"] == "egress_profile"
                 else profile.accept_exec(e["item"], scope) if e["set"] == "unexpected_exec"
                 else profile.accept_domain(e["item"]) if e["set"] == "dns_profile"
+                else profile.accept_library(e["item"]) if e["set"] == "library_profile"
+                else profile.accept_read(e["item"]) if e["set"] == "read_profile"
                 else trust.accept(e["item"]) if e["set"] == "untrusted_update"
                 else baseline.accept(e["set"], e["item"]))
     if not accepted:
@@ -2272,7 +2278,7 @@ def _execute_tier1(finding: dict, cfg: dict | None = None) -> tuple[str, dict | 
             # `ufw deny` "funciona" con ufw apagado pero no filtra nada → no fingir contención
             return tr("ufw is INACTIVE: a block would have no effect (enable it or decide yourself)"), None
         return tr("no ufw or nftables: no safe block executor on this host"), None
-    if kind == "untrusted_update":
+    if kind in ("untrusted_update", "injected_library", "sensitive_read"):
         return _confine_unit(str(target.get("unit") or ""), str(target.get("cgroup") or ""), finding)
     if kind == "unexpected_exec":
         return _contain_process(target, finding)

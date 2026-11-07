@@ -28,7 +28,7 @@ from datetime import datetime, timezone
 from arx import config, consensus, engine, notify, redact
 from arx import license as lic
 from arx.i18n import lang, tr
-from arx.modules import (baseline, canaries, dnswatch, execwatch, fleet, profile, provenance, recon, response, sandbox,
+from arx.modules import (baseline, canaries, dnswatch, execwatch, filewatch, fleet, profile, provenance, recon, response, sandbox,
                          sensors, service, telegram, vaccines)
 
 SYSTEM_PROMPT = (
@@ -482,6 +482,7 @@ def run(once: bool = False, interval: int = 30, chat: bool = False, enforce: boo
         print(tr("  process watch: {mode}", mode=tr("in the kernel, in real time") if mode == "netlink"
                  else tr("each sweep (no kernel connector here)")))
         print(tr("  DNS watch: {mode}", mode=tr("on") if dnswatch.start() else tr("not available here")))
+        print(tr("  sensitive files: {mode}", mode=tr("on") if filewatch.start() else tr("not available here")))
     if not once and telegram.enabled(cfg):  # en un hilo: el chat nunca retrasa la defensa
         threading.Thread(target=telegram.loop, args=(cfg,), daemon=True).start()
     started_with = enforce

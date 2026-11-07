@@ -103,6 +103,20 @@ ES = {
         "servicio crítico ({unit}): no se confina solo",
     "invalid service: nothing confined":
         "servicio no válido: no se confina nada",
+    "{unit} opened {file}, which it never opened while Arx observed it":
+        "{unit} abrió {file}, que nunca abrió mientras Arx lo observaba",
+    "a service reaching for keys or passwords it never used is what an intruder does":
+        "un servicio que busca llaves o contraseñas que nunca usó es lo que hace un intruso",
+    "whatever it read cannot leave: the service keeps running":
+        "lo que haya leído no puede salir: el servicio sigue funcionando",
+    "  sensitive files: {mode}":
+        "  ficheros sensibles: {mode}",
+    "{unit} loaded {lib}, which it never loaded while Arx observed it":
+        "{unit} cargó {lib}, que nunca cargó mientras Arx lo observaba",
+    "a library injected into a service runs inside it with its privileges":
+        "una librería inyectada en un servicio corre dentro de él, con sus privilegios",
+    "a library injected into a service: cutting its network stops it from calling home":
+        "una librería inyectada en un servicio: cortarle la red impide que llame a casa",
     "{unit} looked up {name}, a domain it never used while Arx observed it":
         "{unit} consultó {name}, un dominio que nunca usó mientras Arx lo observaba",
     " (it looks machine-generated)":

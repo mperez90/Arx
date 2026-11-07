@@ -52,6 +52,8 @@ PREVENTIVE_MAX = 3    # servicios afectados por una actualización hasta los que
 MAX_EXECS = 64        # programas distintos que lanza un servicio; más, y no hay perfil de hijos que valga
 MAX_EXEC_FINDINGS = 20
 MAX_DOMAINS = 512     # dominios registrables distintos; más, y no hay perfil de DNS que valga
+MAX_MAPS = 800        # librerías distintas que mapea un servicio
+LIB_PROCS_PER_SWEEP = 40  # procesos cuyas librerías se leen por barrido, por turnos
 SYSTEMD_DIR = "/etc/systemd/system"
 DROPIN = "90-arx-profile.conf"
 # Se observan, pero no se les corta nada: dejar sin parches a un servidor porque su actualizador estrena
@@ -690,6 +692,8 @@ def sweep(enforce: bool = False, cfg: dict | None = None, now: datetime | None =
         findings += _updates(subjects, cfg, now, check_versions=_dpkg_changed(st), enforce=enforce)
         findings += _exec_events(subjects, now, cfg)
         findings += _dns_events(subjects, now, cfg)
+        findings += _library_events(subjects, now, cfg)
+        findings += _read_events(subjects, now, cfg)
         active = vaccines._active()
         for fam in ("4", "6"):
             for cg, proto, ip, port in _elements(f"seen{fam}"):
@@ -730,6 +734,8 @@ def sweep(enforce: bool = False, cfg: dict | None = None, now: datetime | None =
             s["status"], s["watching_since"] = "watching", _iso(now)
             s.setdefault("exec_until", _iso(now))  # lo que lanza se aprendió en la misma observación
             s.setdefault("dns_until", _iso(now))  # y los dominios que consulta
+            s.setdefault("maps_until", _iso(now))  # y las librerías que carga
+            s.setdefault("reads_until", _iso(now))  # y los ficheros sensibles que abre
             response.record({"kind": "profile_watching", "detail": s["unit"], "result": s["mode"]})
         for path, s in subjects.items():
             pending = s.pop("doc_pending", None)
@@ -913,6 +919,178 @@ def _dns_events(subjects: dict, now: datetime, cfg: dict) -> list[dict]:
                           "cut by its behavior profile"),
                 "fp_key": f"dns_new|{path}|{dom}"})
     return findings
+
+
+# ── librerías inyectadas (F18.4) ─────────────────────────────────────────────
+_SUSPECT_LIB = re.compile(r"^(?:/tmp/|/var/tmp/|/dev/shm/|/run/user/|/proc/)|/\.")
+_lib_turn = [0]
+
+
+def _phase(s: dict, key: str, now: datetime, cfg: dict) -> str:
+    """learn / watch para un aspecto que llegó después de que el servicio ya estuviera vigilado."""
+    if s.get(f"{key}_open"):
+        return "open"
+    if s["status"] == "observing":
+        return "learn"
+    if not s.get(f"{key}_until"):
+        days = float(cfg.get("profile_observe_days", OBSERVE_DAYS))
+        jitter = float(cfg.get("profile_jitter_days", JITTER_DAYS))
+        s[f"{key}_until"] = _iso(now + timedelta(days=days) + timedelta(seconds=_share(s["unit"], key) * jitter * 86400))
+    return "learn" if now < _parse(s[f"{key}_until"]) else "watch"
+
+
+def _mapped_libs(pid: int) -> tuple[set[str], str | None]:
+    """(librerías mapeadas, LD_PRELOAD) de un proceso."""
+    libs = set()
+    try:
+        with open(f"/proc/{pid}/maps", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                parts = line.split(None, 5)
+                if len(parts) == 6 and parts[5].startswith("/") and ".so" in os.path.basename(parts[5]):
+                    libs.add(parts[5].strip())
+        with open(f"/proc/{pid}/environ", "rb") as f:
+            env = f.read(1 << 16).split(b"\0")
+    except OSError:
+        return set(), None
+    pre = next((e[11:].decode("utf-8", "replace") for e in env if e.startswith(b"LD_PRELOAD=")), None)
+    return libs, pre
+
+
+def _cgroup_pids(path: str) -> list[int]:
+    try:
+        with open(f"/sys/fs/cgroup/{path}/cgroup.procs", encoding="ascii") as f:
+            return [int(x) for x in f.read().split()]
+    except (OSError, ValueError):
+        return []
+
+
+def _suspect_lib(lib: str, learned: set[str]) -> bool:
+    """¿Inyectada? Una ruta temporal u oculta, siempre; si no es de ningún paquete, salvo que cuelgue de un
+    árbol ya aprendido (una extensión nueva de una app). Una librería borrada cuya ruta vuelve a ser de un
+    paquete es lo que deja una actualización sin reiniciar, no una inyección."""
+    from arx.modules import provenance
+    path = lib.removesuffix(" (deleted)")
+    if _SUSPECT_LIB.search(path):
+        return True
+    if provenance.package_of(path):
+        return False
+    tree = os.path.dirname(path)
+    for _ in range(3):
+        if any(x.startswith(tree + "/") for x in learned):
+            return False
+        tree = os.path.dirname(tree)
+    return True
+
+
+def _library_events(subjects: dict, now: datetime, cfg: dict) -> list[dict]:
+    """Las librerías que carga cada servicio, por turnos. Una inyectada, o un LD_PRELOAD nuevo: crítico, y
+    el servicio se queda sin salida."""
+    findings = []
+    paths = [p for p, s in subjects.items() if not _OBSERVE_ONLY.match(s["unit"])]
+    if not paths:
+        return findings
+    budget, start = LIB_PROCS_PER_SWEEP, _lib_turn[0] % len(paths)
+    for path in paths[start:] + paths[:start]:
+        s = subjects[path]
+        pids = _cgroup_pids(path)[:5]
+        if not pids:
+            continue
+        if budget <= 0:
+            break
+        _lib_turn[0] += 1
+        learned = set(s.setdefault("maps", []))
+        preloads = set(s.setdefault("preload", []))
+        phase = _phase(s, "maps", now, cfg)
+        for pid in pids[:budget]:
+            budget -= 1
+            libs, pre = _mapped_libs(pid)
+            new = sorted(lib for lib in libs if lib not in learned and lib.removesuffix(" (deleted)") not in learned)
+            if phase == "learn":
+                s["maps"] = sorted(learned | set(new))[:MAX_MAPS + 1]
+                if pre:
+                    s["preload"] = sorted(preloads | {pre})
+                if len(s["maps"]) > MAX_MAPS:
+                    s["maps_open"] = True
+                continue
+            if phase != "watch":
+                continue
+            bad = [lib for lib in new if _suspect_lib(lib, learned)]
+            s["maps"] = sorted(learned | {lib for lib in new if lib not in bad})[:MAX_MAPS]  # lo de paquete, sin ruido
+            if pre and pre not in preloads:
+                bad.append(f"LD_PRELOAD={pre}")
+            for lib in bad[:3]:
+                findings.append({
+                    "sev": "crit", "kind": "injected_library", "set": "library_profile", "item": f"{path}|{lib}",
+                    "detail": tr("{unit} loaded {lib}, which it never loaded while Arx observed it", unit=s["unit"],
+                                 lib=lib),
+                    "why": tr("a library injected into a service runs inside it with its privileges"),
+                    "target": {"unit": s["unit"], "cgroup": path},
+                    "fp_key": f"injected_library|{path}|{lib}"})
+            learned = set(s["maps"])
+    return findings
+
+
+# ── ficheros sensibles (F18.4) ───────────────────────────────────────────────
+def _read_events(subjects: dict, now: datetime, cfg: dict) -> list[dict]:
+    """Lo que cada servicio abre de shadow, llaves y credenciales mientras se le observa; después, uno
+    nuevo deja a ese proceso sin red y se avisa."""
+    from arx.modules import filewatch
+    findings, said = [], set()
+    for ev in filewatch.drain():
+        s = subjects.get(ev["unit"])
+        if not s or _OBSERVE_ONLY.match(s["unit"]):
+            continue
+        reads, f = s.setdefault("reads", []), ev["file"]
+        phase = _phase(s, "reads", now, cfg)
+        if phase == "learn" and f not in reads:
+            reads.append(f)
+            if len(reads) > 200:
+                s["reads_open"] = True
+        elif phase == "watch" and f not in reads and (ev["unit"], f) not in said:
+            said.add((ev["unit"], f))
+            findings.append({
+                "sev": "high", "kind": "sensitive_read", "set": "read_profile", "item": f"{ev['unit']}|{f}",
+                "detail": tr("{unit} opened {file}, which it never opened while Arx observed it", unit=s["unit"],
+                             file=f),
+                "why": tr("a service reaching for keys or passwords it never used is what an intruder does"),
+                # el servicio entero sin salida: quien lee suele ser su proceso principal, que no se saca de su cgroup
+                "target": {"unit": s["unit"], "cgroup": ev["unit"], "pid": ev["pid"], "exe": ev["exe"]},
+                "fp_key": f"sensitive_read|{ev['unit']}|{f}"})
+    return findings
+
+
+def accept_read(item: str) -> bool:
+    """«Que abra esto es normal»: lo decide una persona."""
+    path, sep, f = str(item).partition("|")
+    if not (sep and _SERVICE_PATH_RE.match(path) and f.startswith("/")):
+        return False
+    with config.locked("profiles"):
+        st = load()
+        s = (st.get("subjects") or {}).get(path)
+        if s is None:
+            return False
+        if f not in s.setdefault("reads", []):
+            s["reads"].append(f)
+        _save(st)
+    return True
+
+
+def accept_library(item: str) -> bool:
+    """«Que cargue esto es normal»: lo decide una persona."""
+    path, sep, lib = str(item).partition("|")
+    if not (sep and _SERVICE_PATH_RE.match(path) and (lib.startswith("/") or lib.startswith("LD_PRELOAD="))):
+        return False
+    with config.locked("profiles"):
+        st = load()
+        s = (st.get("subjects") or {}).get(path)
+        if s is None:
+            return False
+        if lib.startswith("LD_PRELOAD="):
+            s["preload"] = sorted(set(s.get("preload") or []) | {lib[len("LD_PRELOAD="):]})
+        else:
+            s["maps"] = sorted(set(s.get("maps") or []) | {lib})
+        _save(st)
+    return True
 
 
 def accept_domain(item: str) -> bool:

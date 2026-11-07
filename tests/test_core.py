@@ -4334,6 +4334,79 @@ class DnsWatchTests(unittest.TestCase):
         self.assertIn("example.org", self.p.load()["subjects"]["system.slice/app.service"]["domains"])
 
 
+class InjectedLibraryAndSensitiveFileTests(unittest.TestCase):
+    """F18.4: una librería inyectada en un servicio, o un servicio que abre llaves que nunca abrió."""
+
+    NOW = datetime(2026, 11, 6, tzinfo=timezone.utc)
+
+    def setUp(self):
+        _isolate()
+        from arx import i18n
+        from arx.modules import filewatch, profile, provenance, response
+        self.p, self.f, self.prov, self.r = profile, filewatch, provenance, response
+        i18n.set_lang("en")
+        self.addCleanup(i18n.set_lang, "es")
+        owned = {"/usr/lib/x86_64-linux-gnu/libc.so.6": "libc6", "/usr/lib/x86_64-linux-gnu/libbz2.so.1.0": "libbz2"}
+        p = mock.patch.object(provenance, "package_of", lambda path: owned.get(path))
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_what_counts_as_injected(self):
+        learned = {"/usr/local/lib/python3.12/dist-packages/numpy/core/_a.so"}
+        self.assertTrue(self.p._suspect_lib("/dev/shm/x.so", learned))
+        self.assertTrue(self.p._suspect_lib("/opt/app/.hidden/x.so", learned))
+        self.assertFalse(self.p._suspect_lib("/usr/lib/x86_64-linux-gnu/libc.so.6 (deleted)", learned))  # tras apt upgrade
+        self.assertFalse(self.p._suspect_lib("/usr/local/lib/python3.12/dist-packages/numpy/linalg/_b.so", learned))
+        self.assertTrue(self.p._suspect_lib("/opt/evil/libx.so", learned))
+
+    def _subjects(self, status):
+        return {"system.slice/app.service": {"unit": "app.service", "status": status, "dest": {}, "extensions": [],
+                                             "maps_until": "2026-11-01T00:00:00+00:00"}}
+
+    def _libs(self, subjects, libs, pre=None):
+        with mock.patch.object(self.p, "_cgroup_pids", lambda path: [4242]), \
+                mock.patch.object(self.p, "_mapped_libs", lambda pid: (set(libs), pre)):
+            return self.p._library_events(subjects, self.NOW, {})
+
+    def test_libraries_are_learned_then_an_injected_one_is_critical_and_confines_the_service(self):
+        s = self._subjects("observing")
+        self.assertEqual(self._libs(s, ["/usr/lib/x86_64-linux-gnu/libc.so.6"]), [])
+        s["system.slice/app.service"]["status"] = "watching"
+        self.assertEqual(self._libs(s, ["/usr/lib/x86_64-linux-gnu/libc.so.6", "/usr/lib/x86_64-linux-gnu/libbz2.so.1.0"]), [])
+        self.assertIn("/usr/lib/x86_64-linux-gnu/libbz2.so.1.0", s["system.slice/app.service"]["maps"])  # de paquete: sin ruido
+        found = self._libs(s, ["/usr/lib/x86_64-linux-gnu/libc.so.6", "/dev/shm/evil.so"], pre="/tmp/hook.so")
+        self.assertEqual([(f["sev"], f["kind"]) for f in found], [("crit", "injected_library")] * 2)
+        self.assertIn("app.service loaded /dev/shm/evil.so", found[0]["detail"])
+        self.assertIn("LD_PRELOAD=/tmp/hook.so", found[1]["detail"])
+        self.assertEqual(self.r.classify(found[0])["tier"], 1)
+
+    def test_fanotify_events_are_parsed(self):
+        import struct
+        raw = struct.pack("=IBBHQii", 24, 3, 0, 24, 0x20, 7, 4242) + struct.pack("=IBBHQii", 24, 3, 0, 24, 0x20, 8, 4343)
+        self.assertEqual(self.f.parse(raw), [(0x20, 7, 4242), (0x20, 8, 4343)])
+
+    def test_a_service_opening_keys_it_never_opened_gets_that_process_isolated(self):
+        s = self._subjects("observing")
+        ev = {"pid": 4242, "start": 7, "exe": "/usr/sbin/app", "unit": "system.slice/app.service"}
+        with mock.patch.object(self.f, "drain", lambda: [dict(ev, file="/etc/ssl/private/app.key")]):
+            self.assertEqual(self.p._read_events(s, self.NOW, {}), [])
+        s["system.slice/app.service"].update(status="watching", reads_until="2026-11-01T00:00:00+00:00")
+        with mock.patch.object(self.f, "drain", lambda: [dict(ev, file="/etc/ssl/private/app.key"),
+                                                         dict(ev, file="/etc/shadow")]):
+            found = self.p._read_events(s, self.NOW, {})
+        self.assertEqual([f["item"] for f in found], ["system.slice/app.service|/etc/shadow"])
+        self.assertIn("app.service opened /etc/shadow", found[0]["detail"])
+        self.assertEqual(found[0]["target"]["pid"], 4242)
+        self.assertEqual(self.r.classify(found[0])["tier"], 1)
+        from arx import config
+        config.write_json(self.p._state_path(), {"subjects": s})
+        self.assertTrue(self.p.accept_read("system.slice/app.service|/etc/shadow"))
+        self.assertTrue(self.p.accept_library("system.slice/app.service|LD_PRELOAD=/opt/x.so"))
+        st = self.p.load()["subjects"]["system.slice/app.service"]
+        self.assertIn("/etc/shadow", st["reads"])
+        self.assertIn("/opt/x.so", st["preload"])
+
+
 class TotpTests(unittest.TestCase):
     def setUp(self):
         from arx import totp
@@ -6000,6 +6073,8 @@ class BehaviorWatchTests(unittest.TestCase):
                                  (profile, "_cgroup_id", lambda path: None),
                                  (profile, "_doc_review_later", lambda path, s, cfg: None),
                                  (profile, "_dns_events", lambda subjects, now, cfg: []),
+                                 (profile, "_library_events", lambda subjects, now, cfg: []),
+                                 (profile, "_read_events", lambda subjects, now, cfg: []),
                                  (profile, "_installed_versions", lambda: dict(self.installed)),
                                  (profile, "_library_packages", lambda unit, own: {
                                      p: v for p, v in self.installed.items() if p in self.libs.get(unit, ())}),
