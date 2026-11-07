@@ -4420,6 +4420,14 @@ class InjectedLibraryAndSensitiveFileTests(unittest.TestCase):
         self.assertIn("LD_PRELOAD=/tmp/hook.so", found[1]["detail"])
         self.assertEqual(self.r.classify(found[0])["tier"], 1)
 
+    def test_units_that_authenticate_users_are_not_judged_for_opening_shadow(self):
+        """Lab: cron abre /etc/shadow (PAM) en cada tarea; dejarlo sin red dejaría sin red a todas."""
+        s = {"system.slice/cron.service": {"unit": "cron.service", "status": "watching", "dest": {},
+                                           "reads_until": "2026-11-01T00:00:00+00:00"}}
+        ev = {"pid": 1, "start": 1, "exe": "/usr/sbin/cron", "unit": "system.slice/cron.service", "file": "/etc/shadow"}
+        with mock.patch.object(self.f, "drain", lambda: [ev]):
+            self.assertEqual(self.p._read_events(s, self.NOW, {}), [])
+
     def test_fanotify_events_are_parsed(self):
         import struct
         raw = struct.pack("=IBBHQii", 24, 3, 0, 24, 0x20, 7, 4242) + struct.pack("=IBBHQii", 24, 3, 0, 24, 0x20, 8, 4343)
@@ -6235,6 +6243,12 @@ class BehaviorWatchTests(unittest.TestCase):
         self.assertEqual(found[0]["target"], {"unit": "app.service", "cgroup": "system.slice/app.service"})
         self.assertEqual(found[0]["item"], "pkg=2.0")
         self.assertTrue(found[0]["fp_key"].endswith("|verdict"))
+        self.assertEqual(found[0]["sev"], "high")  # sin una prueba que falle: alto
+        self.trust = {"trusted": False, "score": 0.0, "reason": "x",
+                      "checks": [{"name": "install_scripts", "result": "fail"}]}
+        with mock.patch.object(self.p, "_package_version", lambda unit: ("pkg", "2.1")):
+            sure = [f for f in self._sweep(12.5, enforce=True) if f["kind"] == "untrusted_update"]
+        self.assertEqual(sure[0]["sev"], "crit")  # con una que falla: crítico, con su reserva en el freno
         self.assertEqual(self.r.classify(found[0])["tier"], 1)
 
     def test_while_its_trust_is_checked_the_service_has_no_outbound_network(self):

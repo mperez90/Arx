@@ -575,7 +575,10 @@ def _updates(subjects: dict, cfg: dict, now: datetime, check_versions: bool = Tr
                          unit=s["unit"], new=pv, reason=t["reason"]) if p == pkg else
                       tr("{unit} loads {lib} {new}, just updated, which cannot be trusted: {reason}",
                          unit=s["unit"], lib=p, new=pv, reason=t["reason"]))
-            findings.append({**base, "fp_key": f"{key}|verdict", "detail": detail})
+            # una prueba del código que falla (scripts, copia del repositorio, OSV) es certeza: crítico, y no se
+            # queda sin actuar porque el freno se gastó en cosas menos seguras
+            sure = any(c.get("result") == "fail" for c in t.get("checks") or [])
+            findings.append({**base, "fp_key": f"{key}|verdict", "detail": detail, **({"sev": "crit"} if sure else {})})
     return findings
 
 
@@ -1038,7 +1041,8 @@ def _read_events(subjects: dict, now: datetime, cfg: dict) -> list[dict]:
     findings, said = [], set()
     for ev in filewatch.drain():
         s = subjects.get(ev["unit"])
-        if not s or _OBSERVE_ONLY.match(s["unit"]):
+        # cron, atd, sshd, getty autentican usuarios: PAM abre shadow en cada tarea o login
+        if not s or _OBSERVE_ONLY.match(s["unit"]) or _EXEC_FREE.match(s["unit"]):
             continue
         reads, f = s.setdefault("reads", []), ev["file"]
         phase = _phase(s, "reads", now, cfg)
