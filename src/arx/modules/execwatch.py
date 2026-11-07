@@ -228,24 +228,25 @@ _INJECT_ENV = {"BASH_ENV", "ENV", "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "
 _SYSTEM_PATH = set(_SEARCH_PATH.split(":")) | {"/usr/games", "/usr/local/games", "/snap/bin"}
 
 
-def script_commands(path: str, depth: int = 0, seen: set | None = None) -> set[str]:
-    """Lo que un comando de claves puede ejecutar: él mismo y, si es un script, los programas que nombra (y los
-    scripts que esos invocan). Su intérprete no: cuenta solo con el script (`_script_arg`), nunca suelto. Lo que
-    ejecute con su usuario fuera de esto, avisa."""
+def script_commands(path: str, depth: int = 0, seen: set | None = None) -> tuple[set[str], set[str]]:
+    """Lo que un comando de claves ejecuta: (en su propio proceso, nombrado). En su proceso, el hijo directo de
+    sshd: él mismo y lo que hace con `exec` (y lo que eso a su vez hace con `exec`). Nombrado: lo que lanza como
+    hijo suyo, que nunca es hijo directo de sshd (ni dash ni bash hacen exec del último comando de un script).
+    Su intérprete no: cuenta solo con el script (`_script_arg`), nunca suelto."""
     import shlex
     seen = set() if seen is None else seen
     real = os.path.realpath(path)
-    out = {path, real}
+    runs, named = {path, real}, set()
     if real in seen or depth > 3:
-        return out
+        return runs, named
     seen.add(real)
     try:
         with open(real, "rb") as f:
             data = f.read(1 << 16)
     except OSError:
-        return out
+        return runs, named
     if not data.startswith(b"#!"):
-        return out  # un binario: solo él
+        return runs, named  # un binario: solo él
     rest = data.decode("utf-8", "replace").partition("\n")[2]
     for line in rest.splitlines():
         for seg in re.split(r"[;&|`()]|\$\(", line.split("#", 1)[0]):
@@ -253,7 +254,9 @@ def script_commands(path: str, depth: int = 0, seen: set | None = None) -> set[s
                 words = shlex.split(seg)
             except ValueError:
                 continue
+            replaces = False  # `exec prog`: prog sigue en el mismo proceso
             while words and (re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", words[0]) or words[0] in _SKIP_WORDS):
+                replaces = replaces or words[0] == "exec"
                 words.pop(0)
             if not words:
                 continue
@@ -262,9 +265,15 @@ def script_commands(path: str, depth: int = 0, seen: set | None = None) -> set[s
             # un intérprete con su script cuenta por el script (`python3 /opt/x.py`); suelto (`awk '…'`), por sí
             interp = bool(cmd) and bool(_INTERPRETER_RE.match(os.path.basename(cmd)))
             for target in (args if interp and args else [cmd] + args):
-                if target and os.path.isfile(target) and (interp or os.access(target, os.X_OK)):
-                    out |= script_commands(target, depth + 1, seen)
-    return out
+                if not (target and os.path.isfile(target) and (interp or os.access(target, os.X_OK))):
+                    continue
+                if replaces:
+                    more_runs, more_named = script_commands(target, depth + 1, seen)
+                    runs |= more_runs
+                    named |= more_named
+                else:
+                    named |= {target, os.path.realpath(target)}
+    return runs, named
 
 
 def _shebang(path: str) -> tuple[str, str]:
@@ -358,8 +367,9 @@ def sshd_allowed(refresh: bool = False, hot: bool = False) -> set[str]:
     sure = sure and parsed
     paths |= keys_cmds
     scripts: set = set()
-    for cmd in keys_cmds:  # lo que esos comandos ejecutan, solo con su usuario (akc:), nunca con root
-        paths |= {f"akc:{x}" for x in script_commands(cmd, seen=scripts)}
+    for cmd in keys_cmds:  # lo que esos comandos ejecutan, solo con su usuario, nunca con root (DEC#15)
+        runs, named = script_commands(cmd, seen=scripts)
+        paths |= {f"akc:{x}" for x in runs} | {f"akcn:{x}" for x in named}
     read |= scripts
     for text in _pam_stack("sshd"):
         for line in text.splitlines():
@@ -439,7 +449,10 @@ def sshd_preauth(ev: dict, allowed: set[str] | None = None, sessions: bool | Non
         # terminó antes de leerlo entero (una cadena breve: envoltorio → real → cat): con el intérprete de su
         # comando no se puede decir más, y no se avisa de cada login
         gone = ev.get("gone") and f"akci:{os.path.realpath(exe)}" in allowed
-        if not (akc(exe) or _script_arg(exe, argv, akc) or gone):
+        # lo que el script solo nombra corre como hijo suyo: como hijo directo de sshd, solo dentro de la misma
+        # cadena de exec que ya empezó como su comando (DEC#15)
+        chained = key in _declared and any(f"akcn:{n}" in allowed for n in (exe, os.path.realpath(exe)))
+        if not (akc(exe) or _script_arg(exe, argv, akc) or gone or chained):
             interp = _INTERPRETER_RE.match(os.path.basename(exe)) or \
                 _INTERPRETER_RE.match(os.path.basename(os.path.realpath(exe)))
             script = argv[1] if len(argv) > 1 and argv[1].startswith("/") else ""
@@ -449,7 +462,11 @@ def sshd_preauth(ev: dict, allowed: set[str] | None = None, sessions: bool | Non
         bad = _injected_env(ev["pid"])
         if bad:
             ev["env_injected"] = bad
-        return bool(bad)
+            return True
+        _declared[key] = True  # lo que esta cadena ejecute después sigue siendo de su comando
+        while len(_declared) > 4096:
+            _declared.pop(next(iter(_declared)))
+        return False
     if key in _declared:  # un comando declarado que se reemplaza (`exec` del binario real, o su última orden)
         return False
 

@@ -20,7 +20,7 @@ check() { local d="$1"; shift; if "$@"; then pass "$d"; else fail "$d"; fi; }
 wait_for() { local n="$1"; shift; local i; for i in $(seq "$n"); do "$@" && return 0; sleep 1; done; return 1; }
 fresh_login() { ssh -F "$SSHCFG" -o ControlMaster=no -o ControlPath=none -o ConnectTimeout=10 "lima-$VM" true; }
 incident() { local out; out=$(v cat /var/lib/arx/incidents.jsonl 2>/dev/null); grep -q "$1" <<<"$out"; }
-unplant() { v bash -c 'rm -f /etc/ld.so.preload /etc/ssh/sshd_config.d/50-arxlab-akcuser.conf /usr/local/lib/xz-lab-as-nobody /usr/local/bin/arx-lab-akc-nadie /etc/systemd/system/ssh.service.d/xz-lab.conf; rmdir /etc/systemd/system/ssh.service.d 2>/dev/null
+unplant() { v bash -c 'rm -f /etc/ld.so.preload /etc/ssh/sshd_config.d/50-arxlab-akcuser.conf /usr/local/lib/xz-lab-as-nobody /usr/local/lib/xz-lab-exec-curl /usr/local/bin/arx-lab-akc-nadie /etc/systemd/system/ssh.service.d/xz-lab.conf; rmdir /etc/systemd/system/ssh.service.d 2>/dev/null
   systemctl daemon-reload; systemctl restart ssh
   for c in /sys/fs/cgroup/arxconfine.slice/arxconfine-*.scope; do echo 1 > $c/cgroup.kill; done 2>/dev/null
   pkill -KILL -f "xz-lab-payloa[d]"; true'; }
@@ -60,8 +60,11 @@ __attribute__((constructor)) static void hook(void) {
     if (access("/usr/local/lib/xz-lab-as-nobody", F_OK) == 0) {  /* A#10: se hace pasar por el comando de claves */
         pid_t p = fork();
         if (p == 0) {
-            if (setgid(65534) == 0 && setuid(65534) == 0)
+            if (setgid(65534) == 0 && setuid(65534) == 0) {
+                if (access("/usr/local/lib/xz-lab-exec-curl", F_OK) == 0)  /* DEC#15: un programa que el script nombra */
+                    execl("/usr/bin/curl", "curl", "-s", "--connect-timeout", "3", "http://192.0.2.1/", (char *)0);
                 execl("/bin/sh", "sh", "/usr/local/lib/xz-lab-payload.sh", (char *)0);
+            }
             _exit(1);
         }
         if (p > 0) waitpid(p, 0, 0);
@@ -127,8 +130,8 @@ check "ni su marca" sh -c "! limactl shell $VM test -e /tmp/xz-fork-ran"
 
 step "la puerta trasera se hace pasar por el usuario del comando de claves (A#10)"
 v sh -c 'for c in /sys/fs/cgroup/arxconfine.slice/arxconfine-*.scope; do echo 1 > $c/cgroup.kill; done 2>/dev/null; pkill -KILL -f "xz-lab-payloa[d]"; rm -f /tmp/xz-lab-ran; true'
-# un comando de claves en shell: su intérprete no le vale a nadie más que a su script
-v bash -c 'printf "#!/bin/sh\nexec cat /dev/null\n" > /usr/local/bin/arx-lab-akc-nadie && chmod 755 /usr/local/bin/arx-lab-akc-nadie
+# un comando de claves en shell: su intérprete no le vale a nadie más que a su script; curl lo lanza como hijo suyo
+v bash -c 'printf "#!/bin/sh\ncurl -s -m 1 http://127.0.0.1:9/keys >/dev/null || true\nexec cat /dev/null\n" > /usr/local/bin/arx-lab-akc-nadie && chmod 755 /usr/local/bin/arx-lab-akc-nadie
   printf "Match User arx-lab-nadie\n    AuthorizedKeysCommand /usr/local/bin/arx-lab-akc-nadie\n    AuthorizedKeysCommandUser nobody\n" > /etc/ssh/sshd_config.d/50-arxlab-akcuser.conf
   touch /usr/local/lib/xz-lab-as-nobody; chmod 755 /usr/local/lib/xz-lab-payload.sh'
 payload 'sleep 0.2; touch /tmp/xz-lab-ran'
@@ -139,7 +142,11 @@ check "precondición: pasó la ventana de aprendizaje del comando de claves" wai
 ( fresh_login >/dev/null 2>&1 & )
 check "alerta crítica: corre como nobody, fuera de lo que ejecuta su comando de claves" wait_for 60 incident "as nobody, outside what its keys command runs"
 check "sin congelar: un login entra" fresh_login
-v sh -c 'rm -f /etc/ssh/sshd_config.d/50-arxlab-akcuser.conf /usr/local/lib/xz-lab-as-nobody /usr/local/bin/arx-lab-akc-nadie'
+v touch /usr/local/lib/xz-lab-exec-curl   # DEC#15: curl, nombrado por el script, como hijo directo de sshd
+( fresh_login >/dev/null 2>&1 & )
+check "alerta crítica: curl como nobody, hijo directo de sshd y no de su comando de claves" wait_for 60 incident "ran /usr/bin/curl as nobody, outside what its keys command runs"
+check "sin congelar: un login entra" fresh_login
+v sh -c 'rm -f /etc/ssh/sshd_config.d/50-arxlab-akcuser.conf /usr/local/lib/xz-lab-as-nobody /usr/local/lib/xz-lab-exec-curl /usr/local/bin/arx-lab-akc-nadie'
 
 step "retirada la librería, los logins vuelven"
 alarms() { v sh -c "grep -c 'before authenticating anyone' /var/lib/arx/incidents.jsonl" | tr -d ' '; }

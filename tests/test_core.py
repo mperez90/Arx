@@ -3896,11 +3896,13 @@ class ExecWatchTests(unittest.TestCase):
         open(wrapper, "w").write('#!/bin/sh\nLOG=x echo "$1" >> /tmp/log\nexec ' + real + ' "$@"\n')
         os.chmod(real, 0o755)
         os.chmod(wrapper, 0o755)
-        found = self.x.script_commands(wrapper)
+        found, named = self.x.script_commands(wrapper)
         self.assertIn(real, found)
         self.assertNotIn(os.path.realpath("/bin/sh"), found)  # su intérprete solo cuenta con el script
-        self.assertTrue(any(os.path.basename(p) == "cat" for p in found))
-        self.assertFalse(any(p.endswith("/etc/keys") for p in found))  # un argumento que no se ejecuta, no
+        self.assertTrue(any(os.path.basename(p) == "cat" for p in found))  # `exec cat`: en su proceso
+        self.assertTrue(any(os.path.basename(p) == "echo" for p in named))  # lo demás, como hijo suyo
+        self.assertFalse(any(os.path.basename(p) == "echo" for p in found))
+        self.assertFalse(any(p.endswith("/etc/keys") for p in found | named))  # un argumento que no se ejecuta, no
         allowed = {"user:nobody"} | {f"akc:{p}" for p in found}
         quiet = self._ev(argv=["/bin/sh", wrapper, "ana"], user="nobody")
         self.assertFalse(self.x.sshd_preauth(quiet, allowed, sessions=True))
@@ -3912,6 +3914,19 @@ class ExecWatchTests(unittest.TestCase):
         other = self._ev(exe="/tmp/x", argv=["/tmp/x", wrapper], user="nobody", pid=6001)
         self.assertTrue(self.x.sshd_preauth(other, allowed, sessions=True))  # un programa cualquiera con el script detrás
         self.assertEqual(other["akc_learn"], os.path.realpath("/tmp/x"))
+
+    def test_a_program_the_keys_command_only_names_is_never_a_direct_child_of_sshd(self):
+        """DEC#15: lo que el script nombra sin `exec` corre como hijo suyo. Como hijo directo de sshd (una puerta
+        trasera: setuid(nobody) + exec curl) avisa, sin congelar; dentro de la cadena de su comando, no."""
+        self.x._declared.clear()
+        allowed = {"user:nobody", "akc:/usr/local/bin/akc", "akcn:/usr/bin/curl"}
+        direct = self._ev(exe="/usr/bin/curl", argv=["curl", "-s", "http://x"], user="nobody")
+        self.assertTrue(self.x.sshd_preauth(direct, allowed, sessions=True))
+        self.assertTrue(direct.get("akc_unknown"))
+        script = self._ev(argv=["/bin/sh", "/usr/local/bin/akc", "ana"], user="nobody", pid=6200)
+        self.assertFalse(self.x.sshd_preauth(script, allowed, sessions=True))
+        same = self._ev(exe="/usr/bin/curl", argv=["curl", "-s", "http://x"], user="nobody", pid=6200)
+        self.assertFalse(self.x.sshd_preauth(same, allowed, sessions=True))  # la misma cadena, ya de su comando
 
     def test_a_keys_command_chain_that_already_ended_is_not_an_alert(self):
         """Lab (Ubuntu): exe leído como dash y argv ya de cat, y el proceso terminado. Con el intérprete de su
