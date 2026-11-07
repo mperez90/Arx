@@ -35,8 +35,11 @@ NLMSG_DONE = 3
 MAX_EVENTS = 4000
 ALLOW_REFRESH_S = 60
 SSHD_PIECES = {"sshd", "sshd-session", "sshd-auth"}
-SSH_UNIT_RE = re.compile(r"^(?:.+/)?system\.slice/sshd?\.service$")
-_SERVICE_RE = re.compile(r"^((?:.+/)?system\.slice/[A-Za-z0-9@_.:\\-]{1,200}\.service)(?:/.*)?$")
+# sshd como servicio, o una instancia por conexión (socket con Accept=yes: Debian 13, por ejemplo)
+SSH_UNIT_RE = re.compile(r"^(?:.+/)?system\.slice/(?:system-sshd?\.slice/sshd?@[^/]+|sshd?)\.service$")
+# también instancias de plantilla dentro de su slice (system-sshd.slice/sshd@….service)
+_SERVICE_RE = re.compile(r"^((?:.+/)?system\.slice/(?:[A-Za-z0-9_.:\\-]{1,200}\.slice/)?"
+                         r"[A-Za-z0-9@_.:\\-]{1,200}\.service)(?:/.*)?$")
 # títulos de sshd antes de autenticar; uno con «@» ya es una sesión autenticada. «[priv]» no vale: el
 # monitor lo lleva antes y después, y tras autenticar ejecuta pam_motd
 _PREAUTH_TITLE_RE = re.compile(r"\[(?:accepted|net|preauth|listener)\]|\bunknown\b")
