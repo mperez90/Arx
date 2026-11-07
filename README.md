@@ -68,7 +68,11 @@ shown above. Both only need Docker.
 | A signed update whose install script plants an SSH key | Confines the service: it keeps serving, without network. The key raises its own critical alert | VM |
 | A signed update of a library a service loads, like the xz backdoor (the service itself didn't change) | Confines the services that load it; they keep serving | VM |
 | A trusted service starts doing something it never did, like a tampered update calling home | Cuts that action in the kernel and tells you; the service keeps running | VM |
-| A watched service starts a program it never started | That process loses its network in a scope of its own; the service keeps running | VM |
+| A watched service starts a program it never started | That process loses its network in a scope of its own; the service keeps running. A new tool from a verified package that isn't a shell, interpreter or downloader only raises an alert | VM |
+| sshd runs anything before authenticating (the xz backdoor's pattern), also with OpenSSH 10 and per-connection sshd | Freezes it and whatever it already started within milliseconds, in a frozen cgroup an outside SIGCONT can't wake; critical alert | VM |
+| A watched service looks up a domain it never used | Alert, higher if the name looks machine-generated; the connection itself is cut by its behavior profile | VM |
+| A library injected into a service (`/dev/shm`, a hidden path, no package, a new `LD_PRELOAD`) | Critical alert; the service keeps running without outbound network | VM |
+| A service opens shadow, private keys or cloud credentials it never opened | The service keeps running without outbound network; alert | VM |
 | A web server or database starts a shell or a downloader as its service user (webshell) | Freezes that process; the server keeps running | VM |
 | An untrusted OpenSSH update | sshd loses outbound network except DNS and its authentication servers; open sessions and new logins keep working | VM |
 | Someone stops Arx or edits its unit or files | Alert through your channels | VM |

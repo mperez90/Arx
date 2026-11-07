@@ -47,6 +47,11 @@ pattern) is frozen within milliseconds; a web server or database starting a shel
 is frozen; a watched service starting a program it never started loses that process's network in a
 scope of its own. Arx acts on that process, never on every process of the same program.
 
+Arx also learns, per service and through the kernel, the domains it looks up (NFLOG, by registrable
+domain), the libraries it loads and which secrets it opens (fanotify on shadow, private keys, cloud
+credentials, TLS keys). Something new after the observation is reported; an injected library or a newly
+opened secret leaves the service without outbound network while it keeps serving.
+
 An update isn't trusted on its signature alone. Arx scores the package in layers: signed repository,
 files intact, a fresh copy from the repository compared file by file (a root intruder can forge
 dpkg's database, not the mirror), known-malicious databases, its install scripts, and reproducible

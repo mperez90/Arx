@@ -73,6 +73,9 @@ and B are green.
 | **sshd configuration (Lima)** | An AuthorizedKeysCommand script inside a `Match Group` block, just added: sshd runs it before authenticating on every login, and Arx freezes none; nor with `sshd -T` broken | `bash lab/sshd-config-lab.sh` |
 | **Untrusted OpenSSH update (Lima)** | sshd loses outbound network but keeps DNS; an open session survives, new logins work, also after restarting sshd; accepting gives it all back | `bash lab/ssh-update-lab.sh` |
 | **Uninstall (Lima)** | Stopping Arx or editing its unit is reported; `apt purge arx` leaves no drop-in, pin, unit, nftables table, config or state, and what was confined gets its network back | `bash lab/uninstall-lab.sh` |
+| **xz pattern (Lima)** | A real library injected into sshd runs a command before authentication: frozen within milliseconds before it can act, also a fork loop, and an outside SIGCONT can't wake it. Ubuntu 24.04 and Debian 13 (OpenSSH 10) | `bash lab/xz-lab.sh` |
+| **DNS per service (Lima)** | A service learns its domains; a new one is reported, a machine-generated-looking one is high | `bash lab/dns-lab.sh` |
+| **Libraries and secrets (Lima)** | A library in `/dev/shm` loaded into a service, or a service opening `/etc/shadow`: alert and no outbound network; a library from a package and a user reading shadow don't count | `bash lab/files-lab.sh` |
 | **Supply chain (Lima)** | Signed updates from a vendor's own signed repository: one whose install script plants an SSH key, one whose unit calls home, and one of a library a service loads (the shape of the xz backdoor). Each service is confined or has the call cut, keeps serving, and is reported; accepting a version frees it | `bash lab/supply-chain-lab.sh` |
 
 They use their own image, `lab/systemd/Dockerfile`, built only from the official `ubuntu:22.04` and
