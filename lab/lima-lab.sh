@@ -26,6 +26,8 @@ v() { if [ -n "$LXC" ]; then limactl shell "$VM" sudo incus exec -T "$LXC" -- "$
 a() { limactl shell "$ATT" "$@"; }
 check() { local d="$1"; shift; if "$@"; then pass "$d"; else fail "$d"; fi; }
 wait_for() { local n="$1"; shift; local i; for i in $(seq "$n"); do "$@" && return 0; sleep 1; done; return 1; }
+# con plazo de reloj, para lo que tarda en cada intento (quiet: 13 s): nunca un bucle sin fin, ni si el host se duerme
+within() { local end=$((SECONDS + $1)); shift; while [ $SECONDS -lt $end ]; do "$@" && return 0; sleep 2; done; return 1; }
 
 for m in "$VM" "$ATT"; do
   limactl list -q 2>/dev/null | grep -qx "$m" || { echo "falta la VM $m (ver lab/README.md)"; exit 2; }
@@ -181,7 +183,7 @@ v systemctl stop arx
 v bash -c 'systemctl daemon-reload; systemctl enable --now agent >/dev/null 2>&1'
 check "precondición (Arx parado): el programa llega al atacante" wait_for 30 growing $P1
 v systemctl start arx
-if wait_for 120 quiet $P1; then pass "confinado: al atacante ya no le llega nada"; else fail "confinado: al atacante ya no le llega nada"; fi
+if within 300 quiet $P1; then pass "confinado: al atacante ya no le llega nada"; else fail "confinado: al atacante ya no le llega nada"; fi
 local_ok() { [ "$(v curl -s -m 3 -o /dev/null -w '%{http_code}' http://127.0.0.1:8090/)" = "200" ]; }
 check "y sigue atendiendo en local: no se ha parado" local_ok
 not_stopped() { ! v ps -o stat= -C agentpy | grep -q T; }
@@ -197,7 +199,7 @@ if [ -n "$LXC" ]; then
 else
   limactl shell "$VM" bash -c "setsid nohup env PYTHONHOME=/usr /opt/agent/agentpy /opt/agent/agent.py $A $P2 /tmp/agent2.log >/dev/null 2>&1 < /dev/null &"
 fi
-if wait_for 120 quiet $P2; then pass "el proceso de la sesión tampoco sale"; else fail "el proceso de la sesión tampoco sale"; fi
+if within 300 quiet $P2; then pass "el proceso de la sesión tampoco sale"; else fail "el proceso de la sesión tampoco sale"; fi
 # `[a]` para que pgrep no se encuentre a sí mismo en la línea de órdenes
 adopted() { v sh -c 'cat /proc/$(pgrep -f "[a]gent2.log" | head -1)/cgroup' | grep -q arxconfine; }
 check "lo hizo adoptándolo en un scope propio" adopted
@@ -210,10 +212,20 @@ stopped() { v sh -c "ps -o stat= -p $KPID" | grep -q T; }
 if wait_for 90 stopped; then pass "suspendido (estado T)"; else fail "suspendido (estado T)"; fi
 
 step "reinicio real de la víctima: lo confinado sigue confinado"
+# si el host se duerme (Mac con la tapa cerrada) o la víctima no vuelve, se dice por qué y el lab sigue
+up() { ssh -F "$HOME/.lima/$VM/ssh.config" -o ConnectTimeout=5 -o BatchMode=yes "lima-$VM" true >/dev/null 2>&1; }
+reboot_dump() {
+  echo "  ── diagnóstico del reinicio ──"
+  limactl list "$VM" 2>&1 | sed 's/^/  /'
+  tail -n 15 "$HOME/.lima/$VM/ha.stderr.log" 2>/dev/null | cut -c1-200 | sed 's/^/  /'
+  pmset -g log 2>/dev/null | grep -E " (Sleep|Wake|DarkWake) " | tail -n 4 | cut -c1-120 | sed 's/^/  host: /'
+}
 before=$(hits $P1); CONTROL=0
 if [ -n "$LXC" ]; then limactl shell "$VM" sudo incus restart "$LXC" >/dev/null 2>&1
 else limactl stop "$VM" >/dev/null 2>&1; limactl start "$VM" >/dev/null 2>&1; fi
-if wait_for 150 quiet $P1; then pass "tras el reinicio, al atacante vuelve a no llegarle nada"; else fail "tras el reinicio, al atacante vuelve a no llegarle nada"; fi
+if within 300 up; then pass "la víctima vuelve tras el reinicio"; else fail "la víctima vuelve tras el reinicio (300 s)"; reboot_dump; fi
+if within 300 quiet $P1; then pass "tras el reinicio, al atacante vuelve a no llegarle nada"
+else fail "tras el reinicio, al atacante vuelve a no llegarle nada"; reboot_dump; fi
 # desde antes de apagar: lo que llegó menos las conexiones de control de la propia medida
 leaked=$(( $(hits $P1) - before - CONTROL ))
 echo "  conexiones del programa que salieron durante el arranque: $leaked"
