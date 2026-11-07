@@ -12,7 +12,7 @@
 # Solo para probar en local; sin el puente, la corrida sigue sin modelo.
 set -uo pipefail
 cd "$(dirname "$0")/.."
-VM=arx-victim
+VM=${ARX_LIMA_VICTIM:-arx-victim}
 ATT=arx-attacker
 WORD=palabra-del-lab
 FAILED=0
