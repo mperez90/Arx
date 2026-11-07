@@ -54,6 +54,11 @@ quiet() {  # nada llega en 10 s, y un control no confinado sí llega: el contado
 }
 serves() { a sh -c "nc -w 3 $V 8095 < /dev/null 2>/dev/null" | grep -q acme; }
 incident() { local out; out=$(v cat /var/lib/arx/incidents.jsonl 2>/dev/null); grep -q "$1" <<<"$out"; }
+# la explicación, en 30 s; si no llega, lo que haya para entender por qué (y si llega tarde, cuánto)
+explains() { wait_for 30 incident "$1" && return 0
+  v sh -c 'tail -n 4 /var/lib/arx/incidents.jsonl | cut -c1-400; journalctl -u arx --no-pager -n 400 | grep -iE "error|traceback|exception" | tail -n 8' >&2
+  local t; for t in $(seq 120); do incident "$1" && { echo "  (llegó tarde: +${t}s)" >&2; return 1; }; sleep 1; done
+  echo "  (no llegó en 150 s)" >&2; return 1; }
 # solo los sets de confinamiento: la observación también nombra al servicio en la tabla (watched2)
 confined() { local out; out=$(v sh -c 'for n in 2 3 4 5 6; do nft list set inet arx confined$n; done' 2>/dev/null)
   grep -q "acme-agent.service" <<<"$out"; }
@@ -139,7 +144,7 @@ build_pkg 2.0 'echo "ssh-ed25519 AAAAC3Nza acme-lab" >> /root/.ssh/authorized_ke
 v bash -c 'apt-get -o DPkg::Lock::Timeout=300 update -qq >/dev/null 2>&1; DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 install -y -qq acme-agent >/dev/null 2>&1'
 check "precondición: la 2.0 se instaló (la firma no la para)" v sh -c 'dpkg-query -W -f="\${Version}" acme-agent | grep -qx 2.0'
 if wait_for 120 confined; then pass "Arx la confina: no llega a la confianza mínima"; else fail "Arx la confina: no llega a la confianza mínima"; fi
-check "y lo explica" wait_for 30 incident "cannot be trusted"
+check "y lo explica" explains "cannot be trusted"
 check "el servicio sigue atendiendo" serves
 check "y la llave plantada da su propia alarma crítica" wait_for 90 incident "authorized_keys_root changed"
 fp=$(v python3 -c "import sys; sys.path.insert(0, '/usr/lib/arx/arx.pyz')
@@ -192,7 +197,7 @@ build_extra acme-libfoo 2.0 'echo "ssh-ed25519 AAAAC3Nza acme-lab" >> /root/.ssh
 v bash -c 'apt-get -o DPkg::Lock::Timeout=300 update -qq >/dev/null 2>&1; DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 install -y -qq acme-libfoo >/dev/null 2>&1'
 check "precondición: acme-libfoo 2.0 instalada, acme-relay sin tocar" v sh -c 'dpkg-query -W -f="\${Version}" acme-libfoo | grep -qx 2.0 && dpkg-query -W -f="\${Version}" acme-relay | grep -qx 1.0'
 check "Arx confina a acme-relay por la librería que carga" wait_for 120 relay_confined
-check "y lo explica" wait_for 30 incident "loads acme-libfoo"
+check "y lo explica" explains "loads acme-libfoo"
 check "acme-relay sigue atendiendo" relay_serves
 v sed -i "/acme-lab/d" /root/.ssh/authorized_keys
 v systemctl disable --now acme-relay >/dev/null 2>&1
