@@ -5609,6 +5609,7 @@ class ConfinementTests(unittest.TestCase):
         self._patch(self.r, "_SYSTEMD_DIR", d)
         self._patch(self.r, "auth_backends", lambda: [("udp", "127.0.0.53", 53), ("tcp", "10.0.0.5", 88),
                                                       ("tcp", "2001:db8::5", 389)])
+        self._patch(self.r, "_ssh_templates", lambda: ["sshd"])  # también conexiones por instancia (sshd@)
         f = self._update("ssh.service", "system.slice/ssh.service", "openssh-server=1:9.6")
         self.assertIsNone(self.r.protected_reason(f, {}))
         o = self.r.handle(f, enforce=True, cfg={})
@@ -5622,7 +5623,17 @@ class ConfinementTests(unittest.TestCase):
         dropin = open(os.path.join(d, "ssh.service.d", "91-arx-confallow.conf")).read()
         self.assertIn("confallow2v6", dropin)  # cada reinicio de sshd (cgroup nuevo) las vuelve a cargar
         self.assertIn(["nft", "add", "element", "inet", "arx", "confined2", '{ "system.slice/ssh.service" }'], self.calls)
+        # las conexiones por instancia: su slice, y cada instancia lo recarga al arrancar
+        self.assertIn(["nft", "add", "element", "inet", "arx", "confined2", '{ "system.slice/system-sshd.slice" }'],
+                      self.calls)
+        tmpl = open(os.path.join(d, "sshd@.service.d", "91-arx-confallow.conf")).read()
+        self.assertIn("""confined2 '{ "system.slice/system-sshd.slice" }'""", tmpl)
+        self.assertIn('"system.slice/system-sshd.slice" . udp . 127.0.0.53 . 53', tmpl)
+        self.assertIn("sshd@", o["status"])
         self.assertIn("✓", self.r.accept(o["fp"]))
+        self.assertIn(["nft", "delete", "element", "inet", "arx", "confined2", '{ "system.slice/system-sshd.slice" }'],
+                      self.calls)
+        self.assertFalse(os.path.exists(os.path.join(d, "sshd@.service.d", "91-arx-confallow.conf")))
         self.assertTrue(any(c[:4] == ["nft", "delete", "element", "inet"] and c[5] == "confallow2v4" for c in self.calls))
         self.assertFalse(os.path.exists(os.path.join(d, "ssh.service.d", "91-arx-confallow.conf")))
 

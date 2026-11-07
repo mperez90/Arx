@@ -1675,6 +1675,69 @@ def auth_backends(read=_read_text, resolve=None) -> list[tuple[str, str, int]]:
     return sorted(x for x in out if 0 < x[2] < 65536)
 
 
+_SSH_TEMPLATES = ("sshd", "ssh")
+_UNIT_DIRS = ("/etc/systemd/system", "/run/systemd/generator", "/run/systemd/generator.late", "/usr/lib/systemd/system",
+              "/lib/systemd/system")
+
+
+def _ssh_templates() -> list[str]:
+    """Las plantillas de sshd por conexión de este host (socket con Accept=yes; el generador de ssh de systemd)."""
+    return [t for t in _SSH_TEMPLATES if os.path.isdir(f"/sys/fs/cgroup/system.slice/system-{t}.slice")
+            or any(os.path.exists(os.path.join(d, f"{t}@.service")) for d in _UNIT_DIRS)]
+
+
+def _confine_ssh_instances(allow: list) -> list[dict]:
+    """Las conexiones por instancia (sshd@….service) viven en su slice, fuera de ssh.service: el slice entero
+    queda sin salida salvo las excepciones. Lo recarga cada instancia al arrancar (ExecStartPre), así que
+    vale aunque el slice desaparezca y vuelva, en cualquier versión de systemd."""
+    done = []
+    nft = shutil.which("nft") or "/usr/sbin/nft"
+    for t in _ssh_templates():
+        path, set_name = f"system.slice/system-{t}.slice", _CONFINE_SETS[2]
+        if allow and not _ensure_allow_sets(2):
+            continue
+        lines = [f"ExecStartPre=-{nft} add element inet arx {name} '{{ {elements} }}'"
+                 for name, elements in _allow_elements(path, allow).items()]
+        lines.append(f"ExecStartPre=-{nft} add element inet arx {set_name} '{{ \"{path}\" }}'")
+        d = os.path.join(_SYSTEMD_DIR, f"{t}@.service.d")
+        try:
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, _ALLOW_DROPIN), "w", encoding="utf-8") as f:
+                f.write("# Arx: connections without outbound network, except what they need to authenticate.\n"
+                        "[Service]\n" + "\n".join(lines) + "\n")
+        except OSError:
+            continue
+        for name, elements in _allow_elements(path, allow).items():  # ya, si el slice existe
+            subprocess.run(["nft", "add", "element", "inet", "arx", name, f"{{ {elements} }}"], capture_output=True,
+                           text=True, timeout=15)
+        _nft_cgroup("add", set_name, path)
+        done.append({"template": t, "path": path, "set": set_name, "allow": allow})
+    if done:
+        subprocess.run(["systemctl", "daemon-reload"], capture_output=True, timeout=30)
+    return done
+
+
+def _release_ssh_instances(entries) -> list[str]:
+    done = []
+    for e in entries if isinstance(entries, list) else []:
+        t = e.get("template") if isinstance(e, dict) else None
+        if t not in _SSH_TEMPLATES:
+            continue
+        path = f"system.slice/system-{t}.slice"
+        _nft_cgroup("delete", _CONFINE_SETS[2], path)
+        for name, elements in _allow_elements(path, _valid_allow(e.get("allow"))).items():
+            subprocess.run(["nft", "delete", "element", "inet", "arx", name, f"{{ {elements} }}"], capture_output=True,
+                           text=True, timeout=15)
+        try:
+            os.unlink(os.path.join(_SYSTEMD_DIR, f"{t}@.service.d", _ALLOW_DROPIN))
+        except OSError:
+            pass
+        done.append(f"{t}@")
+    if done:
+        subprocess.run(["systemctl", "daemon-reload"], capture_output=True, timeout=30)
+    return done
+
+
 def _valid_allow(items) -> list:
     """Solo formas conocidas, venga de donde venga el estado: nunca texto libre a nft."""
     out = []
@@ -1972,6 +2035,7 @@ def _release_confinement(revert: dict) -> str:
     for sc in revert.get("scopes") or []:
         _nft_cgroup("delete", str(sc.get("set")), str(sc.get("path", "")))
         done.append(f"pid {sc.get('pid')}")
+    done += _release_ssh_instances(revert.get("templates"))
     for path in revert.get("frozen_cgroups") or []:  # primero descongelar el scope, luego SIGCONT
         if isinstance(path, str):
             _freeze_cgroup(path, False)
@@ -2052,6 +2116,15 @@ def _restore_confinements() -> int:
                     _pin_confinement(str(entry["unit"]), path, set_name)
                 if entry.get("unit") and isinstance(entry.get("allow"), list):
                     _pin_allow(str(entry["unit"]), path, _valid_allow(entry["allow"]))
+        for e in revert.get("templates") or []:  # las conexiones por instancia: el slice, si ya existe
+            if isinstance(e, dict) and e.get("template") in _SSH_TEMPLATES and os.path.isdir(
+                    f"/sys/fs/cgroup/system.slice/system-{e['template']}.slice"):
+                path = f"system.slice/system-{e['template']}.slice"
+                for name, elements in _allow_elements(path, _valid_allow(e.get("allow"))).items():
+                    subprocess.run(["nft", "add", "element", "inet", "arx", name, f"{{ {elements} }}"],
+                                   capture_output=True, text=True, timeout=15)
+                if _nft_cgroup("add", _CONFINE_SETS[2], path):
+                    restored += 1
     return restored
 
 
@@ -2074,9 +2147,13 @@ def _confine_unit(unit: str, cgroup: str, finding: dict) -> tuple[str, dict | No
     _nft_cgroup("add", set_name, cgroup)
     _pin_confinement(unit, cgroup, set_name)
     revert = {"tool": "confine", "exe": None, "units": [entry], "scopes": []}
+    what = unit
+    if _SSH_UNIT_RE.match(unit):  # y las conexiones por instancia, si las hay
+        revert["templates"] = _confine_ssh_instances(_valid_allow(entry["allow"]))
+        what += "".join(f", {t['template']}@" for t in revert["templates"])
     register_block(finding, revert, ttl_min=None)
     return tr("confined without outbound network: {what}. It keeps running; it does not expire, "
-              "you decide", what=unit), revert
+              "you decide", what=what), revert
 
 
 def _freeze_cgroup(path: str, on: bool) -> bool:

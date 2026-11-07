@@ -43,6 +43,11 @@ sys.exit(0 if s.get('system.slice/ssh.service', {}).get('package') else 1)"; }
 check "precondición: Arx conoce ssh.service y su paquete" wait_for 60 known
 check "precondición: desde el cgroup de sshd se sale a Internet" in_sshd nc -z -w 5 1.1.1.1 443
 check "precondición: un login nuevo funciona" fresh_login
+# sshd por socket, una instancia por conexión (Debian 13): la de una conexión abierta, si la hay
+INST=$(v sh -c 'ls -d /sys/fs/cgroup/system.slice/system-sshd.slice/sshd@*.service 2>/dev/null | head -1')
+in_inst() { v sh -c "echo \$\$ > '$INST/cgroup.procs' && exec $*"; }
+inst_cut() { ! in_inst nc -z -w 5 1.1.1.1 443; }
+[ -n "$INST" ] && check "precondición: desde una conexión por instancia (sshd@) se sale" in_inst nc -z -w 5 1.1.1.1 443
 
 step "una sesión abierta antes, y la actualización no fiable de openssh-server"
 limactl shell "$VM" sleep 900 > /dev/null 2>&1 &
@@ -73,6 +78,10 @@ check "un login nuevo sigue funcionando" fresh_login
 cut() { ! in_sshd nc -z -w 5 1.1.1.1 443; }
 check "desde el cgroup de sshd ya no se sale a Internet" cut
 check "pero el DNS sí resuelve (excepción para autenticar)" in_sshd getent hosts ubuntu.com
+if [ -n "$INST" ]; then
+  check "las conexiones por instancia (sshd@) tampoco salen" inst_cut
+  check "pero también resuelven DNS" in_inst getent hosts ubuntu.com
+fi
 v systemctl restart ssh
 sleep 3
 check "tras reiniciar sshd (cgroup nuevo): sigue sin salida" cut
@@ -86,6 +95,7 @@ print(next(fp for fp, e in r.load_findings().items() if 'ssh.service was updated
 v arx accept "$fp" >/dev/null 2>&1
 check "sshd vuelve a tener salida" wait_for 30 not_confined
 check "y sale a Internet" in_sshd nc -z -w 5 1.1.1.1 443
+[ -n "$INST" ] && check "y las conexiones por instancia también" in_inst nc -z -w 5 1.1.1.1 443
 gone() { ! v test -e /etc/systemd/system/ssh.service.d/91-arx-confallow.conf; }
 check "sin restos de las excepciones" gone
 kill "$SESSION" 2>/dev/null
