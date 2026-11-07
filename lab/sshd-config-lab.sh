@@ -60,6 +60,7 @@ CALLS=$(v sh -c 'wc -l < /tmp/arx-akc-calls' | tr -d ' ')
 check "sshd ejecutó el comando antes de autenticar en cada uno (llamadas: $CALLS)" test "${CALLS:-0}" -ge 20
 sleep 35
 check "ninguna alarma de «sshd antes de autenticar»" sh -c "! limactl shell $VM sudo grep -q 'before authenticating anyone' /var/lib/arx/incidents.jsonl"
+v sh -c 'grep "before authenticating anyone" /var/lib/arx/incidents.jsonl | cut -c1-300' || true
 check "nada congelado en ssh.service" no_frozen
 
 step "con sshd -T roto: nunca un login congelado"

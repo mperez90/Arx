@@ -117,10 +117,14 @@ def _owner(pid: int) -> str:
 
 
 def describe(pid: int, root: str = "") -> dict | None:
-    """Lo que hace falta para decidir, leído al instante: el proceso puede durar milisegundos."""
+    """Lo que hace falta para decidir, leído al instante: el proceso puede durar milisegundos. Su usuario,
+    lo primero: un comando de claves breve ya habría terminado al final y saldría sin usuario."""
+    user = _owner(pid)
     try:
         exe = os.readlink(f"/proc/{pid}/exe").removesuffix(" (deleted)")
     except OSError:
+        return None
+    if not user:
         return None
     cg = next((ln[3:].strip().strip("/") for ln in _read(f"/proc/{pid}/cgroup").splitlines()
                if ln.startswith("0::")), "")
@@ -138,7 +142,7 @@ def describe(pid: int, root: str = "") -> dict | None:
     except OSError:
         pexe = ""
     argv = _read(f"/proc/{pid}/cmdline", 1024).split("\0")[:3]
-    return {"pid": pid, "start": start, "exe": exe, "argv": argv, "user": _owner(pid), "unit": m.group(1), "ppid": ppid,
+    return {"pid": pid, "start": start, "exe": exe, "argv": argv, "user": user, "unit": m.group(1), "ppid": ppid,
             "parent_exe": pexe,
             "parent_title": _read(f"/proc/{ppid}/cmdline", 512).replace("\0", " ").strip(),
             "parent_user": _owner(ppid)}
