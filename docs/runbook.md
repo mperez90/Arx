@@ -19,6 +19,8 @@ sudo arx forensics --indicators    # just the indicators (IPs, hashes) to share 
 | A service "tried to reach … outside its usual behavior" | Cut that connection in the kernel | A new legitimate destination: `sudo arx accept <id>` |
 | A service "started …, which it never ran" | Isolated that process without network; the service keeps running | Expected (a new feature, a new job): `sudo arx accept <id>` |
 | sshd "before authenticating anyone, ran …" | Froze that process and isolated it | Treat it as a compromise: keep the evidence, update OpenSSH and its libraries from a trusted source, rotate keys. Only if you configured that command yourself: `sudo arx accept <id>` |
+| sshd ran … "as <user>, outside what its keys command runs" | Alerted only: nothing frozen, logins keep working | You changed your AuthorizedKeysCommand (a new program, or one it now runs directly instead of as its child): `sudo arx accept <id>`. You didn't: treat it as a compromise, as above |
+| sshd ran a declared command "with … in its environment" | Alerted only: nothing frozen | Variables such as `BASH_ENV` or `LD_PRELOAD` make it run something else. Unless you set them on purpose, treat it as a compromise |
 | A web server or database "started a shell" | Froze that process | Look for a webshell in the site's files; then `sudo arx accept <id>` lifts it |
 | Login from an unknown origin | Closed that account's sessions and access (on your word, or the model's) | `sudo arx unlock` only once you know it was legitimate |
 | A planted cron job, SUID bit, second root account, changed critical file | Alerted and asked for your word | `sudo arx authorize <id>` to restore or remove; `sudo arx accept <id>` if it was you |

@@ -864,10 +864,11 @@ def _exec_finding(ev: dict, why: str) -> dict:
                           if ev.get("env_injected") else {}),
                        **({"scope": ev["scope"], "scope_frozen": bool(ev.get("scope_frozen"))} if ev.get("scope") else {}),
                        **({"alert_only": True} if why == "sshd" and ev.get("sure") is False else {})},
-            "set": "unexpected_exec", "item": f"{ev['unit']}|{exe}",
+            # con el usuario de claves, lo que se acepta es el script que corrió, nunca su intérprete suelto
+            "set": "unexpected_exec", "item": f"{ev['unit']}|{ev.get('akc_learn') or exe}",
             # uno por servicio y programa (las instancias por conexión, sshd@…, cuentan como una): los procesos
             # siguientes se contienen bajo el mismo aviso
-            "fp_key": f"unexpected_exec|{_ONE_INSTANCE_RE.sub('@.service', ev['unit'])}|{exe}"}
+            "fp_key": f"unexpected_exec|{_ONE_INSTANCE_RE.sub('@.service', ev['unit'])}|{ev.get('akc_learn') or exe}"}
 
 
 def _sha256_file(path: str) -> str:
@@ -1155,8 +1156,10 @@ def accept_exec(item: str, scope: str | None = None) -> bool:
     """«Que lance esto es normal»: entra en lo aprendido del servicio (en sshd, en lo que puede lanzar
     antes de autenticar). Con `scope="dir"`, todo su directorio; con `scope="children"`, también lo que ese
     programa lance. Lo decide una persona."""
+    from arx.modules import execwatch
     path, sep, exe = str(item).partition("|")
-    if not (sep and _SERVICE_PATH_RE.match(path) and exe.startswith("/") and "|" not in exe):
+    ssh = bool(execwatch.SSH_UNIT_RE.match(path))  # también sshd@<conexión>, bajo system-sshd.slice (Debian 13)
+    if not (sep and (_SERVICE_PATH_RE.match(path) or ssh) and exe.startswith("/") and "|" not in exe):
         return False
     with config.locked("profiles"):
         st = load()
@@ -1167,7 +1170,7 @@ def accept_exec(item: str, scope: str | None = None) -> bool:
             s["exec_patterns"] = sorted(set(s.get("exec_patterns") or []) | {os.path.dirname(exe) + "/*"})
         if s is not None and scope == "children":
             s["exec_parents"] = sorted(set(s.get("exec_parents") or []) | {exe})
-        if re.search(r"/sshd?\.service$", path):
+        if ssh:
             st["sshd_allowed"] = sorted(set(st.get("sshd_allowed") or []) | {exe})
         _save(st)
     return True

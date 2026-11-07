@@ -378,9 +378,10 @@ def sshd_allowed(refresh: bool = False, hot: bool = False) -> set[str]:
                 cmd = next((t for t in tokens[tokens.index("pam_exec.so") + 1:] if t.startswith("/")), None)
                 if cmd:
                     paths.add(cmd)
-    from arx.modules import profile  # lo que una persona aceptó, y lo aprendido con el usuario de claves
+    from arx.modules import profile  # lo que una persona aceptó (vale con o sin usuario de claves) y lo aprendido
     st = profile.load()
-    paths |= set(st.get("sshd_allowed") or [])
+    accepted = set(st.get("sshd_allowed") or [])
+    paths |= accepted | {f"akc:{x}" for x in accepted}
     paths |= {f"akc:{x}" for x in st.get("sshd_akc_seen") or []}
     # los intérpretes de esos scripts: solo para un proceso que terminó antes de poder leer sus argumentos
     paths |= {f"akci:{i}" for p in [p[4:] for p in paths if p.startswith("akc:")] for i in _interpreters(p)}

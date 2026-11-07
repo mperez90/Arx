@@ -4275,6 +4275,25 @@ class ExecWatchTests(unittest.TestCase):
         self.assertIn("/usr/bin/new", st["subjects"]["system.slice/app.service"]["execs"])
         self.assertEqual(st["sshd_allowed"], ["/usr/local/bin/akc"])
         self.assertFalse(self.p.accept_exec("../etc|/x"))
+        # Debian 13: sshd por conexión, bajo system-sshd.slice (antes no se guardaba: el login seguía congelado)
+        self.assertTrue(self.p.accept_exec("system.slice/system-sshd.slice/sshd@3-10.0.0.1:22-10.0.0.2:5555.service"
+                                           "|/usr/local/bin/akc2"))
+        self.assertIn("/usr/local/bin/akc2", self.p.load()["sshd_allowed"])
+        self.assertFalse(self.p.accept_exec("system.slice/system-sshd.slice/../x.service|/x"))
+
+    def test_a_keys_command_alert_accepts_its_script_never_the_bare_shell(self):
+        ev = {"pid": 1, "start": 1, "exe": "/usr/bin/dash", "unit": "system.slice/ssh.service", "user": "nobody",
+              "argv": ["/bin/sh", "/usr/local/bin/new-akc"], "preauth": True, "sure": True, "akc_unknown": True,
+              "akc_learn": "/usr/local/bin/new-akc"}
+        f = self.p._exec_finding(ev, "sshd")
+        self.assertEqual(f["item"], "system.slice/ssh.service|/usr/local/bin/new-akc")
+        self.assertTrue(f["fp_key"].endswith("|/usr/local/bin/new-akc"))
+        self.assertTrue(f["target"]["alert_only"])
+        from arx.modules import execwatch
+        with mock.patch.object(self.p, "load", lambda: {"sshd_allowed": ["/usr/local/bin/new-akc"]}), \
+                mock.patch.object(execwatch.subprocess, "run", side_effect=OSError):
+            allowed = execwatch.sshd_allowed(refresh=True)
+        self.assertIn("akc:/usr/local/bin/new-akc", allowed)  # aceptado: vale también con el usuario de claves
 
 
 class RedactionTests(unittest.TestCase):
