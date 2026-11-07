@@ -693,7 +693,7 @@ def sweep(enforce: bool = False, cfg: dict | None = None, now: datetime | None =
                 subjects[path] = _new_subject(path, now, cfg)
         # versiones solo si dpkg cambió; lo ya actualizado se re-evalúa una hora (el modelo llega después)
         findings += _updates(subjects, cfg, now, check_versions=_dpkg_changed(st), enforce=enforce)
-        findings += _exec_events(subjects, now, cfg)
+        findings += _exec_events(subjects, now, cfg, st)
         findings += _dns_events(subjects, now, cfg)
         findings += _library_events(subjects, now, cfg)
         findings += _read_events(subjects, now, cfg)
@@ -835,6 +835,12 @@ def _exec_finding(ev: dict, why: str) -> dict:
         detail = tr("{unit}: sshd, before authenticating anyone, ran {exe}", unit=unit, exe=exe)
         if ev.get("stopped") and ev.get("latency_ms") is not None:
             detail += tr(" (frozen {ms} ms after it started)", ms=ev["latency_ms"])
+        if ev.get("akc_unknown"):  # con el usuario de claves: la evidencia, sin congelar
+            detail += tr(" as {user}, outside what its keys command runs (sha256 {sha}, argv: {argv})",
+                         user=ev.get("user"), sha=_sha256_file(exe)[:16], argv=" ".join(ev.get("argv") or [])[:160])
+        if ev.get("env_injected"):
+            detail += tr(" with {vars} in its environment, which sshd never sets (argv: {argv})",
+                         vars=", ".join(ev["env_injected"]), argv=" ".join(ev.get("argv") or [])[:160])
     elif why == "webshell":
         sev, harm = "high", [tr("a web or database service started a shell or a downloader")]
         detail = tr("{unit} started {exe} as {user}", unit=unit, exe=exe, user=ev.get("parent_user") or "?")
@@ -850,6 +856,12 @@ def _exec_finding(ev: dict, why: str) -> dict:
                        **({"alert_only": True, "alert_reason": tr("it comes from a verified package and is not a "
                                                                   "shell, interpreter or downloader: alert only")}
                           if why == "verified" else {}),
+                       **({"alert_only": True, "alert_reason": tr("it runs as the keys command's user: alert only, "
+                                                                  "nothing frozen, no login is blocked")}
+                          if ev.get("akc_unknown") else {}),
+                       **({"alert_only": True, "alert_reason": tr("a declared command with code-loading variables in "
+                                                                  "its environment: alert only, no login is blocked")}
+                          if ev.get("env_injected") else {}),
                        **({"scope": ev["scope"], "scope_frozen": bool(ev.get("scope_frozen"))} if ev.get("scope") else {}),
                        **({"alert_only": True} if why == "sshd" and ev.get("sure") is False else {})},
             "set": "unexpected_exec", "item": f"{ev['unit']}|{exe}",
@@ -858,11 +870,27 @@ def _exec_finding(ev: dict, why: str) -> dict:
             "fp_key": f"unexpected_exec|{_ONE_INSTANCE_RE.sub('@.service', ev['unit'])}|{exe}"}
 
 
-def _exec_events(subjects: dict, now: datetime, cfg: dict) -> list[dict]:
+def _sha256_file(path: str) -> str:
+    import hashlib
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read(64 * 1024 * 1024)).hexdigest()
+    except OSError:
+        return "?"
+
+
+def _exec_events(subjects: dict, now: datetime, cfg: dict, st: dict | None = None) -> list[dict]:
     """Aprende lo que lanza cada servicio mientras se le observa; después, lo nuevo se aísla y se avisa."""
     from arx.modules import execwatch
     findings = []
+    akc = (st if st is not None else {}).setdefault("sshd_akc", {"unit": "sshd-keys-command", "status": "watching"})
+    akc_phase = _phase(akc, "akc", now, cfg)  # su propia ventana, desde el primer barrido
     for ev in execwatch.drain():
+        if ev.get("akc_unknown") and akc_phase == "learn" and st is not None:  # lo del comando de claves, aprendido
+            seen, item = st.setdefault("sshd_akc_seen", []), ev.get("akc_learn")
+            if item and item not in seen and len(seen) < 64:
+                seen.append(item)
+            continue
         s = subjects.get(ev["unit"])
         why = "sshd" if ev.get("preauth") else "webshell" if execwatch.webshell(ev) else None
         if not why and s and not (_EXEC_FREE.match(s["unit"]) or _OBSERVE_ONLY.match(s["unit"])):

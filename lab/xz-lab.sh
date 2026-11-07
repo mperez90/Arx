@@ -20,7 +20,7 @@ check() { local d="$1"; shift; if "$@"; then pass "$d"; else fail "$d"; fi; }
 wait_for() { local n="$1"; shift; local i; for i in $(seq "$n"); do "$@" && return 0; sleep 1; done; return 1; }
 fresh_login() { ssh -F "$SSHCFG" -o ControlMaster=no -o ControlPath=none -o ConnectTimeout=10 "lima-$VM" true; }
 incident() { local out; out=$(v cat /var/lib/arx/incidents.jsonl 2>/dev/null); grep -q "$1" <<<"$out"; }
-unplant() { v bash -c 'rm -f /etc/ld.so.preload /etc/systemd/system/ssh.service.d/xz-lab.conf; rmdir /etc/systemd/system/ssh.service.d 2>/dev/null
+unplant() { v bash -c 'rm -f /etc/ld.so.preload /etc/ssh/sshd_config.d/50-arxlab-akcuser.conf /usr/local/lib/xz-lab-as-nobody /usr/local/bin/arx-lab-akc-nadie /etc/systemd/system/ssh.service.d/xz-lab.conf; rmdir /etc/systemd/system/ssh.service.d 2>/dev/null
   systemctl daemon-reload; systemctl restart ssh
   for c in /sys/fs/cgroup/arxconfine.slice/arxconfine-*.scope; do echo 1 > $c/cgroup.kill; done 2>/dev/null
   pkill -KILL -f "xz-lab-payloa[d]"; true'; }
@@ -41,6 +41,7 @@ cat > /tmp/xz-lab.c <<'EOF'
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/wait.h>
 /* Solo en el proceso de cada conexión, antes de autenticar: como la puerta trasera de xz. OpenSSH 9 se
    reejecuta con -R; OpenSSH 10 ejecuta sshd-session. */
 __attribute__((constructor)) static void hook(void) {
@@ -56,6 +57,16 @@ __attribute__((constructor)) static void hook(void) {
     if (m > 13 && strcmp(exe + m - 13, "/sshd-session") == 0) conn = 1;
     if (!conn) return;
     unsetenv("LD_PRELOAD");
+    if (access("/usr/local/lib/xz-lab-as-nobody", F_OK) == 0) {  /* A#10: se hace pasar por el comando de claves */
+        pid_t p = fork();
+        if (p == 0) {
+            if (setgid(65534) == 0 && setuid(65534) == 0)
+                execl("/bin/sh", "sh", "/usr/local/lib/xz-lab-payload.sh", (char *)0);
+            _exit(1);
+        }
+        if (p > 0) waitpid(p, 0, 0);
+        return;
+    }
     system("/bin/sh /usr/local/lib/xz-lab-payload.sh");  /* la orden la decide el lab en cada escenario */
 }
 EOF
@@ -68,6 +79,7 @@ v bash -c "mkdir -p /tmp/arxsrc && cp -r $PWD/src $PWD/packaging /tmp/arxsrc/ &&
 check "Arx instalado" v arx --version
 printf '%s\n' "en" "" "" "" "$WORD" "$WORD" "" "" "1" "" "core" "" "" "high" "block" | v arx setup >/dev/null 2>&1
 v bash -c 'arx recon >/dev/null; arx learn >/dev/null; arx learn >/dev/null; arx learn --seal >/dev/null'
+v python3 -c "import json; p = '/etc/arx/config.json'; c = json.load(open(p)); c.update(profile_observe_days=0.003, profile_jitter_days=0); json.dump(c, open(p, 'w'))"
 v arx service install --enforce >/dev/null 2>&1
 check "Arx en guardia con --enforce" v systemctl is-active -q arx
 kernel_watch() { local out; out=$(v journalctl -u arx --no-pager -n 200); grep -q "process watch: in the kernel" <<<"$out"; }
@@ -112,6 +124,22 @@ sleep 3
 C=$(spawned)
 check "un SIGCONT ajeno no la despierta: ni procesos nuevos" test "$B" = "$C"
 check "ni su marca" sh -c "! limactl shell $VM test -e /tmp/xz-fork-ran"
+
+step "la puerta trasera se hace pasar por el usuario del comando de claves (A#10)"
+v sh -c 'for c in /sys/fs/cgroup/arxconfine.slice/arxconfine-*.scope; do echo 1 > $c/cgroup.kill; done 2>/dev/null; pkill -KILL -f "xz-lab-payloa[d]"; rm -f /tmp/xz-lab-ran; true'
+# un comando de claves en shell: su intérprete no le vale a nadie más que a su script
+v bash -c 'printf "#!/bin/sh\nexec cat /dev/null\n" > /usr/local/bin/arx-lab-akc-nadie && chmod 755 /usr/local/bin/arx-lab-akc-nadie
+  printf "Match User arx-lab-nadie\n    AuthorizedKeysCommand /usr/local/bin/arx-lab-akc-nadie\n    AuthorizedKeysCommandUser nobody\n" > /etc/ssh/sshd_config.d/50-arxlab-akcuser.conf
+  touch /usr/local/lib/xz-lab-as-nobody; chmod 755 /usr/local/lib/xz-lab-payload.sh'
+payload 'sleep 0.2; touch /tmp/xz-lab-ran'
+akc_watching() { v python3 -c "import json, sys, datetime as d
+s = json.load(open('/var/lib/arx/profiles.json')).get('sshd_akc', {})
+u = s.get('akc_until'); sys.exit(0 if u and d.datetime.fromisoformat(u) < d.datetime.now(d.timezone.utc) else 1)"; }
+check "precondición: pasó la ventana de aprendizaje del comando de claves" wait_for 420 akc_watching
+( fresh_login >/dev/null 2>&1 & )
+check "alerta crítica: corre como nobody, fuera de lo que ejecuta su comando de claves" wait_for 60 incident "as nobody, outside what its keys command runs"
+check "sin congelar: un login entra" fresh_login
+v sh -c 'rm -f /etc/ssh/sshd_config.d/50-arxlab-akcuser.conf /usr/local/lib/xz-lab-as-nobody /usr/local/bin/arx-lab-akc-nadie'
 
 step "retirada la librería, los logins vuelven"
 unplant

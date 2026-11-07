@@ -207,6 +207,113 @@ def config_commands(path: str | None = None, depth: int = 0, seen: set | None = 
     return commands, sure
 
 
+_SEARCH_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+_SKIP_WORDS = {"exec", "env", "command", "nohup", "then", "do", "else", "if", "while", "until", "time", "!", "{", "}"}
+# un intérprete ejecuta lo que le den: cuenta solo con un script conocido, nunca suelto ni con `-c`
+_INTERPRETER_RE = re.compile(r"^(?:sh|bash|dash|zsh|ksh|mksh|ash|python[0-9.]*|perl[0-9.]*|ruby[0-9.]*|php[0-9.]*|"
+                             r"node|nodejs|lua[0-9.]*|tclsh[0-9.]*|[gm]?awk)$")
+# con estas, un intérprete o el cargador ejecutan código ajeno; sshd lanza sus comandos con un entorno mínimo
+_INJECT_ENV = {"BASH_ENV", "ENV", "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "PERL5OPT", "PERL5LIB", "PERLLIB",
+               "PYTHONSTARTUP", "PYTHONPATH", "PYTHONHOME", "RUBYOPT", "RUBYLIB", "NODE_OPTIONS", "NODE_PATH",
+               "SHELLOPTS", "BASHOPTS", "PS4", "LUA_INIT", "LUA_PATH", "PHPRC", "PHP_INI_SCAN_DIR"}
+_SYSTEM_PATH = set(_SEARCH_PATH.split(":")) | {"/usr/games", "/usr/local/games", "/snap/bin"}
+
+
+def script_commands(path: str, depth: int = 0, seen: set | None = None) -> set[str]:
+    """Lo que un comando de claves puede ejecutar: él mismo y, si es un script, los programas que nombra (y los
+    scripts que esos invocan). Su intérprete no: cuenta solo con el script (`_script_arg`), nunca suelto. Lo que
+    ejecute con su usuario fuera de esto, avisa."""
+    import shlex
+    seen = set() if seen is None else seen
+    real = os.path.realpath(path)
+    out = {path, real}
+    if real in seen or depth > 3:
+        return out
+    seen.add(real)
+    try:
+        with open(real, "rb") as f:
+            data = f.read(1 << 16)
+    except OSError:
+        return out
+    if not data.startswith(b"#!"):
+        return out  # un binario: solo él
+    rest = data.decode("utf-8", "replace").partition("\n")[2]
+    for line in rest.splitlines():
+        for seg in re.split(r"[;&|`()]|\$\(", line.split("#", 1)[0]):
+            try:
+                words = shlex.split(seg)
+            except ValueError:
+                continue
+            while words and (re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", words[0]) or words[0] in _SKIP_WORDS):
+                words.pop(0)
+            if not words:
+                continue
+            cmd = words[0] if words[0].startswith("/") else shutil.which(words[0], path=_SEARCH_PATH)
+            args = [w for w in words[1:] if w.startswith("/") and os.path.isfile(w)]
+            # un intérprete con su script cuenta por el script (`python3 /opt/x.py`); suelto (`awk '…'`), por sí
+            interp = bool(cmd) and bool(_INTERPRETER_RE.match(os.path.basename(cmd)))
+            for target in (args if interp and args else [cmd] + args):
+                if target and os.path.isfile(target) and (interp or os.access(target, os.X_OK)):
+                    out |= script_commands(target, depth + 1, seen)
+    return out
+
+
+def _shebang(path: str) -> tuple[str, str]:
+    """(intérprete, argumento) del shebang de un script, como lo lee el kernel: el resto de la línea es uno."""
+    try:
+        with open(path, "rb") as f:
+            first = f.read(256).split(b"\n", 1)[0].decode("utf-8", "replace")
+    except OSError:
+        return "", ""
+    parts = first[2:].strip().split(None, 1) if first.startswith("#!") else []
+    return (parts[0], parts[1].strip() if len(parts) > 1 else "") if parts else ("", "")
+
+
+def _script_arg(exe: str, argv: list, known) -> str:
+    """El script conocido que corre un intérprete: el de su shebang (`sh /ruta`, o `sh -e /ruta` con
+    `#!/bin/sh -e` y solo ese argumento; con `#!/usr/bin/env python3`, env y luego python3) o un intérprete
+    habitual con el script de primer argumento (`python3 /opt/x.py`). Nunca `sh -c …`, ni un programa
+    cualquiera con un script conocido detrás."""
+    real = os.path.realpath(exe)
+    for i in (1, 2):
+        script = argv[i] if len(argv) > i else ""
+        if not script.startswith("/") or not known(script):
+            continue
+        interp, arg = _shebang(script)
+        if i == 2 and (not interp or argv[1] != arg):
+            continue
+        runs = {os.path.realpath(interp)} if interp else set()
+        if interp and os.path.basename(interp) == "env":  # y luego lo que env lanza
+            prog = next((w for w in arg.split() if not w.startswith("-") and "=" not in w), "")
+            found = prog if prog.startswith("/") else shutil.which(prog, path=_SEARCH_PATH) if prog else None
+            if found:
+                runs.add(os.path.realpath(found))
+        if real in runs or (i == 1 and (_INTERPRETER_RE.match(os.path.basename(exe))
+                                        or _INTERPRETER_RE.match(os.path.basename(real)))):
+            return script
+    return ""
+
+
+def _injected_env(pid: int) -> list[str]:
+    """Lo que en el entorno de un comando declarado le haría ejecutar otra cosa (BASH_ENV, LD_PRELOAD, un PATH
+    con directorios que no son del sistema): eso no lo pone sshd."""
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as f:
+            data = f.read(1 << 16)
+    except OSError:
+        return []
+    found = set()
+    for var in data.split(b"\0"):
+        name, eq, value = var.decode("utf-8", "replace").partition("=")
+        if not eq:
+            continue
+        if name in _INJECT_ENV or name.startswith("BASH_FUNC_"):
+            found.add(name)
+        elif name == "PATH" and any(d not in _SYSTEM_PATH for d in value.split(":")):
+            found.add(name)
+    return sorted(found)
+
+
 def sshd_allowed(refresh: bool = False, hot: bool = False) -> set[str]:
     """Lo que sshd y PAM declaran que se ejecuta antes de autenticar. Se relee cada minuto. Si algo de esto no
     se pudo leer con certeza, `_allow["sure"]` queda en falso y la regla de sshd solo avisa (A#6)."""
@@ -220,16 +327,23 @@ def sshd_allowed(refresh: bool = False, hot: bool = False) -> set[str]:
         out, sure = r.stdout, r.returncode == 0 and bool(r.stdout.strip())
     except (OSError, subprocess.TimeoutExpired):
         out, sure = "", False
+    keys_cmds = set()
     for line in out.splitlines():
         key, _, value = line.partition(" ")
         if key in _COMMAND_KEYS and value.strip() not in ("", "none"):
-            paths.add(value.split()[0])
+            keys_cmds.add(value.split()[0])
         elif key in _USER_KEYS and value.strip() not in ("", "none", "root", "0"):
             paths.add(f"user:{value.split()[0]}")
     read: set = {"/etc/pam.d"}
     declared, parsed = config_commands(seen=read)
-    paths |= declared
+    paths |= {d for d in declared if d.startswith("user:")}
+    keys_cmds |= {d for d in declared if not d.startswith("user:")}
     sure = sure and parsed
+    paths |= keys_cmds
+    scripts: set = set()
+    for cmd in keys_cmds:  # lo que esos comandos ejecutan, solo con su usuario (akc:), nunca con root
+        paths |= {f"akc:{x}" for x in script_commands(cmd, seen=scripts)}
+    read |= scripts
     for text in _pam_stack("sshd"):
         for line in text.splitlines():
             tokens = line.split("#", 1)[0].split()
@@ -237,8 +351,10 @@ def sshd_allowed(refresh: bool = False, hot: bool = False) -> set[str]:
                 cmd = next((t for t in tokens[tokens.index("pam_exec.so") + 1:] if t.startswith("/")), None)
                 if cmd:
                     paths.add(cmd)
-    from arx.modules import profile  # lo que una persona aceptó
-    paths |= set(profile.load().get("sshd_allowed") or [])
+    from arx.modules import profile  # lo que una persona aceptó, y lo aprendido con el usuario de claves
+    st = profile.load()
+    paths |= set(st.get("sshd_allowed") or [])
+    paths |= {f"akc:{x}" for x in st.get("sshd_akc_seen") or []}
     paths |= {os.path.realpath(p) for p in paths}
     files = read | {f"/etc/pam.d/{n}" for n in _PAM_SEEN}
     _allow.update(at=time.monotonic(), paths=paths, sure=sure, stamps=_stamps(files))
@@ -290,20 +406,40 @@ def sshd_preauth(ev: dict, allowed: set[str] | None = None, sessions: bool | Non
         return False
     allowed = sshd_allowed(hot=True) if allowed is None else allowed  # solo aquí: el resto de eventos no la necesitan
     key = (ev["pid"], ev.get("start"))
-    if key in _declared:  # un comando declarado que se reemplaza (`exec` del binario real, o su última orden)
-        return False
+    argv = ev.get("argv") or []
     # El comando de claves corre con su AuthorizedKeysCommandUser (nunca root): esa señal no la cambia la
     # carrera de una cadena de exec rápida (envoltorio → programa real → cat), que al leer /proc ya va por el
-    # final. Lo que ejecute una puerta trasera dentro de sshd corre como root.
+    # final. Con ese usuario, en silencio solo lo que su comando puede ejecutar (o lo aprendido), en cada exec
+    # de la cadena: un root que cambie a ese usuario para lanzar otra cosa no pasa. Fuera de eso, aviso sin
+    # congelar: ningún login se bloquea.
     user = ev.get("user") or ""
     if user and user != "root" and f"user:{user}" in allowed:
+        def akc(p):
+            return f"akc:{p}" in allowed or f"akc:{os.path.realpath(p)}" in allowed
+        exe = ev["exe"]
+        if not (akc(exe) or _script_arg(exe, argv, akc)):
+            interp = _INTERPRETER_RE.match(os.path.basename(exe)) or \
+                _INTERPRETER_RE.match(os.path.basename(os.path.realpath(exe)))
+            script = argv[1] if len(argv) > 1 and argv[1].startswith("/") else ""
+            # lo que se aprende: el script de un intérprete (nunca el intérprete suelto), o el programa
+            ev["akc_unknown"], ev["akc_learn"] = True, (script or None) if interp else os.path.realpath(exe)
+            return True
+        bad = _injected_env(ev["pid"])
+        if bad:
+            ev["env_injected"] = bad
+        return bool(bad)
+    if key in _declared:  # un comando declarado que se reemplaza (`exec` del binario real, o su última orden)
         return False
-    argv = ev.get("argv") or []
-    script = argv[1] if len(argv) > 1 else ""
+
+    def declared(p):
+        return p in allowed or os.path.realpath(p) in allowed
     # un comando declarado, o uno que es un script: el kernel ejecuta el intérprete con el script como primer
-    # argumento (`sh /usr/local/bin/akc`). Cuenta solo así, nunca `sh -c …`
-    if ev["exe"] in allowed or os.path.realpath(ev["exe"]) in allowed or \
-            (script.startswith("/") and (script in allowed or os.path.realpath(script) in allowed)):
+    # argumento (`sh /usr/local/bin/akc`, o `sh -e /usr/local/bin/akc` con `#!/bin/sh -e`). Nunca `sh -c …`
+    if declared(ev["exe"]) or _script_arg(ev["exe"], argv, declared):
+        bad = _injected_env(ev["pid"])
+        if bad:  # su entorno le haría ejecutar otra cosa: aviso crítico, sin congelar (un login legítimo, nunca)
+            ev["env_injected"] = bad
+            return True
         _declared[key] = True
         while len(_declared) > 4096:
             _declared.pop(next(iter(_declared)))
@@ -404,7 +540,7 @@ def handle_pid(pid: int, root: str, enforce, ts: int | None = None) -> dict | No
         return None
     ev["preauth"] = sshd_preauth(ev)
     ev["sure"] = sshd_sure() if ev["preauth"] else True
-    if ev["preauth"] and ev["sure"] and enforce():  # milisegundos: antes de que la orden de la puerta trasera haga nada
+    if ev["preauth"] and ev["sure"] and not (ev.get("akc_unknown") or ev.get("env_injected")) and enforce():
         ev["ts"] = ts
         ev["stopped"] = _freeze(ev)
     _events.append(ev)
