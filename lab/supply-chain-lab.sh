@@ -54,8 +54,9 @@ quiet() {  # nada llega en 10 s, y un control no confinado sí llega: el contado
 }
 serves() { a sh -c "nc -w 3 $V 8095 < /dev/null 2>/dev/null" | grep -q acme; }
 incident() { local out; out=$(v cat /var/lib/arx/incidents.jsonl 2>/dev/null); grep -q "$1" <<<"$out"; }
-# la explicación, en 30 s; si no llega, lo que haya para entender por qué (y si llega tarde, cuánto)
-explains() { wait_for 30 incident "$1" && return 0
+# la explicación: el corte preventivo llega primero y el veredicto en el barrido siguiente (30 s), así que hasta
+# tres barridos; si no llega, lo que haya para entender por qué (y si llega tarde, cuánto)
+explains() { wait_for 90 incident "$1" && return 0
   v sh -c 'tail -n 4 /var/lib/arx/incidents.jsonl | cut -c1-400; journalctl -u arx --no-pager -n 400 | grep -iE "error|traceback|exception" | tail -n 8' >&2
   local t; for t in $(seq 120); do incident "$1" && { echo "  (llegó tarde: +${t}s)" >&2; return 1; }; sleep 1; done
   echo "  (no llegó en 150 s)" >&2; return 1; }
