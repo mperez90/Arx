@@ -61,6 +61,7 @@ _OBSERVE_ONLY = re.compile(r"^(?:apt-daily(?:-upgrade)?|apt-news|esm-cache|unatt
                            r"arx-firewall|ubuntu-advantage|ua-[\w-]+|landscape-[\w-]+|cloud-init[\w-]*|"
                            r"cloud-config|cloud-final|apport[\w-]*|update-notifier[\w-]*|chrony|chronyd|ntp|"
                            r"ntpsec|openntpd|docker|containerd)\.service$")
+_ONE_INSTANCE_RE = re.compile(r"@[^/]+\.service$")  # sshd@<conexión>.service → sshd@.service
 _SERVICE_PATH_RE = re.compile(r"^(?:[A-Za-z0-9@_.:\\-]+/)*system\.slice/[A-Za-z0-9@_.:\\-]{1,200}\.service$")
 # Lanzan lo que se les pida por diseño (tareas programadas) o tienen su propia regla (sshd)
 _EXEC_FREE = re.compile(r"^(?:cron|crond|anacron|atd|ssh|sshd|getty@[\w-]*|serial-getty@[\w-]*)\.service$")
@@ -809,8 +810,9 @@ def _exec_finding(ev: dict, why: str) -> dict:
                        **({"scope": ev["scope"], "scope_frozen": bool(ev.get("scope_frozen"))} if ev.get("scope") else {}),
                        **({"alert_only": True} if why == "sshd" and ev.get("sure") is False else {})},
             "set": "unexpected_exec", "item": f"{ev['unit']}|{exe}",
-            # uno por servicio y programa: los procesos siguientes se contienen bajo el mismo aviso
-            "fp_key": f"unexpected_exec|{ev['unit']}|{exe}"}
+            # uno por servicio y programa (las instancias por conexión, sshd@…, cuentan como una): los procesos
+            # siguientes se contienen bajo el mismo aviso
+            "fp_key": f"unexpected_exec|{_ONE_INSTANCE_RE.sub('@.service', ev['unit'])}|{exe}"}
 
 
 def _exec_events(subjects: dict, now: datetime, cfg: dict) -> list[dict]:

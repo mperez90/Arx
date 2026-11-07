@@ -3809,6 +3809,11 @@ class ExecWatchTests(unittest.TestCase):
                    self._ev(parent_title="sshd: ana@pts/0"), self._ev(unit="system.slice/nginx.service"),
                    self._ev(parent_exe="/usr/lib/systemd/systemd-executor")):
             self.assertFalse(self.x.sshd_preauth(ev, allowed, sessions=True), ev)
+        # sshd por socket, una instancia por conexión (Debian 13): también es sshd
+        per_conn = self._ev(unit="system.slice/system-sshd.slice/sshd@48-3:22-2:3452379996.service",
+                            parent_exe="/usr/lib/openssh/sshd-session", parent_title="/usr/lib/openssh/sshd-session -i -R")
+        self.assertTrue(self.x.sshd_preauth(per_conn, allowed, sessions=True))
+        self.assertTrue(self.x._SERVICE_RE.match(per_conn["unit"] + "/x"))
         # un comando declarado que es un script: el kernel ejecuta el intérprete con el script detrás
         self.assertFalse(self.x.sshd_preauth(self._ev(argv=["/bin/sh", "/usr/local/bin/akc", "ana"]), allowed, sessions=True))
         self.assertTrue(self.x.sshd_preauth(self._ev(argv=["sh", "-c", "evil", "/usr/local/bin/akc"]), allowed, sessions=True))
@@ -3935,6 +3940,12 @@ class ExecWatchTests(unittest.TestCase):
         child = self._ev(unit="system.slice/app.service", parent_exe="/usr/sbin/app", exe="/usr/bin/new")
         self.assertEqual(self._events(old, child), [])  # estrena su propia ventana: aprende
         self.assertEqual(old["system.slice/app.service"]["execs"], ["/usr/bin/new"])
+
+    def test_per_connection_sshd_instances_share_one_alert(self):
+        a = self._events({}, self._ev(preauth=True, unit="system.slice/system-sshd.slice/sshd@1-2:22-3:4.service"))[0]
+        b = self._events({}, self._ev(preauth=True, pid=4343, unit="system.slice/system-sshd.slice/sshd@9-8:22-7:6.service"))[0]
+        self.assertEqual(a["fp_key"], b["fp_key"])
+        self.assertIn("sshd@.service", a["fp_key"])
 
     def test_the_sshd_finding_is_critical_and_keeps_the_freeze(self):
         found = self._events({}, self._ev(preauth=True, stopped=True))
