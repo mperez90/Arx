@@ -3786,12 +3786,14 @@ class ExecWatchTests(unittest.TestCase):
         from arx import i18n
         from arx.modules import execwatch, profile, response
         self.x, self.p, self.r = execwatch, profile, response
+        execwatch._declared.clear()
         i18n.set_lang("en")
         self.addCleanup(i18n.set_lang, "es")
 
     def _ev(self, **over):
         return {"pid": 4242, "start": 777, "exe": "/usr/bin/dash", "unit": "system.slice/ssh.service", "ppid": 900,
-                "parent_exe": "/usr/sbin/sshd", "parent_title": "sshd: [accepted]", "parent_user": "root", **over}
+                "parent_exe": "/usr/sbin/sshd", "parent_title": "sshd: [accepted]", "parent_user": "root", "user": "root",
+                **over}
 
     def test_exec_events_are_read_from_the_kernel_connector(self):
         import struct
@@ -3809,6 +3811,7 @@ class ExecWatchTests(unittest.TestCase):
                    self._ev(parent_title="sshd: ana@pts/0"), self._ev(unit="system.slice/nginx.service"),
                    self._ev(parent_exe="/usr/lib/systemd/systemd-executor")):
             self.assertFalse(self.x.sshd_preauth(ev, allowed, sessions=True), ev)
+        self.x._declared.clear()  # los casos de arriba comparten pid: el de akc lo dejó como declarado
         # sshd por socket, una instancia por conexión (Debian 13): también es sshd
         per_conn = self._ev(unit="system.slice/system-sshd.slice/sshd@48-3:22-2:3452379996.service",
                             parent_exe="/usr/lib/openssh/sshd-session", parent_title="/usr/lib/openssh/sshd-session -i -R")
@@ -3816,6 +3819,7 @@ class ExecWatchTests(unittest.TestCase):
         self.assertTrue(self.x._SERVICE_RE.match(per_conn["unit"] + "/x"))
         # un comando declarado que es un script: el kernel ejecuta el intérprete con el script detrás
         self.assertFalse(self.x.sshd_preauth(self._ev(argv=["/bin/sh", "/usr/local/bin/akc", "ana"]), allowed, sessions=True))
+        self.x._declared.clear()
         self.assertTrue(self.x.sshd_preauth(self._ev(argv=["sh", "-c", "evil", "/usr/local/bin/akc"]), allowed, sessions=True))
         # sin logind, solo con un título de antes de autenticar: lo de después (pam_motd en [priv]) no
         self.assertFalse(self.x.sshd_preauth(self._ev(parent_title="sshd: ana [priv]"), allowed, sessions=False))
@@ -3853,6 +3857,42 @@ class ExecWatchTests(unittest.TestCase):
             open(inc, "w").write("Match Group staff\n  AuthorizedKeysCommand /usr/local/bin/akc %u\n")
             os.utime(inc, ns=(time.time_ns() + 10**9, time.time_ns() + 10**9))
             self.assertIn("/usr/local/bin/akc", self.x.sshd_allowed())
+
+    def test_a_new_file_in_an_included_directory_counts_at_once(self):
+        """Lockout: un fichero NUEVO en sshd_config.d no cambiaba el mtime de nada ya leído."""
+        self._sshd_config("Include sshd_config.d/*.conf\n")
+
+        class R:
+            returncode, stdout = 0, "port 22\n"
+        d = os.path.join(os.path.dirname(self.x.SSHD_CONFIG), "sshd_config.d")
+        with mock.patch.object(self.x.subprocess, "run", lambda *a, **k: R()), \
+                mock.patch.object(self.p, "load", lambda: {}):
+            self.x.sshd_allowed(refresh=True)
+            open(os.path.join(d, "60-new.conf"), "w").write("Match Group g\n  AuthorizedKeysCommand /usr/local/bin/new %u\n")
+            os.utime(d, ns=(time.time_ns() + 10**9, time.time_ns() + 10**9))
+            self.assertIn("/usr/local/bin/new", self.x.sshd_allowed(hot=True))
+
+    def test_the_keys_command_user_covers_a_fast_exec_chain(self):
+        """Lockout en Debian 13: al leer /proc, el envoltorio ya era `cat`. Corre con su usuario (nobody)."""
+        allowed = {"/usr/local/bin/akc-wrapper", "user:nobody"}
+        self.assertFalse(self.x.sshd_preauth(self._ev(exe="/usr/bin/cat", argv=["cat", "/etc/keys"], user="nobody"),
+                                             allowed, sessions=True))
+        self.assertTrue(self.x.sshd_preauth(self._ev(exe="/usr/bin/cat", argv=["cat", "/etc/keys"], user="root"),
+                                            allowed, sessions=True))  # la puerta trasera corre como root
+        self._sshd_config("Match Group g\n  AuthorizedKeysCommand /x %u\n  AuthorizedKeysCommandUser nobody\n"
+                          "  AuthorizedPrincipalsCommandUser root\n")
+        self.assertEqual(self.x.config_commands()[0], {"/x", "user:nobody"})  # root nunca
+
+    def test_a_declared_command_that_execs_the_real_one_is_still_declared(self):
+        """Lockout: un envoltorio `exec /usr/bin/sss_ssh_authorizedkeys "$@"` reemplaza su proceso."""
+        allowed = {"/usr/local/bin/akc-wrapper"}
+        self.x._declared.clear()
+        first = self._ev(argv=["/bin/sh", "/usr/local/bin/akc-wrapper", "ana"])
+        self.assertFalse(self.x.sshd_preauth(first, allowed, sessions=True))
+        chained = self._ev(exe="/usr/bin/sss_ssh_authorizedkeys", argv=["/usr/bin/sss_ssh_authorizedkeys", "ana"])
+        self.assertFalse(self.x.sshd_preauth(chained, allowed, sessions=True))  # mismo pid y mismo inicio
+        other = self._ev(pid=5555, exe="/usr/bin/sss_ssh_authorizedkeys")
+        self.assertTrue(self.x.sshd_preauth(other, allowed, sessions=True))  # otro proceso: no
 
     def test_when_sshd_cannot_be_read_for_sure_it_only_alerts(self):
         self._sshd_config("PasswordAuthentication no\n")
