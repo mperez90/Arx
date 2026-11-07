@@ -148,6 +148,17 @@ check "alerta crítica: curl como nobody, hijo directo de sshd y no de su comand
 check "sin congelar: un login entra" fresh_login
 v sh -c 'rm -f /etc/ssh/sshd_config.d/50-arxlab-akcuser.conf /usr/local/lib/xz-lab-as-nobody /usr/local/lib/xz-lab-exec-curl /usr/local/bin/arx-lab-akc-nadie'
 
+step "aceptar la alarma de sshd la deja de congelar, también con sshd por conexión (A#11)"
+v sh -c 'for c in /sys/fs/cgroup/arxconfine.slice/arxconfine-*.scope; do echo 1 > $c/cgroup.kill; done 2>/dev/null; pkill -KILL -f "xz-lab-payloa[d]"; rm -f /tmp/xz-lab-ran; true'
+( fresh_login >/dev/null 2>&1 & )
+check "precondición: la orden de la puerta trasera, congelada" wait_for 60 cg_frozen
+FP=$(v sh -c "grep 'before authenticating anyone, ran /usr/bin/dash' /var/lib/arx/incidents.jsonl | grep -v 'outside what its keys command' | tail -n 1" | python3 -c 'import json, sys; print(json.loads(sys.stdin.read() or "{}").get("fp", ""))')
+check "arx accept $FP (lo decide una persona)" v arx accept "$FP"
+v sh -c 'for c in /sys/fs/cgroup/arxconfine.slice/arxconfine-*.scope; do echo 1 > $c/cgroup.kill; done 2>/dev/null; pkill -KILL -f "xz-lab-payloa[d]"; rm -f /tmp/xz-lab-ran; true'
+OK=0; for i in 1 2 3 4 5; do fresh_login && OK=$((OK + 1)); done
+check "los 5 logins siguientes entran (hechos: $OK)" test "$OK" = 5
+check "y la orden aceptada corre: nada congelado" v test -e /tmp/xz-lab-ran
+
 step "retirada la librería, los logins vuelven"
 alarms() { v sh -c "grep -c 'before authenticating anyone' /var/lib/arx/incidents.jsonl" | tr -d ' '; }
 sleep 35   # que lo pendiente del escenario anterior ya esté contado
