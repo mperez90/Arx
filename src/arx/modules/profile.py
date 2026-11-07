@@ -882,15 +882,17 @@ def _cleanup_dead() -> None:
 def accept_exec(item: str) -> bool:
     """«Que lance esto es normal»: entra en lo aprendido del servicio (en sshd, en lo que puede lanzar
     antes de autenticar). Lo decide una persona."""
+    from arx.modules import execwatch
     path, sep, exe = str(item).partition("|")
-    if not (sep and _SERVICE_PATH_RE.match(path) and exe.startswith("/") and "|" not in exe):
+    ssh = bool(execwatch.SSH_UNIT_RE.match(path))  # también sshd@<conexión>, bajo system-sshd.slice (Debian 13)
+    if not (sep and (_SERVICE_PATH_RE.match(path) or ssh) and exe.startswith("/") and "|" not in exe):
         return False
     with config.locked("profiles"):
         st = load()
         s = (st.get("subjects") or {}).get(path)
         if s is not None and exe not in s.setdefault("execs", []):
             s["execs"].append(exe)
-        if re.search(r"/sshd?\.service$", path):
+        if ssh:
             st["sshd_allowed"] = sorted(set(st.get("sshd_allowed") or []) | {exe})
         _save(st)
     return True

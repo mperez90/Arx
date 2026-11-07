@@ -4234,6 +4234,11 @@ class ExecWatchTests(unittest.TestCase):
         self.assertIn("/usr/bin/new", st["subjects"]["system.slice/app.service"]["execs"])
         self.assertEqual(st["sshd_allowed"], ["/usr/local/bin/akc"])
         self.assertFalse(self.p.accept_exec("../etc|/x"))
+        # Debian 13: sshd por conexión, bajo system-sshd.slice (antes no se guardaba: el login seguía congelado)
+        self.assertTrue(self.p.accept_exec("system.slice/system-sshd.slice/sshd@3-10.0.0.1:22-10.0.0.2:5555.service"
+                                           "|/usr/local/bin/akc2"))
+        self.assertIn("/usr/local/bin/akc2", self.p.load()["sshd_allowed"])
+        self.assertFalse(self.p.accept_exec("system.slice/system-sshd.slice/../x.service|/x"))
 
 
 class RedactionTests(unittest.TestCase):
