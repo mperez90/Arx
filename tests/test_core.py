@@ -8,6 +8,7 @@ os.environ["ARX_LANG"] = "es"  # los textos de estas pruebas fijan el catálogo:
 
 import io
 import json
+import shutil
 import sys
 import tempfile
 import time
@@ -3871,16 +3872,88 @@ class ExecWatchTests(unittest.TestCase):
             os.utime(d, ns=(time.time_ns() + 10**9, time.time_ns() + 10**9))
             self.assertIn("/usr/local/bin/new", self.x.sshd_allowed(hot=True))
 
-    def test_the_keys_command_user_covers_a_fast_exec_chain(self):
-        """Lockout en Debian 13: al leer /proc, el envoltorio ya era `cat`. Corre con su usuario (nobody)."""
-        allowed = {"/usr/local/bin/akc-wrapper", "user:nobody"}
-        self.assertFalse(self.x.sshd_preauth(self._ev(exe="/usr/bin/cat", argv=["cat", "/etc/keys"], user="nobody"),
-                                             allowed, sessions=True))
-        self.assertTrue(self.x.sshd_preauth(self._ev(exe="/usr/bin/cat", argv=["cat", "/etc/keys"], user="root"),
-                                            allowed, sessions=True))  # la puerta trasera corre como root
+    def test_the_keys_command_user_covers_only_what_its_command_runs(self):
+        """A#10: la carrera de una cadena de exec rápida la cubre el usuario de claves, pero solo con lo que su
+        comando ejecuta: un root que cambie a ese usuario para lanzar una shell avisa (sin congelar)."""
+        allowed = {"/usr/local/bin/akc-wrapper", "user:nobody", "akc:/usr/local/bin/akc-wrapper", "akc:/usr/bin/cat"}
+        quiet = self._ev(exe="/usr/bin/cat", argv=["cat", "/etc/keys"], user="nobody")
+        self.assertFalse(self.x.sshd_preauth(quiet, allowed, sessions=True))
+        shell = self._ev(exe="/usr/bin/dash", argv=["sh", "-c", "id"], user="nobody", pid=5001)
+        self.assertTrue(self.x.sshd_preauth(shell, allowed, sessions=True))
+        self.assertTrue(shell.get("akc_unknown"))  # aviso, sin congelar
+        root = self._ev(exe="/usr/bin/cat", argv=["cat", "/etc/keys"], user="root", pid=5002)
+        self.assertTrue(self.x.sshd_preauth(root, allowed, sessions=True))
+        self.assertFalse(root.get("akc_unknown"))  # root: la regla de siempre, congela
         self._sshd_config("Match Group g\n  AuthorizedKeysCommand /x %u\n  AuthorizedKeysCommandUser nobody\n"
                           "  AuthorizedPrincipalsCommandUser root\n")
         self.assertEqual(self.x.config_commands()[0], {"/x", "user:nobody"})  # root nunca
+
+    def test_what_a_keys_command_script_runs_is_read_from_it(self):
+        d = tempfile.mkdtemp()
+        real, wrapper = os.path.join(d, "real"), os.path.join(d, "wrapper")
+        open(real, "w").write("#!/bin/sh\nexec cat /etc/keys\n")
+        open(wrapper, "w").write('#!/bin/sh\nLOG=x echo "$1" >> /tmp/log\nexec ' + real + ' "$@"\n')
+        os.chmod(real, 0o755)
+        os.chmod(wrapper, 0o755)
+        found = self.x.script_commands(wrapper)
+        self.assertIn(real, found)
+        self.assertNotIn(os.path.realpath("/bin/sh"), found)  # su intérprete solo cuenta con el script
+        self.assertTrue(any(os.path.basename(p) == "cat" for p in found))
+        self.assertFalse(any(p.endswith("/etc/keys") for p in found))  # un argumento que no se ejecuta, no
+        allowed = {"user:nobody"} | {f"akc:{p}" for p in found}
+        quiet = self._ev(argv=["/bin/sh", wrapper, "ana"], user="nobody")
+        self.assertFalse(self.x.sshd_preauth(quiet, allowed, sessions=True))
+        for argv in (["sh"], ["sh", "-c", "id"], ["sh", "-c", "id", wrapper], ["sh", "-i"]):  # A#10: la shell suelta
+            ev = self._ev(argv=argv, user="nobody", pid=6000)
+            self.assertTrue(self.x.sshd_preauth(ev, allowed, sessions=True), argv)
+            self.assertTrue(ev.get("akc_unknown"))
+            self.assertIsNone(ev.get("akc_learn"))  # una shell sin script no se aprende
+        other = self._ev(exe="/tmp/x", argv=["/tmp/x", wrapper], user="nobody", pid=6001)
+        self.assertTrue(self.x.sshd_preauth(other, allowed, sessions=True))  # un programa cualquiera con el script detrás
+        self.assertEqual(other["akc_learn"], os.path.realpath("/tmp/x"))
+
+    def test_a_shebang_with_an_argument_or_env_is_still_the_declared_script(self):
+        """Lockout: con `#!/bin/sh -e` el kernel ejecuta `sh -e /ruta`; con `#!/usr/bin/env python3`, env y luego
+        python3. Un programa cualquiera con el script detrás, o `sh -c`, no."""
+        d = tempfile.mkdtemp()
+        hook, py = os.path.join(d, "hook"), os.path.join(d, "hook.py")
+        open(hook, "w").write("#!/bin/sh -e\nexit 0\n")
+        open(py, "w").write("#!/usr/bin/env python3\nprint()\n")
+        allowed = {hook, py}
+        self.x._declared.clear()
+        sh = os.path.realpath("/bin/sh")  # lo que el kernel ejecuta (dash en Debian)
+        ok = [self._ev(exe=sh, argv=["/bin/sh", "-e", hook, "x"]), self._ev(argv=["/bin/sh", hook], pid=7001),
+              self._ev(exe="/usr/bin/env", argv=["/usr/bin/env", "python3", py], pid=7002)]
+        python3 = shutil.which("python3")
+        if python3:
+            ok.append(self._ev(exe=os.path.realpath(python3), argv=["python3", py], pid=7003))
+        for ev in ok:
+            self.assertFalse(self.x.sshd_preauth(ev, allowed, sessions=True), ev["argv"])
+        bad = [self._ev(exe=sh, argv=["/bin/sh", "-x", hook], pid=7010),
+               self._ev(exe=sh, argv=["/bin/sh", "-c", hook], pid=7011),
+               self._ev(exe="/tmp/evil", argv=["/tmp/evil", hook], pid=7012),
+               self._ev(exe="/usr/bin/env", argv=["/usr/bin/env", "BASH_ENV=/tmp/p", hook], pid=7013)]
+        for ev in bad:
+            self.assertTrue(self.x.sshd_preauth(ev, allowed, sessions=True), ev["argv"])
+
+    def test_a_declared_command_with_code_loading_variables_alerts_without_freezing(self):
+        """BASH_ENV, LD_PRELOAD o un PATH ajeno harían ejecutar otra cosa al comando declarado: aviso crítico,
+        sin congelar (ningún login legítimo se bloquea)."""
+        self.x._declared.clear()
+        allowed = {"/usr/local/bin/akc", "user:nobody", "akc:/usr/local/bin/akc"}
+        with mock.patch.object(self.x, "_injected_env", lambda pid: ["BASH_ENV"]):
+            for ev in (self._ev(argv=["/bin/sh", "/usr/local/bin/akc"]),
+                       self._ev(argv=["/bin/sh", "/usr/local/bin/akc"], user="nobody", pid=8001)):
+                self.assertTrue(self.x.sshd_preauth(ev, allowed, sessions=True))
+                self.assertEqual(ev["env_injected"], ["BASH_ENV"])
+                self.assertFalse(ev.get("akc_unknown"))
+        self.assertEqual(self.x._declared, {})  # no abre la cadena de exec
+        env = b"PATH=/usr/bin:/bin\0USER=nobody\0LANG=C.UTF-8\0"
+        with mock.patch("builtins.open", mock.mock_open(read_data=env)):
+            self.assertEqual(self.x._injected_env(1), [])
+        env = b"PATH=/tmp/x:/usr/bin\0BASH_FUNC_cat%%=() { id; }\0LD_PRELOAD=/tmp/l.so\0"
+        with mock.patch("builtins.open", mock.mock_open(read_data=env)):
+            self.assertEqual(self.x._injected_env(1), ["BASH_FUNC_cat%%", "LD_PRELOAD", "PATH"])
 
     def test_a_declared_command_that_execs_the_real_one_is_still_declared(self):
         """Lockout: un envoltorio `exec /usr/bin/sss_ssh_authorizedkeys "$@"` reemplaza su proceso."""

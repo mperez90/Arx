@@ -680,7 +680,7 @@ def sweep(enforce: bool = False, cfg: dict | None = None, now: datetime | None =
                 subjects[path] = _new_subject(path, now, cfg)
         # versiones solo si dpkg cambió; lo ya actualizado se re-evalúa una hora (el modelo llega después)
         findings += _updates(subjects, cfg, now, check_versions=_dpkg_changed(st), enforce=enforce)
-        findings += _exec_events(subjects, now, cfg)
+        findings += _exec_events(subjects, now, cfg, st)
         active = vaccines._active()
         for fam in ("4", "6"):
             for cg, proto, ip, port in _elements(f"seen{fam}"):
@@ -777,15 +777,20 @@ def _unit_execs(unit: str) -> set[str]:
 
 def _exec_phase(s: dict, now: datetime, cfg: dict) -> str:
     """learn mientras se observa (o, en un servicio ya vigilado, durante su propia ventana), luego watch."""
-    if s.get("exec_open"):
+    return _phase(s, "exec", now, cfg)
+
+
+def _phase(s: dict, key: str, now: datetime, cfg: dict) -> str:
+    """learn / watch para un aspecto que llegó después de que el servicio ya estuviera vigilado."""
+    if s.get(f"{key}_open"):
         return "open"
     if s["status"] == "observing":
         return "learn"
-    if not s.get("exec_until"):  # vigilado antes de existir esto: su propia ventana, con su azar
+    if not s.get(f"{key}_until"):  # vigilado antes de existir esto: su propia ventana, con su azar
         days = float(cfg.get("profile_observe_days", OBSERVE_DAYS))
         jitter = float(cfg.get("profile_jitter_days", JITTER_DAYS))
-        s["exec_until"] = _iso(now + timedelta(days=days) + timedelta(seconds=_share(s["unit"], "exec") * jitter * 86400))
-    return "learn" if now < _parse(s["exec_until"]) else "watch"
+        s[f"{key}_until"] = _iso(now + timedelta(days=days) + timedelta(seconds=_share(s["unit"], key) * jitter * 86400))
+    return "learn" if now < _parse(s[f"{key}_until"]) else "watch"
 
 
 def _exec_finding(ev: dict, why: str) -> dict:
@@ -797,6 +802,12 @@ def _exec_finding(ev: dict, why: str) -> dict:
         detail = tr("{unit}: sshd, before authenticating anyone, ran {exe}", unit=unit, exe=exe)
         if ev.get("stopped") and ev.get("latency_ms") is not None:
             detail += tr(" (frozen {ms} ms after it started)", ms=ev["latency_ms"])
+        if ev.get("akc_unknown"):  # con el usuario de claves: la evidencia, sin congelar
+            detail += tr(" as {user}, outside what its keys command runs (sha256 {sha}, argv: {argv})",
+                         user=ev.get("user"), sha=_sha256_file(exe)[:16], argv=" ".join(ev.get("argv") or [])[:160])
+        if ev.get("env_injected"):
+            detail += tr(" with {vars} in its environment, which sshd never sets (argv: {argv})",
+                         vars=", ".join(ev["env_injected"]), argv=" ".join(ev.get("argv") or [])[:160])
     elif why == "webshell":
         sev, harm = "high", [tr("a web or database service started a shell or a downloader")]
         detail = tr("{unit} started {exe} as {user}", unit=unit, exe=exe, user=ev.get("parent_user") or "?")
@@ -807,6 +818,12 @@ def _exec_finding(ev: dict, why: str) -> dict:
             "why": tr("a compromised program shows itself by what it starts"),
             "target": {"pid": ev["pid"], "start": ev["start"], "exe": exe, "unit": unit,
                        "stopped": bool(ev.get("stopped")), "family": ev.get("family") or [],
+                       **({"alert_only": True, "alert_reason": tr("it runs as the keys command's user: alert only, "
+                                                                  "nothing frozen, no login is blocked")}
+                          if ev.get("akc_unknown") else {}),
+                       **({"alert_only": True, "alert_reason": tr("a declared command with code-loading variables in "
+                                                                  "its environment: alert only, no login is blocked")}
+                          if ev.get("env_injected") else {}),
                        **({"scope": ev["scope"], "scope_frozen": bool(ev.get("scope_frozen"))} if ev.get("scope") else {}),
                        **({"alert_only": True} if why == "sshd" and ev.get("sure") is False else {})},
             "set": "unexpected_exec", "item": f"{ev['unit']}|{exe}",
@@ -815,11 +832,27 @@ def _exec_finding(ev: dict, why: str) -> dict:
             "fp_key": f"unexpected_exec|{_ONE_INSTANCE_RE.sub('@.service', ev['unit'])}|{exe}"}
 
 
-def _exec_events(subjects: dict, now: datetime, cfg: dict) -> list[dict]:
+def _sha256_file(path: str) -> str:
+    import hashlib
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read(64 * 1024 * 1024)).hexdigest()
+    except OSError:
+        return "?"
+
+
+def _exec_events(subjects: dict, now: datetime, cfg: dict, st: dict | None = None) -> list[dict]:
     """Aprende lo que lanza cada servicio mientras se le observa; después, lo nuevo se aísla y se avisa."""
     from arx.modules import execwatch
     findings = []
+    akc = (st if st is not None else {}).setdefault("sshd_akc", {"unit": "sshd-keys-command", "status": "watching"})
+    akc_phase = _phase(akc, "akc", now, cfg)  # su propia ventana, desde el primer barrido
     for ev in execwatch.drain():
+        if ev.get("akc_unknown") and akc_phase == "learn" and st is not None:  # lo del comando de claves, aprendido
+            seen, item = st.setdefault("sshd_akc_seen", []), ev.get("akc_learn")
+            if item and item not in seen and len(seen) < 64:
+                seen.append(item)
+            continue
         s = subjects.get(ev["unit"])
         why = "sshd" if ev.get("preauth") else "webshell" if execwatch.webshell(ev) else None
         if not why and s and not (_EXEC_FREE.match(s["unit"]) or _OBSERVE_ONLY.match(s["unit"])):

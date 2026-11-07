@@ -103,6 +103,14 @@ ES = {
         "servicio crítico ({unit}): no se confina solo",
     "invalid service: nothing confined":
         "servicio no válido: no se confina nada",
+    " as {user}, outside what its keys command runs (sha256 {sha}, argv: {argv})":
+        " como {user}, fuera de lo que ejecuta su comando de claves (sha256 {sha}, argv: {argv})",
+    "it runs as the keys command's user: alert only, nothing frozen, no login is blocked":
+        "corre con el usuario del comando de claves: solo se avisa, no se congela nada ni se bloquea ningún login",
+    " with {vars} in its environment, which sshd never sets (argv: {argv})":
+        " con {vars} en su entorno, que sshd nunca pone (argv: {argv})",
+    "a declared command with code-loading variables in its environment: alert only, no login is blocked":
+        "un comando declarado con variables que cargan código en su entorno: solo se avisa, no se bloquea ningún login",
     " (frozen {ms} ms after it started)":
         " (congelado {ms} ms después de arrancar)",
     "sshd's configuration could not be read with certainty: alert only, nothing frozen":

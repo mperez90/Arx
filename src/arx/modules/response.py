@@ -293,7 +293,8 @@ def protected_reason(finding: dict, cfg: dict | None = None) -> str | None:
         if base in _PROTECTED_EXES or exe == sys.executable:
             return tr("critical process ({base}): observed only", base=base)
     if kind == "unexpected_exec" and target.get("alert_only") and not target.get("stopped"):
-        return tr("sshd's configuration could not be read with certainty: alert only, nothing frozen")
+        return str(target.get("alert_reason") or "") or \
+            tr("sshd's configuration could not be read with certainty: alert only, nothing frozen")
     if kind == "untrusted_update":
         unit = str(target.get("unit") or "")
         if _PROTECTED_UNITS.match(unit) and not _SSH_UNIT_RE.match(unit):  # ssh: sin salida, con excepciones
