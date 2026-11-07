@@ -101,6 +101,8 @@ _PLAN: dict[str, tuple[int, str, bool, str]] = {
                         tr("a program its service never started: the service keeps running")),
     "self_tamper": (0, tr("log and alert outside the host"), True,
                     tr("someone changed Arx itself: it may be an attempt to blind it")),
+    "dns_new": (0, tr("log and alert"), True,
+                tr("a domain this service never used: its connection is cut by the behavior profile")),
     "update_check": (0, tr("log and alert"), True,
                      tr("an update many services load: checked first, cut only with an untrusted verdict")),
     "untrusted_update": (1, tr("confine the service: no outbound network, it keeps running (until you decide)"),
@@ -1290,6 +1292,7 @@ def accept(fp: str, scope: str | None = None) -> str | None:
     from arx.modules import trust
     accepted = (profile.accept(e["item"]) if e["set"] == "egress_profile"
                 else profile.accept_exec(e["item"], scope) if e["set"] == "unexpected_exec"
+                else profile.accept_domain(e["item"]) if e["set"] == "dns_profile"
                 else trust.accept(e["item"]) if e["set"] == "untrusted_update"
                 else baseline.accept(e["set"], e["item"]))
     if not accepted:

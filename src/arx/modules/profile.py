@@ -51,6 +51,7 @@ LIBS_PER_SWEEP = 4    # servicios cuyas librerías se aprenden por barrido (dpkg
 PREVENTIVE_MAX = 3    # servicios afectados por una actualización hasta los que se corta mientras se prueba
 MAX_EXECS = 64        # programas distintos que lanza un servicio; más, y no hay perfil de hijos que valga
 MAX_EXEC_FINDINGS = 20
+MAX_DOMAINS = 512     # dominios registrables distintos; más, y no hay perfil de DNS que valga
 SYSTEMD_DIR = "/etc/systemd/system"
 DROPIN = "90-arx-profile.conf"
 # Se observan, pero no se les corta nada: dejar sin parches a un servidor porque su actualizador estrena
@@ -688,6 +689,7 @@ def sweep(enforce: bool = False, cfg: dict | None = None, now: datetime | None =
         # versiones solo si dpkg cambió; lo ya actualizado se re-evalúa una hora (el modelo llega después)
         findings += _updates(subjects, cfg, now, check_versions=_dpkg_changed(st), enforce=enforce)
         findings += _exec_events(subjects, now, cfg)
+        findings += _dns_events(subjects, now, cfg)
         active = vaccines._active()
         for fam in ("4", "6"):
             for cg, proto, ip, port in _elements(f"seen{fam}"):
@@ -727,6 +729,7 @@ def sweep(enforce: bool = False, cfg: dict | None = None, now: datetime | None =
                 _doc_review_later(path, s, cfg)
             s["status"], s["watching_since"] = "watching", _iso(now)
             s.setdefault("exec_until", _iso(now))  # lo que lanza se aprendió en la misma observación
+            s.setdefault("dns_until", _iso(now))  # y los dominios que consulta
             response.record({"kind": "profile_watching", "detail": s["unit"], "result": s["mode"]})
         for path, s in subjects.items():
             pending = s.pop("doc_pending", None)
@@ -866,6 +869,66 @@ def _exec_events(subjects: dict, now: datetime, cfg: dict) -> list[dict]:
         if why and (len(findings) < MAX_EXEC_FINDINGS or why == "sshd"):
             findings.append(_exec_finding(ev, why))  # cada pid cuenta: el aviso, uno por servicio y programa
     return findings
+
+
+# ── qué dominios consulta cada servicio (F18.3) ──────────────────────────────
+def _dns_phase(s: dict, now: datetime, cfg: dict) -> str:
+    if s.get("dns_open"):
+        return "open"
+    if s["status"] == "observing":
+        return "learn"
+    if not s.get("dns_until"):  # vigilado antes de existir esto: su propia ventana, con su azar
+        days = float(cfg.get("profile_observe_days", OBSERVE_DAYS))
+        jitter = float(cfg.get("profile_jitter_days", JITTER_DAYS))
+        s["dns_until"] = _iso(now + timedelta(days=days) + timedelta(seconds=_share(s["unit"], "dns") * jitter * 86400))
+    return "learn" if now < _parse(s["dns_until"]) else "watch"
+
+
+def _dns_events(subjects: dict, now: datetime, cfg: dict) -> list[dict]:
+    """Aprende los dominios de cada servicio mientras se le observa; después, uno nuevo se avisa."""
+    from arx.modules import dnswatch
+    paths = sorted(p for p, s in subjects.items() if not _OBSERVE_ONLY.match(s["unit"]) and _cgroup_exists(p))
+    dnswatch.sync(paths, tuple((p, _cgroup_id(p)) for p in paths))
+    findings, said = [], set()
+    for unit, name in dnswatch.drain():
+        path = f"system.slice/{unit}"
+        s = subjects.get(path)
+        if not s or _OBSERVE_ONLY.match(unit):
+            continue
+        dom = dnswatch.registrable(name)
+        learned = s.setdefault("domains", [])
+        phase = _dns_phase(s, now, cfg)
+        if phase == "learn" and dom not in learned:
+            learned.append(dom)
+            if len(learned) > MAX_DOMAINS:
+                s["dns_open"] = True
+        elif phase == "watch" and dom not in learned and (path, dom) not in said and len(findings) < MAX_EXEC_FINDINGS:
+            said.add((path, dom))
+            odd = dnswatch.dga_like(dom)
+            findings.append({
+                "sev": "high" if odd else "med", "kind": "dns_new", "set": "dns_profile", "item": f"{path}|{dom}",
+                "detail": tr("{unit} looked up {name}, a domain it never used while Arx observed it", unit=unit,
+                             name=name) + (tr(" (it looks machine-generated)") if odd else ""),
+                "why": tr("a service that starts using a new domain may be calling home; the connection itself is "
+                          "cut by its behavior profile"),
+                "fp_key": f"dns_new|{path}|{dom}"})
+    return findings
+
+
+def accept_domain(item: str) -> bool:
+    """«Este dominio es normal para este servicio»: lo decide una persona."""
+    path, sep, dom = str(item).partition("|")
+    if not (sep and _SERVICE_PATH_RE.match(path) and re.fullmatch(r"[a-z0-9_.-]{1,253}", dom)):
+        return False
+    with config.locked("profiles"):
+        st = load()
+        s = (st.get("subjects") or {}).get(path)
+        if s is None:
+            return False
+        if dom not in s.setdefault("domains", []):
+            s["domains"].append(dom)
+        _save(st)
+    return True
 
 
 def _cleanup_dead() -> None:

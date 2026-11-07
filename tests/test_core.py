@@ -4260,6 +4260,80 @@ class SelfProtectionTests(unittest.TestCase):
         self.assertEqual(log.count("self_stopped"), 3)  # lo planificado no se anota; el apagado, sí (sin avisar)
 
 
+class DnsWatchTests(unittest.TestCase):
+    """F18.3: qué dominios consulta cada servicio; uno nuevo se avisa, uno con pinta de generado, más."""
+
+    def setUp(self):
+        _isolate()
+        from arx import i18n
+        from arx.modules import dnswatch, profile
+        self.d, self.p = dnswatch, profile
+        i18n.set_lang("en")
+        self.addCleanup(i18n.set_lang, "es")
+
+    def _query(self, name, v6=False):
+        import struct
+        q = b"".join(bytes([len(x)]) + x.encode() for x in name.split(".")) + b"\0" + struct.pack("!HH", 1, 1)
+        dns = struct.pack("!HHHHHH", 0x1234, 0x0100, 1, 0, 0, 0) + q
+        udp = struct.pack("!HHHH", 40000, 53, 8 + len(dns), 0) + dns
+        if v6:
+            return bytes([0x60, 0, 0, 0]) + struct.pack("!HBB", len(udp), 17, 64) + b"\0" * 32 + udp
+        return bytes([0x45, 0]) + struct.pack("!H", 20 + len(udp)) + b"\0" * 5 + bytes([17]) + b"\0" * 10 + udp
+
+    def _nflog(self, prefix, payload):
+        import struct
+
+        def attr(t, v):
+            raw = struct.pack("=HH", 4 + len(v), t) + v
+            return raw + b"\0" * ((-len(raw)) % 4)
+        body = struct.pack("=BBH", 2, 0, 0) + attr(10, prefix.encode() + b"\0") + attr(9, payload)
+        return struct.pack("=IHHII", 16 + len(body), 4 << 8, 0, 0, 0) + body
+
+    def test_the_query_name_is_read_from_ipv4_and_ipv6(self):
+        self.assertEqual(self.d.qname(self._query("api.Example.com")), "api.example.com")
+        self.assertEqual(self.d.qname(self._query("x.example.org", v6=True)), "x.example.org")
+        self.assertIsNone(self.d.qname(b"\x45\x00garbage"))
+
+    def test_each_service_is_named_by_its_nflog_prefix(self):
+        raw = self._nflog("arxdns:app.service", self._query("a.b.c")) + self._nflog("other", self._query("x.y"))
+        self.assertEqual([u for u, _ in self.d.parse(raw)], ["app.service"])
+
+    def test_learning_is_by_registrable_domain_and_dga_is_conservative(self):
+        self.assertEqual(self.d.registrable("d3x9a.cloudfront.net"), "cloudfront.net")
+        self.assertEqual(self.d.registrable("www.example.co.uk"), "example.co.uk")
+        for real in ("googleapis.com", "cloudfront.net", "ubuntu.com", "letsencrypt.org", "microsoftonline.com",
+                     "githubusercontent.com", "amazonaws.com", "akamaiedge.net"):
+            self.assertFalse(self.d.dga_like(real), real)
+        for dga in ("xk3j9qz7vw2mrt8p.com", "qwrtzpsdfghjklmn.net", "a8f3k2m9x7q1z4w6.biz"):
+            self.assertTrue(self.d.dga_like(dga), dga)
+        self.assertTrue(self.d.ignored("1.0.168.192.in-addr.arpa"))
+
+    def test_one_rule_per_service_with_its_prefix(self):
+        text = self.d.rules_text(["system.slice/app.service"])
+        self.assertIn('socket cgroupv2 level 2 "system.slice/app.service" log prefix "arxdns:app.service" group 7', text)
+        self.assertTrue(text.startswith("flush chain inet arx dnslog"))
+
+    def _run(self, subjects, *events, now=None):
+        with mock.patch.object(self.d, "drain", lambda: list(events)), mock.patch.object(self.d, "sync", lambda p, sig: None), \
+                mock.patch.object(self.p, "_cgroup_exists", lambda path: True):
+            return self.p._dns_events(subjects, now or datetime(2026, 11, 6, tzinfo=timezone.utc), {})
+
+    def test_it_learns_while_observing_and_then_a_new_domain_is_reported(self):
+        s = {"system.slice/app.service": {"unit": "app.service", "status": "observing", "dest": {}}}
+        self.assertEqual(self._run(s, ("app.service", "api.example.com"), ("app.service", "x.cdn.example.com")), [])
+        self.assertEqual(s["system.slice/app.service"]["domains"], ["example.com"])
+        s["system.slice/app.service"].update(status="watching", dns_until="2026-11-01T00:00:00+00:00")
+        found = self._run(s, ("app.service", "other.example.com"), ("app.service", "new.example.org"),
+                          ("app.service", "xk3j9qz7vw2mrt8p.com"))
+        self.assertEqual([(f["sev"], f["item"]) for f in found],
+                         [("med", "system.slice/app.service|example.org"), ("high", "system.slice/app.service|xk3j9qz7vw2mrt8p.com")])
+        self.assertIn("looks machine-generated", found[1]["detail"])
+        from arx import config
+        config.write_json(self.p._state_path(), {"subjects": s})
+        self.assertTrue(self.p.accept_domain("system.slice/app.service|example.org"))
+        self.assertIn("example.org", self.p.load()["subjects"]["system.slice/app.service"]["domains"])
+
+
 class TotpTests(unittest.TestCase):
     def setUp(self):
         from arx import totp
@@ -5925,6 +5999,7 @@ class BehaviorWatchTests(unittest.TestCase):
         for obj, name, value in [(profile, "_cgroup_exists", lambda path: True),
                                  (profile, "_cgroup_id", lambda path: None),
                                  (profile, "_doc_review_later", lambda path, s, cfg: None),
+                                 (profile, "_dns_events", lambda subjects, now, cfg: []),
                                  (profile, "_installed_versions", lambda: dict(self.installed)),
                                  (profile, "_library_packages", lambda unit, own: {
                                      p: v for p, v in self.installed.items() if p in self.libs.get(unit, ())}),

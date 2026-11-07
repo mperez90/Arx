@@ -103,6 +103,20 @@ ES = {
         "servicio crítico ({unit}): no se confina solo",
     "invalid service: nothing confined":
         "servicio no válido: no se confina nada",
+    "{unit} looked up {name}, a domain it never used while Arx observed it":
+        "{unit} consultó {name}, un dominio que nunca usó mientras Arx lo observaba",
+    " (it looks machine-generated)":
+        " (parece generado por una máquina)",
+    "a service that starts using a new domain may be calling home; the connection itself is cut by its behavior profile":
+        "un servicio que empieza a usar un dominio nuevo puede estar llamando a casa; la conexión en sí la corta su perfil de comportamiento",
+    "a domain this service never used: its connection is cut by the behavior profile":
+        "un dominio que este servicio nunca usó: su conexión la corta el perfil de comportamiento",
+    "  DNS watch: {mode}":
+        "  vigilancia de DNS: {mode}",
+    "on":
+        "activa",
+    "not available here":
+        "no disponible aquí",
     "it comes from a verified package and is not a shell, interpreter or downloader: alert only":
         "viene de un paquete verificado y no es una shell, un intérprete ni un descargador: solo se avisa",
     "for a program a service started: accept its whole directory for that service":
