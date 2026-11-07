@@ -61,6 +61,13 @@ _OBSERVE_ONLY = re.compile(r"^(?:apt-daily(?:-upgrade)?|apt-news|esm-cache|unatt
                            r"arx-firewall|ubuntu-advantage|ua-[\w-]+|landscape-[\w-]+|cloud-init[\w-]*|"
                            r"cloud-config|cloud-final|apport[\w-]*|update-notifier[\w-]*|chrony|chronyd|ntp|"
                            r"ntpsec|openntpd|docker|containerd)\.service$")
+# Shells, intérpretes, descargadores y herramientas de ataque «del sistema»: venir de un paquete no las
+# hace inocentes como hijo nuevo de un servicio (se aíslan igual)
+_LOLBINS = re.compile(r"^(?:sh|bash|dash|zsh|ksh|ash|busybox|python[0-9.]*|perl[0-9.]*|ruby[0-9.]*|php[0-9.]*|node|nodejs|"
+                      r"lua[0-9.]*|tclsh[0-9.]*|curl|wget|nc|ncat|netcat|nc\.openbsd|nc\.traditional|socat|telnet|ssh|"
+                      r"scp|sftp|rsync|ftp|tftp|openssl|gdb|strace|nsenter|chroot|setsid|nohup|xxd|base64|dd|mkfifo)$")
+_BROAD_DIRS = ("", "/", "/bin", "/sbin", "/usr/bin", "/usr/sbin", "/usr/local/bin", "/usr/local/sbin", "/usr/lib",
+               "/usr/libexec", "/tmp", "/var/tmp", "/dev/shm", "/opt", "/home", "/root")
 _ONE_INSTANCE_RE = re.compile(r"@[^/]+\.service$")  # sshd@<conexión>.service → sshd@.service
 _SERVICE_PATH_RE = re.compile(r"^(?:[A-Za-z0-9@_.:\\-]+/)*system\.slice/[A-Za-z0-9@_.:\\-]{1,200}\.service$")
 # Lanzan lo que se les pida por diseño (tareas programadas) o tienen su propia regla (sshd)
@@ -788,6 +795,25 @@ def _exec_phase(s: dict, now: datetime, cfg: dict) -> str:
     return "learn" if now < _parse(s["exec_until"]) else "watch"
 
 
+def _exec_known(s: dict, ev: dict, known: set) -> bool:
+    """Lo aprendido, lo que declara su unit, un directorio aceptado entero o el hijo de un programa aceptado
+    con sus hijos."""
+    import fnmatch
+    if ev["exe"] in known | _unit_execs(s["unit"]):
+        return True
+    if any(fnmatch.fnmatchcase(ev["exe"], p) for p in s.get("exec_patterns") or []):
+        return True
+    return ev.get("parent_exe") in (s.get("exec_parents") or [])
+
+
+def _verified(exe: str) -> bool:
+    from arx.modules import provenance
+    try:
+        return bool(provenance.verify_file(exe).get("verified"))
+    except Exception:
+        return False
+
+
 def _exec_finding(ev: dict, why: str) -> dict:
     from arx.modules import provenance
     unit = ev["unit"].rsplit("/", 1)[-1]
@@ -803,10 +829,15 @@ def _exec_finding(ev: dict, why: str) -> dict:
     else:
         sev, harm = "high", provenance.harm_signals(exe, [ev["pid"]], {})
         detail = tr("{unit} started {exe}, which it never ran while Arx observed it", unit=unit, exe=exe)
+        if why == "verified":  # de un paquete verificado y no es una herramienta de ataque: avisar, sin aislar
+            sev = "med"
     return {"sev": sev, "kind": "unexpected_exec", "detail": detail, "harm": harm,
             "why": tr("a compromised program shows itself by what it starts"),
             "target": {"pid": ev["pid"], "start": ev["start"], "exe": exe, "unit": unit,
                        "stopped": bool(ev.get("stopped")), "family": ev.get("family") or [],
+                       **({"alert_only": True, "alert_reason": tr("it comes from a verified package and is not a "
+                                                                  "shell, interpreter or downloader: alert only")}
+                          if why == "verified" else {}),
                        **({"scope": ev["scope"], "scope_frozen": bool(ev.get("scope_frozen"))} if ev.get("scope") else {}),
                        **({"alert_only": True} if why == "sshd" and ev.get("sure") is False else {})},
             "set": "unexpected_exec", "item": f"{ev['unit']}|{exe}",
@@ -829,8 +860,9 @@ def _exec_events(subjects: dict, now: datetime, cfg: dict) -> list[dict]:
                 s["execs"].append(ev["exe"])
                 if len(s["execs"]) > MAX_EXECS:
                     s["exec_open"] = True
-            elif phase == "watch" and ev["exe"] not in known | _unit_execs(s["unit"]):
-                why = "unexpected"
+            elif phase == "watch" and not _exec_known(s, ev, known):
+                why = "unexpected" if _LOLBINS.match(os.path.basename(ev["exe"])) or not _verified(ev["exe"]) \
+                    else "verified"
         if why and (len(findings) < MAX_EXEC_FINDINGS or why == "sshd"):
             findings.append(_exec_finding(ev, why))  # cada pid cuenta: el aviso, uno por servicio y programa
     return findings
@@ -846,9 +878,10 @@ def _cleanup_dead() -> None:
         _nft("delete", "element", "inet", "arx", "watched2", f"{{ {m.group(1)} }}")
 
 
-def accept_exec(item: str) -> bool:
+def accept_exec(item: str, scope: str | None = None) -> bool:
     """«Que lance esto es normal»: entra en lo aprendido del servicio (en sshd, en lo que puede lanzar
-    antes de autenticar). Lo decide una persona."""
+    antes de autenticar). Con `scope="dir"`, todo su directorio; con `scope="children"`, también lo que ese
+    programa lance. Lo decide una persona."""
     path, sep, exe = str(item).partition("|")
     if not (sep and _SERVICE_PATH_RE.match(path) and exe.startswith("/") and "|" not in exe):
         return False
@@ -857,6 +890,10 @@ def accept_exec(item: str) -> bool:
         s = (st.get("subjects") or {}).get(path)
         if s is not None and exe not in s.setdefault("execs", []):
             s["execs"].append(exe)
+        if s is not None and scope == "dir" and os.path.dirname(exe) not in _BROAD_DIRS:  # nunca todo /usr/bin
+            s["exec_patterns"] = sorted(set(s.get("exec_patterns") or []) | {os.path.dirname(exe) + "/*"})
+        if s is not None and scope == "children":
+            s["exec_parents"] = sorted(set(s.get("exec_parents") or []) | {exe})
         if re.search(r"/sshd?\.service$", path):
             st["sshd_allowed"] = sorted(set(st.get("sshd_allowed") or []) | {exe})
         _save(st)

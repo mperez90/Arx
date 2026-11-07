@@ -103,6 +103,12 @@ ES = {
         "servicio crítico ({unit}): no se confina solo",
     "invalid service: nothing confined":
         "servicio no válido: no se confina nada",
+    "it comes from a verified package and is not a shell, interpreter or downloader: alert only":
+        "viene de un paquete verificado y no es una shell, un intérprete ni un descargador: solo se avisa",
+    "for a program a service started: accept its whole directory for that service":
+        "para un programa que lanzó un servicio: aceptar su directorio entero para ese servicio",
+    "for a program a service started: accept also what it starts":
+        "para un programa que lanzó un servicio: aceptar también lo que lance",
     " (frozen {ms} ms after it started)":
         " (congelado {ms} ms después de arrancar)",
     "Arx is down: systemd gave up restarting it":

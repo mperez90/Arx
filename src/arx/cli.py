@@ -87,7 +87,8 @@ def cmd_accept(args: argparse.Namespace) -> int:
                      fp=fp, detail=e.get('detail'), seen=e.get('seen'), v=e.get('last_seen', '')[:16]))
         print(tr("\nAccept one with:  arx accept <id>"))
         return 0
-    msg = response.accept(args.fp)
+    msg = response.accept(args.fp, "dir" if getattr(args, "dir", False) else
+                          "children" if getattr(args, "children", False) else None)
     if msg is None:
         print(tr("No acceptable finding with id '{fp}'. List them:  arx accept", fp=args.fp))
         return 1
@@ -492,6 +493,11 @@ def main(argv: list[str] | None = None) -> int:
     p_acc = sub.add_parser("accept", help=tr("accept a legitimate change as normal (adds it to the "
                                              "baseline)"))
     p_acc.add_argument("fp", nargs="?", help=tr("finding id (no id: list acceptable findings)"))
+    scope = p_acc.add_mutually_exclusive_group()
+    scope.add_argument("--dir", action="store_true",
+                       help=tr("for a program a service started: accept its whole directory for that service"))
+    scope.add_argument("--children", action="store_true",
+                       help=tr("for a program a service started: accept also what it starts"))
     p_not = sub.add_parser("notify", help=tr("outgoing alerts (Telegram / webhook)"))
     nsub = p_not.add_subparsers(dest="naction", required=True)
     nsub.add_parser("test", help=tr("send a test message through the configured channels"))

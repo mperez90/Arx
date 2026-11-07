@@ -3932,6 +3932,31 @@ class ExecWatchTests(unittest.TestCase):
         self.assertTrue(found[0]["harm"])  # ruta temporal y oculta: se congelará
         self.assertEqual(found[0]["target"]["pid"], 4242)
 
+    def test_a_new_child_from_a_verified_package_only_alerts_unless_it_is_an_attack_tool(self):
+        """Ruido: un servicio que estrena una herramienta de su paquete no se ve aislado; curl o bash, sí."""
+        child = dict(unit="system.slice/app.service", parent_exe="/usr/sbin/app", parent_user="app")
+        with mock.patch.object(self.p, "_verified", lambda exe: True):
+            found = self._events(self._subjects(), self._ev(**child, exe="/usr/lib/app/bin/reindex"),
+                                 self._ev(**child, exe="/usr/bin/curl", pid=4343))
+        tool, curl = found
+        self.assertEqual((tool["sev"], tool["target"].get("alert_only")), ("med", True))
+        self.assertIn("verified package", self.r.protected_reason(tool, {}))
+        self.assertEqual((curl["sev"], curl["target"].get("alert_only")), ("high", None))
+        self.assertIsNone(self.r.protected_reason(curl, {}))
+
+    def test_accepting_a_whole_directory_or_what_a_program_starts(self):
+        from arx import config
+        config.write_json(self.p._state_path(), {"subjects": self._subjects()})
+        self.assertTrue(self.p.accept_exec("system.slice/app.service|/usr/lib/app/plugins/a", "dir"))
+        self.assertTrue(self.p.accept_exec("system.slice/app.service|/usr/bin/backup-tool", "children"))
+        subjects = self.p.load()["subjects"]
+        child = dict(unit="system.slice/app.service", parent_exe="/usr/sbin/app", parent_user="app")
+        self.assertEqual(self._events(subjects, self._ev(**child, exe="/usr/lib/app/plugins/b"),
+                                      self._ev(**{**child, "parent_exe": "/usr/bin/backup-tool"}, exe="/usr/bin/gzip")), [])
+        self.assertEqual(len(self._events(subjects, self._ev(**child, exe="/usr/lib/app/other/c"))), 1)
+        self.assertTrue(self.p.accept_exec("system.slice/app.service|/usr/bin/convert", "dir"))
+        self.assertNotIn("/usr/bin/*", self.p.load()["subjects"]["system.slice/app.service"].get("exec_patterns"))
+
     def test_job_runners_are_not_profiled_and_a_service_watched_before_this_learns_first(self):
         cron = self._subjects(unit="cron.service")
         self.assertEqual(self._events(cron, self._ev(unit="system.slice/cron.service", parent_exe="/usr/sbin/cron",

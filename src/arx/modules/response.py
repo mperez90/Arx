@@ -293,7 +293,8 @@ def protected_reason(finding: dict, cfg: dict | None = None) -> str | None:
         if base in _PROTECTED_EXES or exe == sys.executable:
             return tr("critical process ({base}): observed only", base=base)
     if kind == "unexpected_exec" and target.get("alert_only") and not target.get("stopped"):
-        return tr("sshd's configuration could not be read with certainty: alert only, nothing frozen")
+        return str(target.get("alert_reason") or "") or \
+            tr("sshd's configuration could not be read with certainty: alert only, nothing frozen")
     if kind == "untrusted_update":
         unit = str(target.get("unit") or "")
         if _PROTECTED_UNITS.match(unit) and not _SSH_UNIT_RE.match(unit):  # ssh: sin salida, con excepciones
@@ -1276,7 +1277,7 @@ def authorize_pending(pid: str) -> dict | None:
     return item
 
 
-def accept(fp: str) -> str | None:
+def accept(fp: str, scope: str | None = None) -> str | None:
     """Incorpora a la base un cambio legítimo y levanta lo que lo contenía. Devuelve qué pasó, o
     None si no hay un hallazgo aceptable con ese id. La autorización, si hace falta, es del llamador."""
     from arx.modules import baseline, vaccines  # perezoso: ambos importan este módulo
@@ -1288,7 +1289,7 @@ def accept(fp: str) -> str | None:
         return None
     from arx.modules import trust
     accepted = (profile.accept(e["item"]) if e["set"] == "egress_profile"
-                else profile.accept_exec(e["item"]) if e["set"] == "unexpected_exec"
+                else profile.accept_exec(e["item"], scope) if e["set"] == "unexpected_exec"
                 else trust.accept(e["item"]) if e["set"] == "untrusted_update"
                 else baseline.accept(e["set"], e["item"]))
     if not accepted:
