@@ -4281,6 +4281,19 @@ class ExecWatchTests(unittest.TestCase):
         self.assertIn("/usr/local/bin/akc2", self.p.load()["sshd_allowed"])
         self.assertFalse(self.p.accept_exec("system.slice/system-sshd.slice/../x.service|/x"))
 
+    def test_an_accepted_sshd_command_counts_at_the_next_login_without_waiting(self):
+        """A#11 (lab Debian 13): `arx accept` corre en otro proceso; sin esto, cada login hasta el barrido
+        siguiente se congelaba otra vez. En el camino caliente, solo un stat."""
+        import time as _time
+        from arx.modules import execwatch
+        execwatch._allow.update(at=_time.monotonic(), paths={"/usr/sbin/unix_chkpwd"}, sure=True, stamps={},
+                                accepted_at=None, accepted=set())
+        self.addCleanup(execwatch._allow.update, at=0.0, paths=set(), sure=False, stamps={})
+        self.assertNotIn("/usr/local/bin/akc3", execwatch.sshd_allowed(hot=True))
+        self.assertTrue(self.p.accept_exec("system.slice/system-sshd.slice/sshd@4-1:22-2:5.service|/usr/local/bin/akc3"))
+        with mock.patch.object(execwatch.subprocess, "run", side_effect=AssertionError("sshd -T en caliente")):
+            self.assertIn("/usr/local/bin/akc3", execwatch.sshd_allowed(hot=True))
+
     def test_a_keys_command_alert_accepts_its_script_never_the_bare_shell(self):
         ev = {"pid": 1, "start": 1, "exe": "/usr/bin/dash", "unit": "system.slice/ssh.service", "user": "nobody",
               "argv": ["/bin/sh", "/usr/local/bin/new-akc"], "preauth": True, "sure": True, "akc_unknown": True,
