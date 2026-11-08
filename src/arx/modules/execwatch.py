@@ -336,7 +336,7 @@ def sshd_allowed(refresh: bool = False, hot: bool = False) -> set[str]:
     se pudo leer con certeza, `_allow["sure"]` queda en falso y la regla de sshd solo avisa (A#6)."""
     # en el camino caliente (un exec de sshd) solo se relee si cambió la configuración; por edad, en el barrido
     if not refresh and _allow["at"] and (hot or time.monotonic() - _allow["at"] < ALLOW_REFRESH_S) and not _changed():
-        return _allow["paths"]
+        return _allow["paths"] | _accepted_now()
     paths = {"/usr/sbin/unix_chkpwd", "/sbin/unix_chkpwd"}
     sshd = shutil.which("sshd") or "/usr/sbin/sshd"
     try:
@@ -378,6 +378,22 @@ def sshd_allowed(refresh: bool = False, hot: bool = False) -> set[str]:
     files = read | {f"/etc/pam.d/{n}" for n in _PAM_SEEN}
     _allow.update(at=time.monotonic(), paths=paths, sure=sure, stamps=_stamps(files))
     return paths
+
+
+def _accepted_now() -> set[str]:
+    """Lo que una persona acaba de aceptar, sin esperar al barrido: `arx accept` corre en otro proceso, y con sshd
+    por conexión cada login hasta entonces se congelaría (A#11). Un fichero pequeño: en el camino caliente, un stat."""
+    from arx import config
+    path = config.state_dir() / "sshd_accepted.json"
+    try:
+        mtime = os.stat(path).st_mtime_ns
+    except OSError:
+        return set()
+    if mtime != _allow.get("accepted_at"):
+        accepted = {p for p in config.read_json(path).get("paths") or [] if isinstance(p, str) and p.startswith("/")}
+        accepted |= {os.path.realpath(p) for p in accepted}
+        _allow.update(accepted_at=mtime, accepted=accepted)
+    return _allow.get("accepted") or set()
 
 
 def _stamps(files) -> dict:

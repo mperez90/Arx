@@ -94,7 +94,8 @@ v sh -c 'echo /usr/local/lib/xz-lab.so > /etc/ld.so.preload'
 frozen() { local out; out=$(v sh -c 'for p in $(pgrep -f "xz-lab-payloa[d]"); do ps -o stat= -p $p; done'); grep -q T <<<"$out"; }
 check "la orden queda congelada" wait_for 30 frozen
 sleep 3
-check "en milisegundos: no llegó a dejar su marca (200 ms)" sh -c "! limactl shell $VM test -e /tmp/xz-lab-ran"
+check "en milisegundos: no llegó a dejar su marca (200 ms)" sh -c "! limactl shell $VM test -e /tmp/xz-lab-ran" || \
+  v sh -c 'stat -c "  marca: %y" /tmp/xz-lab-ran; date "+  ahora: %F %T.%N"; for p in $(pgrep -f "xz-lab-payloa[d]"); do echo "  $p $(ps -o stat=,etimes= -p $p) $(cut -d: -f3- /proc/$p/cgroup)"; done; journalctl -u arx --no-pager -n 30 | grep -iE "freez|congel|sshd|error" | tail -n 8'  
 check "alerta crítica: sshd ejecutó algo antes de autenticar" wait_for 40 incident "sshd, before authenticating anyone, ran"
 crit() { local out; out=$(v cat /var/lib/arx/incidents.jsonl); grep "before authenticating anyone" <<<"$out" | grep -q '"sev": "crit"'; }
 check "y es crítica" crit
@@ -117,7 +118,7 @@ check "no llegó a dejar su marca" sh -c "! limactl shell $VM test -e /tmp/xz-fo
 check "Arx sigue respondiendo" v sh -c 'timeout 30 arx status >/dev/null'
 check "y sigue en guardia" v systemctl is-active -q arx
 # el scope de ESTE escenario (el de su primer proceso), no uno cualquiera
-cg_frozen() { local out; out=$(v sh -c 'p=$(pgrep -of "xz-lab-payloa[d]"); c=$(cut -d: -f3 /proc/$p/cgroup); cat /sys/fs/cgroup$c/cgroup.freeze') ; test "$out" = 1; }
+cg_frozen() { local out; out=$(v sh -c 'p=$(pgrep -of "xz-lab-payloa[d]"); c=$(cut -d: -f3- /proc/$p/cgroup); cat /sys/fs/cgroup$c/cgroup.freeze') ; test "$out" = 1; }
 check "su scope está congelado ya (lo hace el vigilante, no el barrido)" cg_frozen
 v sh -c 'pkill -CONT -f "xz-lab-payloa[d]"; pkill -CONT -f "sleep 0.0[1]"; true'   # el «vigilante» de la puerta trasera
 sleep 3

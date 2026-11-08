@@ -894,6 +894,8 @@ def accept_exec(item: str) -> bool:
             s["execs"].append(exe)
         if ssh:
             st["sshd_allowed"] = sorted(set(st.get("sshd_allowed") or []) | {exe})
+            # el vigilante lo ve en el login siguiente, sin esperar al barrido (A#11)
+            config.write_json(config.state_dir() / "sshd_accepted.json", {"paths": st["sshd_allowed"]})
         _save(st)
     return True
 
