@@ -1,3 +1,3 @@
 """Arx — Core (source-available). Defensa activa y reactiva para servidores."""
 
-__version__ = "0.0.6"
+__version__ = "0.0.7"
