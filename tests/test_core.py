@@ -516,8 +516,32 @@ class NotifyTests(unittest.TestCase):
     def test_error_never_leaks_bot_token(self):
         def boom(url, payload):
             raise OSError(f"fallo contactando {url}")
-        res = self.notify.send("hola", self.cfg, post=boom)
+        with mock.patch.object(self.notify, "RETRY_WAITS", (0, 0)):
+            res = self.notify.send("hola", self.cfg, post=boom)
         self.assertNotIn("BOTSECRET", str(res))
+
+    def test_a_transient_failure_is_retried_but_a_bad_token_is_not(self):
+        """B42 (VPS real): un «Connection reset by peer» suelto perdía la alerta."""
+        import urllib.error
+        calls = []
+
+        def flaky(url, payload):
+            calls.append(url)
+            if len(calls) == 1:
+                raise ConnectionResetError(104, "Connection reset by peer")
+        with mock.patch.object(self.notify, "RETRY_WAITS", (0, 0)):
+            res = self.notify.send("hola", {"notify": {"telegram_chat_id": "42"}}, post=flaky)
+        self.assertEqual(res, {"telegram": "ok"})
+        self.assertEqual(len(calls), 2)
+        calls.clear()
+
+        def unauthorized(url, payload):
+            calls.append(url)
+            raise urllib.error.HTTPError("https://api.telegram.org/x", 401, "Unauthorized", {}, None)
+        with mock.patch.object(self.notify, "RETRY_WAITS", (0, 0)):
+            res = self.notify.send("hola", {"notify": {"telegram_chat_id": "42"}}, post=unauthorized)
+        self.assertTrue(res["telegram"].startswith("error"))
+        self.assertEqual(len(calls), 1)  # un 4xx no se arregla reintentando
 
 
 class StateIOTests(unittest.TestCase):

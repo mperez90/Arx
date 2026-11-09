@@ -69,6 +69,23 @@ def muted(now: float | None = None) -> bool:
     return now < config.read_json(_mute_path(), {}).get("until", 0)
 
 
+RETRY_WAITS = (2, 5)  # VPS real: un «Connection reset by peer» suelto perdía la alerta (B42)
+
+
+def _deliver(fn) -> None:
+    """Un corte transitorio (reset, timeout, 5xx, 429) se reintenta; un 4xx (token o chat mal), no."""
+    for wait in (*RETRY_WAITS, None):
+        try:
+            return fn()
+        except urllib.error.HTTPError as e:
+            if wait is None or (400 <= e.code < 500 and e.code != 429):
+                raise
+        except (urllib.error.URLError, TimeoutError, OSError):
+            if wait is None:
+                raise
+        time.sleep(wait)
+
+
 def send(text: str, cfg: dict | None = None, post=_post) -> dict:
     """Envía `text` (redactado) por todos los canales. Devuelve {canal: ok|error}."""
     n = settings(cfg)
@@ -79,11 +96,12 @@ def send(text: str, cfg: dict | None = None, post=_post) -> dict:
         try:
             if ch == "telegram":
                 token = config.load_secrets()["telegram_bot_token"]
-                post(f"{n.get('telegram_api') or 'https://api.telegram.org'}/bot{token}/sendMessage",
-                     {"chat_id": n["telegram_chat_id"], "text": f"🛡 Arx · {host}\n{text}",
-                      "disable_web_page_preview": True})
+                url = f"{n.get('telegram_api') or 'https://api.telegram.org'}/bot{token}/sendMessage"
+                body = {"chat_id": n["telegram_chat_id"], "text": f"🛡 Arx · {host}\n{text}",
+                        "disable_web_page_preview": True}
+                _deliver(lambda: post(url, body))
             else:
-                post(n["webhook_url"], {"source": "arx", "host": host, "text": text})
+                _deliver(lambda: post(n["webhook_url"], {"source": "arx", "host": host, "text": text}))
             results[ch] = "ok"
         except (urllib.error.URLError, TimeoutError, OSError, KeyError, ValueError) as e:
             # el error puede contener la URL con el token del bot → redactar también
