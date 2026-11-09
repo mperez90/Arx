@@ -16,6 +16,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 VERSION="${1:-$(python3 -c "import sys; sys.path.insert(0, '$ROOT/src'); import arx; print(arx.__version__)" 2>/dev/null || echo 0.0.1)}"
+# 0.0.8rc1 (Python) → 0.0.8~rc1 (Debian): una candidata se ordena antes que su versión final
+VERSION="$(printf '%s' "$VERSION" | sed -E 's/(a|b|rc)([0-9]+)$/~\1\2/')"
 MAINTAINER="${ARX_MAINTAINER:-Advanced Systems Laboratories <mperez90@users.noreply.github.com>}"
 STAGE="$(mktemp -d)"
 PKG="$STAGE/pkg"
