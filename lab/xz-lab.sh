@@ -97,8 +97,9 @@ v sh -c 'echo /usr/local/lib/xz-lab.so > /etc/ld.so.preload'
 frozen() { local out; out=$(v sh -c 'for p in $(pgrep -f "xz-lab-payloa[d]"); do ps -o stat= -p $p; done'); grep -q T <<<"$out"; }
 check "la orden queda congelada" wait_for 30 frozen
 sleep 3
-check "en milisegundos: no llegó a dejar su marca (200 ms)" sh -c "! limactl shell $VM test -e /tmp/xz-lab-ran" || \
-  v sh -c 'stat -c "  marca: %y" /tmp/xz-lab-ran; date "+  ahora: %F %T.%N"; for p in $(pgrep -f "xz-lab-payloa[d]"); do echo "  $p $(ps -o stat=,etimes= -p $p) $(cut -d: -f3- /proc/$p/cgroup)"; done; journalctl -u arx --no-pager -n 30 | grep -iE "freez|congel|sshd|error" | tail -n 8'  
+if limactl shell "$VM" test -e /tmp/xz-lab-ran; then fail "en milisegundos: no llegó a dejar su marca (200 ms)"
+  v sh -c 'stat -c "  marca: %y" /tmp/xz-lab-ran; date "+  ahora: %F %T.%N"; for p in $(pgrep -f "xz-lab-payloa[d]"); do echo "  $p $(ps -o stat=,etimes= -p $p) $(cut -d: -f3- /proc/$p/cgroup)"; done; journalctl -u arx --no-pager -n 30 | grep -iE "freez|congel|sshd|error" | tail -n 8'
+else pass "en milisegundos: no llegó a dejar su marca (200 ms)"; fi
 check "alerta crítica: sshd ejecutó algo antes de autenticar" wait_for 40 incident "sshd, before authenticating anyone, ran"
 crit() { local out; out=$(v cat /var/lib/arx/incidents.jsonl); grep "before authenticating anyone" <<<"$out" | grep -q '"sev": "crit"'; }
 check "y es crítica" crit

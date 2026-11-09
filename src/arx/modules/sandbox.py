@@ -26,6 +26,7 @@ import re
 import signal
 import stat
 import threading
+import time
 
 from arx.i18n import tr
 from arx.redact import printable
@@ -189,15 +190,30 @@ class _BudgetExceeded(Exception):
     pass
 
 
+class _TooBusy(Exception):
+    pass
+
+
+WALL_FACTOR = 10  # sin CPU para trabajar (CPUQuota, host ocupado), hasta 10× el presupuesto de reloj
+
+
 @contextlib.contextmanager
 def _time_budget(seconds: float):
-    """Límite de tiempo real, también dentro de una regex: el motor de `re` atiende señales."""
+    """Límite de CPU del análisis, también dentro de una regex (el motor de `re` atiende señales): una trampa
+    que lo hace trabajar lo agota. Un host ocupado o el CPUQuota de Arx, no: se cuenta el CPU de este hilo, no
+    el reloj (lab: un python copiado salía «sospechoso» y se suspendía). Con un tope de reloj más amplio."""
     if threading.current_thread() is not threading.main_thread() or not hasattr(signal, "SIGALRM"):
         yield
         return
+    cpu0, wall0 = time.thread_time(), time.monotonic()
 
     def _expired(*_):
-        raise _BudgetExceeded
+        used = time.thread_time() - cpu0
+        if used >= seconds:
+            raise _BudgetExceeded  # trabajó todo su presupuesto: una trampa
+        if time.monotonic() - wall0 >= seconds * WALL_FACTOR:
+            raise _TooBusy  # el host no le dejó trabajar: sin veredicto, nunca «sospechoso» por eso
+        signal.setitimer(signal.ITIMER_REAL, max(0.05, seconds - used))
     previous = signal.signal(signal.SIGALRM, _expired)
     signal.setitimer(signal.ITIMER_REAL, seconds)
     try:
@@ -260,6 +276,8 @@ def analyze(path: str, budget: float = SCAN_BUDGET_S) -> dict:
             return _analyze(path)
     except OSError as e:
         return _unknown(path, tr("unreadable: {e}", e=e))
+    except _TooBusy:
+        return _unknown(path, tr("the host was too busy to finish the analysis"))
     except _BudgetExceeded:
         why = tr("the analysis ran out of its {budget:g} s budget (possible trap file)",
                  budget=budget)

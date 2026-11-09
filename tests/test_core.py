@@ -5044,6 +5044,22 @@ class SandboxTests(unittest.TestCase):
         self.assertEqual(rep["verdict"], "suspicious")
         self.assertEqual(rep["hits"][0]["rule"], "analysis-budget")
 
+    def test_a_busy_host_is_not_a_trap_file(self):
+        """Lab (v0.0.8, CPUQuota y más hilos): el análisis de un python copiado pasaba de 2 s de reloj sin
+        trabajar 2 s, salía «sospechoso» y el programa se suspendía. Cuenta el CPU del análisis, no el reloj."""
+        import time
+        path = self._file(b"#!/bin/sh\necho hola\n", "quiet")
+        real = self.s._analyze
+
+        def slow(p):  # espera sin trabajar: lo que hace un hilo con la CPU racionada
+            time.sleep(0.4)
+            return real(p)
+        with mock.patch.object(self.s, "_analyze", slow):
+            self.assertEqual(self.s.analyze(path, budget=0.2)["verdict"], "clean")
+        with mock.patch.object(self.s, "_analyze", slow), mock.patch.object(self.s, "WALL_FACTOR", 1):
+            rep = self.s.analyze(path, budget=0.2)  # ni siquiera el tope de reloj la hace «sospechosa»
+        self.assertEqual(rep["verdict"], "unknown")
+
     def test_fifo_does_not_block(self):
         """Antes colgaba: abrir un FIFO sin escritor se bloquea para siempre."""
         path = os.path.join(self.d, "fifo")

@@ -1415,6 +1415,8 @@ ES = {
         "  (ninguna regla casó; sin indicadores estáticos de malware)",
     "no indicators, but only {v} of {total} B were analyzed":
         "sin indicadores, pero solo se analizaron {v} de {total} B",
+    "the host was too busy to finish the analysis":
+        "el host estaba demasiado ocupado para terminar el análisis",
     "the analysis ran out of its {budget:g} s budget (possible trap file)":
         "el análisis agotó su presupuesto de {budget:g} s (posible fichero trampa)",
     "unnamed or duplicate rule: {rid}":
