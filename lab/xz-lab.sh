@@ -82,7 +82,8 @@ v bash -c 'arx recon >/dev/null; arx learn >/dev/null; arx learn >/dev/null; arx
 v python3 -c "import json; p = '/etc/arx/config.json'; c = json.load(open(p)); c.update(profile_observe_days=0.003, profile_jitter_days=0); json.dump(c, open(p, 'w'))"
 v arx service install --enforce >/dev/null 2>&1
 check "Arx en guardia con --enforce" v systemctl is-active -q arx
-kernel_watch() { local out; out=$(v journalctl -u arx --no-pager -n 200); grep -q "process watch: in the kernel" <<<"$out"; }
+# solo este arranque de Arx: la línea de uno anterior seguiría en el journal y el lab empezaría sin vigilancia
+kernel_watch() { local out; out=$(v sh -c 'journalctl -u arx --no-pager _SYSTEMD_INVOCATION_ID=$(systemctl show -p InvocationID --value arx)'); grep -q "process watch: in the kernel" <<<"$out"; }
 check "vigila cada exec desde el kernel" wait_for 20 kernel_watch
 check "precondición: un login nuevo funciona" fresh_login
 
@@ -94,8 +95,9 @@ v sh -c 'echo /usr/local/lib/xz-lab.so > /etc/ld.so.preload'
 frozen() { local out; out=$(v sh -c 'for p in $(pgrep -f "xz-lab-payloa[d]"); do ps -o stat= -p $p; done'); grep -q T <<<"$out"; }
 check "la orden queda congelada" wait_for 30 frozen
 sleep 3
-check "en milisegundos: no llegó a dejar su marca (200 ms)" sh -c "! limactl shell $VM test -e /tmp/xz-lab-ran" || \
-  v sh -c 'stat -c "  marca: %y" /tmp/xz-lab-ran; date "+  ahora: %F %T.%N"; for p in $(pgrep -f "xz-lab-payloa[d]"); do echo "  $p $(ps -o stat=,etimes= -p $p) $(cut -d: -f3- /proc/$p/cgroup)"; done; journalctl -u arx --no-pager -n 30 | grep -iE "freez|congel|sshd|error" | tail -n 8'  
+if limactl shell "$VM" test -e /tmp/xz-lab-ran; then fail "en milisegundos: no llegó a dejar su marca (200 ms)"
+  v sh -c 'stat -c "  marca: %y" /tmp/xz-lab-ran; date "+  ahora: %F %T.%N"; for p in $(pgrep -f "xz-lab-payloa[d]"); do echo "  $p $(ps -o stat=,etimes= -p $p) $(cut -d: -f3- /proc/$p/cgroup)"; done; journalctl -u arx --no-pager -n 30 | grep -iE "freez|congel|sshd|error" | tail -n 8'
+else pass "en milisegundos: no llegó a dejar su marca (200 ms)"; fi
 check "alerta crítica: sshd ejecutó algo antes de autenticar" wait_for 40 incident "sshd, before authenticating anyone, ran"
 crit() { local out; out=$(v cat /var/lib/arx/incidents.jsonl); grep "before authenticating anyone" <<<"$out" | grep -q '"sev": "crit"'; }
 check "y es crítica" crit
