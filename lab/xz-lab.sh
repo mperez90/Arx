@@ -85,7 +85,8 @@ v bash -c 'arx recon >/dev/null; arx learn >/dev/null; arx learn >/dev/null; arx
 v python3 -c "import json; p = '/etc/arx/config.json'; c = json.load(open(p)); c.update(profile_observe_days=0.003, profile_jitter_days=0); json.dump(c, open(p, 'w'))"
 v arx service install --enforce >/dev/null 2>&1
 check "Arx en guardia con --enforce" v systemctl is-active -q arx
-kernel_watch() { local out; out=$(v journalctl -u arx --no-pager -n 200); grep -q "process watch: in the kernel" <<<"$out"; }
+# solo este arranque de Arx: la línea de uno anterior seguiría en el journal y el lab empezaría sin vigilancia
+kernel_watch() { local out; out=$(v sh -c 'journalctl -u arx --no-pager _SYSTEMD_INVOCATION_ID=$(systemctl show -p InvocationID --value arx)'); grep -q "process watch: in the kernel" <<<"$out"; }
 check "vigila cada exec desde el kernel" wait_for 20 kernel_watch
 check "precondición: un login nuevo funciona" fresh_login
 
