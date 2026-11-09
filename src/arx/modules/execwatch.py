@@ -590,15 +590,42 @@ def _freeze(ev: dict) -> bool:
     return True
 
 
+def _hot_handle(ev: dict, why: str) -> None:
+    """Lo congelado por el vigilante se registra YA, con su bloqueo liberable: el barrido tarda hasta
+    30 s en verlo, y un stop de Arx en medio lo perdería — congelado, sin incidente y sin forma de
+    soltarlo (B45, prueba real F2). handled_hot: el barrido no lo cuenta dos veces."""
+    try:
+        from arx.modules import profile, response
+        response.handle(profile._exec_finding(ev, why), enforce=True)
+        ev["handled_hot"] = True
+    except Exception:
+        pass  # si esto falla, el barrido de siempre sigue cubriendo el registro
+
+
+def set_hot_verdict(fn) -> None:
+    """profile registra aquí (None lo quita) el veredicto en caliente: dado un exec, dice si hay que
+    pararlo ya. Una reverse shell no espera al siguiente barrido (B44, prueba real F2)."""
+    _state["hot_fn"] = fn
+
+
 def handle_pid(pid: int, root: str, enforce, ts: int | None = None) -> dict | None:
     ev = describe(pid, root)
     if not ev:
         return None
     ev["preauth"] = sshd_preauth(ev)
     ev["sure"] = sshd_sure() if ev["preauth"] else True
-    if ev["preauth"] and ev["sure"] and not (ev.get("akc_unknown") or ev.get("env_injected")) and enforce():
+    hot = None
+    if ev["preauth"] and ev["sure"] and not (ev.get("akc_unknown") or ev.get("env_injected")):
+        hot = "sshd"
+    elif not ev["preauth"] and _state.get("hot_fn"):
+        try:
+            hot = _state["hot_fn"](ev)
+        except Exception:
+            hot = None
+    if hot and enforce():
         ev["ts"] = ts
         ev["stopped"] = _freeze(ev)
+        _hot_handle(ev, hot)
     _events.append(ev)
     return ev
 

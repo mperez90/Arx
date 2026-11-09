@@ -172,29 +172,41 @@ def _trusted_yes_urls() -> list[str]:
 
 
 def signed_origin(pkg: str) -> tuple[bool, str]:
-    """¿La versión instalada está en un repositorio firmado? (sí/no, de dónde)."""
+    """¿El paquete instalado vino de un repositorio firmado? (sí/no, de dónde).
+
+    Que el repo ya no liste la versión instalada (publicó una más nueva y este host aún no actualiza)
+    NO la convierte en un .deb suelto: apt verificó su firma cuando la instaló (B43, prueba real F2:
+    openssh-server quedó en «suelto» 0,00 para siempre tras un `apt update`, y su confinamiento expulsó
+    sesiones de administración). Suelto es lo que ningún repositorio firmado sirve en ninguna versión."""
     def look():
         out = _q(["apt-cache", "policy", pkg.partition(":")[0]])
         if not out:
             return False, tr("apt does not know this package")
-        sources, inside = [], False
+        installed_src, any_src, inside = [], [], False
         for line in out.splitlines():
             if line.startswith(" *** "):
                 inside = True
                 continue
+            if re.match(r"^ {2,6}\S", line):
+                inside = False  # otra versión de la tabla: la instalada quedó atrás
+            m = re.match(r"^ {8}\s*-?\d+\s+(\S+)", line)
+            if not m:
+                continue
+            any_src.append(m.group(1))
             if inside:
-                m = re.match(r"^ {8}\s*-?\d+\s+(\S+)", line)
-                if not m:
-                    break  # siguiente versión de la tabla
-                sources.append(m.group(1))
-        remote = [s for s in sources if s != "/var/lib/dpkg/status"]
-        if not remote:
-            return False, tr("installed from a local package, not from a repository")
+                installed_src.append(m.group(1))
         unsigned = _trusted_yes_urls()
-        signed = [s for s in remote if not any(s.rstrip("/").startswith(u) for u in unsigned)]
-        if not signed:
-            return False, tr("its repository is marked trusted=yes: apt does not check its signature")
-        return True, signed[0]
+        is_signed = lambda s: s != "/var/lib/dpkg/status" and not any(
+            s.rstrip("/").startswith(u) for u in unsigned)
+        signed = [s for s in installed_src if is_signed(s)]
+        if signed:
+            return True, signed[0]
+        if any(is_signed(s) for s in any_src):
+            return True, tr("signed repository; the installed version is no longer listed "
+                            "(an upgrade is pending)")
+        if not any(s != "/var/lib/dpkg/status" for s in any_src):
+            return False, tr("installed from a local package, not from a repository")
+        return False, tr("its repository is marked trusted=yes: apt does not check its signature")
     return _cached(("origin", pkg), look)
 
 

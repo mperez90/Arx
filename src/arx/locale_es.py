@@ -259,6 +259,14 @@ ES = {
         "red devuelta a: {what}",
     "confined without outbound network: {what}. It keeps running; it does not expire, you decide":
         "confinado sin red saliente: {what}. Sigue funcionando; no caduca, decides tú",
+    "confined without outbound network: {what}. It keeps running; it does not expire, you decide{note}":
+        "confinado sin red saliente: {what}. Sigue funcionando; no caduca, decides tú{note}",
+    "; your open SSH sessions keep working":
+        "; tus sesiones SSH abiertas siguen funcionando",
+    "{unit} was already confined; nothing re-applied":
+        "{unit} ya estaba confinado; no se ha vuelto a aplicar nada",
+    "signed repository; the installed version is no longer listed (an upgrade is pending)":
+        "repositorio firmado; la versión instalada ya no está listada (hay una actualización pendiente)",
     "log and alert (verified package)":
         "registrar y avisar (paquete verificado)",
     "confine it: no outbound network, it keeps running (until you decide)":

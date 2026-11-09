@@ -42,6 +42,7 @@ from arx.i18n import tr
 
 TRUST_MIN = 0.98
 CACHE_DAYS = 7
+CACHE_V = 2  # v1 condenaba 7 días como «paquete suelto» a versiones que el repo ya no lista (B43)
 OSV_URL = "https://api.osv.dev/v1/query"
 REPRO_URL = "https://reproduce.debian.net/{arch}/api/v0/pkgs/list?name={name}"
 MAX_DEB_BYTES = 200 * 1024 * 1024
@@ -392,7 +393,7 @@ def assess(pkg: str, deep: bool = False, now: datetime | None = None) -> dict:
         return {"score": 1.0, "trusted": True, "checks": [], "concerns": [], "facts": f,
                 "reason": tr("accepted by a person for this exact version")}
     hit = cache.get(key)
-    if hit and time.time() - hit.get("t", 0) < CACHE_DAYS * 86400:
+    if hit and hit.get("v") == CACHE_V and time.time() - hit.get("t", 0) < CACHE_DAYS * 86400:
         checks = hit["checks"]
     else:
         names = list(CHECKS) if deep else list(_QUICK)
@@ -403,7 +404,7 @@ def assess(pkg: str, deep: bool = False, now: datetime | None = None) -> dict:
         (concerns[0] if concerns else None) or next((c for c in checks if c["result"] == "unknown"), None)
     with config.locked("trust"):
         cache = config.read_json(_cache_path(), {}) or {}
-        cache[key] = {"t": time.time(), "checks": checks}
+        cache[key] = {"t": time.time(), "checks": checks, "v": CACHE_V}
         config.write_json(_cache_path(), cache)
     reason = tr("trust {score:.2f} of {min:.2f}", score=s, min=TRUST_MIN)
     if worst:
@@ -432,7 +433,7 @@ def cached(pkg: str, deep: bool = False) -> dict | None:
         cache = config.read_json(_cache_path(), {}) or {}
     hit = cache.get(f"{f['package']}={f['version']}|{'deep' if deep else 'quick'}")
     if f"{f['package']}={f['version']}|accepted" in cache or \
-            (hit and time.time() - hit.get("t", 0) < CACHE_DAYS * 86400):
+            (hit and hit.get("v") == CACHE_V and time.time() - hit.get("t", 0) < CACHE_DAYS * 86400):
         return assess(pkg, deep=deep)
     return None
 

@@ -768,6 +768,13 @@ def sweep(enforce: bool = False, cfg: dict | None = None, now: datetime | None =
                     if path and f"{path}|{proto}|{ip}|{port}" not in reported:
                         reported[f"{path}|{proto}|{ip}|{port}"] = _iso(now)
                         findings.append(_finding_denied(path, proto, ip, port, enforced=True))
+        # el veredicto en caliente del vigilante (B44): servicios vigilados, sin cron/ssh ni observados
+        from arx.modules import execwatch
+        execwatch.set_hot_verdict(hot_verdict)
+        _HOT.clear()
+        _HOT.update({path: s for path, s in subjects.items()  # la clave es el cgroup, como en ev["unit"]
+                     if s["status"] == "watching" and _exec_phase(s, now, cfg) == "watch"
+                     and not _EXEC_FREE.match(s["unit"]) and not _OBSERVE_ONLY.match(s["unit"])})
         _save(st)
     if pinned:
         subprocess.run(["systemctl", "daemon-reload"], capture_output=True, timeout=60)
@@ -816,6 +823,21 @@ def _exec_known(s: dict, ev: dict, known: set) -> bool:
     if any(fnmatch.fnmatchcase(ev["exe"], p) for p in s.get("exec_patterns") or []):
         return True
     return ev.get("parent_exe") in (s.get("exec_parents") or [])
+
+
+# Unidades en vigilancia cuyas shells/descargadores se paran al instante (B44). Lo renueva cada barrido.
+_HOT: dict = {}
+
+
+def hot_verdict(ev: dict) -> str | None:
+    """Veredicto en caliente para execwatch: una shell o un descargador lanzado por un servicio de red ya
+    vigilado se congela al instante — una reverse shell no espera al próximo barrido (B44, prueba real F2).
+    Solo lo que el barrido también cazaría; lo ya conocido por el perfil, nunca."""
+    from arx.modules import execwatch
+    s = _HOT.get(ev.get("unit") or "")
+    if not s or not execwatch.webshell(ev):
+        return None
+    return None if _exec_known(s, ev, set(s.get("execs") or [])) else "webshell"
 
 
 def _verified(exe: str) -> bool:
@@ -887,6 +909,8 @@ def _exec_events(subjects: dict, now: datetime, cfg: dict, st: dict | None = Non
     akc = (st if st is not None else {}).setdefault("sshd_akc", {"unit": "sshd-keys-command", "status": "watching"})
     akc_phase = _phase(akc, "akc", now, cfg)  # su propia ventana, desde el primer barrido
     for ev in execwatch.drain():
+        if ev.get("handled_hot"):  # el vigilante ya lo registró en caliente (B45): no contarlo dos veces
+            continue
         if ev.get("akc_unknown") and akc_phase == "learn" and st is not None:  # lo del comando de claves, aprendido
             seen, item = st.setdefault("sshd_akc_seen", []), ev.get("akc_learn")
             if item and item not in seen and len(seen) < 64:

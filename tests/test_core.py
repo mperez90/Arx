@@ -4243,37 +4243,111 @@ class ExecWatchTests(unittest.TestCase):
         self.assertEqual(froze[-1], ("arxconfine.slice/arxconfine-4242.scope", False))
 
     def test_the_watcher_freezes_the_scope_itself_and_the_sweep_only_records_it(self):
-        """Lab xz: entre el SIGSTOP y el barrido, un cómplice podía despertarlos con SIGCONT."""
+        """Lab xz: entre el SIGSTOP y el barrido, un cómplice podía despertarlos con SIGCONT.
+        B45 (F2): el registro es en caliente — un `systemctl stop arx` antes del barrido ya no lo
+        pierde — y el barrido no lo cuenta dos veces."""
         scope = {"scope": "arxconfine-4242.scope", "path": "arxconfine.slice/arxconfine-4242.scope",
                  "set": "confined2", "pid": 4242}
         froze, adopted = [], []
+        for name, value in [("_is_linux_root", lambda: True), ("_can_confine", lambda: True),
+                            ("_cgroup_of", lambda pid: scope["path"]),
+                            ("_adopt_into_scope", lambda pid, also=None: adopted.append(pid) or dict(scope)),
+                            ("_freeze_cgroup", lambda path, on: froze.append((path, on)) or True)]:
+            p = mock.patch.object(self.r, name, value)
+            p.start()
+            self.addCleanup(p.stop)
         with mock.patch.object(self.x, "describe", lambda pid, root: self._ev()), \
                 mock.patch.object(self.x, "sshd_allowed", lambda refresh=False, hot=False: set()), \
                 mock.patch.object(self.x, "sshd_sure", lambda: True), \
                 mock.patch.object(self.x, "same_process", lambda pid, exe, start: True), \
                 mock.patch.object(self.x, "freeze_family", lambda pid: []), \
                 mock.patch.object(self.x.os, "kill", lambda pid, sig: None), \
-                mock.patch.dict(self.x._state, {"confine": True}), \
-                mock.patch.object(self.r, "_adopt_into_scope", lambda pid, also=None: adopted.append(pid) or dict(scope)), \
-                mock.patch.object(self.r, "_freeze_cgroup", lambda path, on: froze.append((path, on)) or True):
+                mock.patch.dict(self.x._state, {"confine": True}):
             ev = self.x.handle_pid(4242, "", lambda: True)
-        self.x.drain()
         self.assertEqual((ev["scope"]["path"], ev["scope_frozen"]), (scope["path"], True))
         self.assertEqual(froze, [(scope["path"], True)])
-        f = self._events({}, ev)[0]
+        self.assertEqual(adopted, [4242])
+        self.assertTrue(ev.get("handled_hot"))  # registrado YA, en el hilo del vigilante
+        revert = self.r._load_blocks()[0]["revert"]  # sin esperar al barrido
+        self.assertEqual((revert["scopes"][0]["path"], revert["frozen_cgroups"]), (scope["path"], [scope["path"]]))
+        self.x.drain()
+        self.assertEqual(self._events({}, ev), [])  # el barrido no lo cuenta dos veces
+
+    def test_hot_verdict_only_for_watched_services_and_unknown_execs(self):
+        """B44 (F2): la reverse shell apareció +54 s tarde, en otra ventana. Con el servicio en «watch»,
+        una shell o un descargador de su usuario de servicio se congela en el hilo del vigilante;
+        lo ya conocido por el perfil o fuera de «watch», jamás."""
+        from arx.modules import profile
+        ev = self._ev(unit="system.slice/web.service", exe="/usr/bin/curl",
+                      parent_exe="/usr/sbin/nginx", parent_user="www-data")
+        s = {"unit": "web.service", "execs": []}
+        profile._HOT.clear()
+        profile._HOT["system.slice/web.service"] = s  # la clave es el cgroup, como en ev["unit"]
+        self.addCleanup(profile._HOT.clear)
+        self.assertEqual(profile.hot_verdict(ev), "webshell")
+        s["execs"] = ["/usr/bin/curl"]  # ya lo conocía el perfil: nunca en caliente
+        self.assertIsNone(profile.hot_verdict(ev))
+        profile._HOT.clear()  # el servicio no está en «watch»: al barrido, como siempre
+        self.assertIsNone(profile.hot_verdict(ev))
+
+    def test_a_webshell_under_a_watched_service_is_frozen_on_the_spot(self):
+        """B44: integración con handle_pid: veredicto caliente → congelado y registrado YA."""
+        from arx.modules import profile
+        scope = {"scope": "arxconfine-4242.scope", "path": "arxconfine.slice/arxconfine-4242.scope",
+                 "set": "confined2", "pid": 4242}
+        froze = []
         for name, value in [("_is_linux_root", lambda: True), ("_can_confine", lambda: True),
                             ("_cgroup_of", lambda pid: scope["path"]),
-                            ("_adopt_into_scope", lambda pid, also=None: adopted.append(pid))]:
+                            ("_adopt_into_scope", lambda pid, also=None: dict(scope)),
+                            ("_freeze_cgroup", lambda path, on: froze.append((path, on)) or True)]:
             p = mock.patch.object(self.r, name, value)
             p.start()
             self.addCleanup(p.stop)
-        with mock.patch.object(self.x, "same_process", lambda pid, exe, start: True):
-            self.r.handle(f, enforce=True, cfg={})
-        self.assertEqual(adopted, [4242])  # el barrido no crea otro scope
-        revert = self.r._load_blocks()[0]["revert"]
-        self.assertEqual((revert["scopes"][0]["path"], revert["frozen_cgroups"]), (scope["path"], [scope["path"]]))
+        profile._HOT.clear()
+        profile._HOT["system.slice/web.service"] = {"unit": "web.service", "execs": []}
+        self.addCleanup(profile._HOT.clear)
+        self.x.set_hot_verdict(profile.hot_verdict)
+        self.addCleanup(self.x.set_hot_verdict, None)
+        with mock.patch.object(self.x, "describe", lambda pid, root: self._ev(
+                unit="system.slice/web.service", exe="/usr/bin/curl",
+                parent_exe="/usr/sbin/nginx", parent_user="www-data")), \
+                mock.patch.object(self.x, "same_process", lambda pid, exe, start: True), \
+                mock.patch.object(self.x, "freeze_family", lambda pid: []), \
+                mock.patch.object(self.x.os, "kill", lambda pid, sig: None), \
+                mock.patch.dict(self.x._state, {"confine": True}):
+            ev = self.x.handle_pid(4242, "", lambda: True)
+        self.assertTrue(ev["stopped"])
+        self.assertTrue(ev.get("handled_hot"))
+        self.assertEqual(self.r._load_blocks()[0]["revert"]["scopes"][0]["path"], scope["path"])
+        self.assertEqual(self._events({}, ev), [])  # y el barrido no lo repite
+
+    def test_what_the_watcher_froze_does_not_spend_the_brake(self):
+        """B48 (F2): el freno se gastó en la preparación y la campaña corrió en «solo observo».
+        Lo que el vigilante ya congeló se registra y es liberable sin gastar el cupo."""
+        from arx.modules import execwatch
+        noted = []
+        for name, value in [("_is_linux_root", lambda: True), ("_can_confine", lambda: False),
+                            ("_cgroup_of", lambda pid: "system.slice/app.service"),
+                            ("_note_action", lambda now=None: noted.append(now))]:
+            p = mock.patch.object(self.r, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+        f = {"kind": "unexpected_exec", "sev": "high", "detail": "x", "fp_key": "k|t|i",
+             "set": "unexpected_exec", "item": "/tmp/x",
+             "target": {"pid": 4242, "start": 7, "exe": "/tmp/x", "stopped": True}}
+        with mock.patch.object(execwatch, "same_process", lambda pid, exe, start: True):
+            o = self.r.handle(f, enforce=True, cfg={})
+        self.assertEqual(noted, [])  # congelado por el vigilante: no gasta cupo
+        self.assertIn("4242", o["status"])
+        f2 = {**f, "fp_key": "k|t|j", "item": "/tmp/y",  # la misma acción sin congelar sí que cuenta
+              "target": {"pid": 4243, "start": 7, "exe": "/tmp/y"}}
+        with mock.patch.object(execwatch, "same_process", lambda pid, exe, start: True), \
+                mock.patch.object(self.r.os, "kill", lambda pid, sig: None):
+            self.r.handle(f2, enforce=True, cfg={})
+        self.assertEqual(len(noted), 1)
 
     def test_only_arx_scopes_can_be_frozen(self):
+
         for path in ("system.slice/ssh.service", "user.slice", "arxconfine.slice/../system.slice", "/"):
             self.assertFalse(self.r._freeze_cgroup(path, True), path)
 
@@ -5751,6 +5825,31 @@ class ProvenanceTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("local", why)
 
+    STALE = """openssh-server:
+  Installed: 1:9.6p1-3ubuntu13.5
+  Candidate: 1:9.6p1-3ubuntu13.14
+  Version table:
+     1:9.6p1-3ubuntu13.14 500
+        500 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 Packages
+ *** 1:9.6p1-3ubuntu13.5 100
+        100 /var/lib/dpkg/status
+"""
+
+    def test_a_version_the_repo_no_longer_lists_is_not_a_loose_deb(self):
+        """B43 (F2): tras `apt update`, la versión instalada de openssh-server salió de las listas →
+        «paquete suelto» 0,00 eterno y ssh confinado con sesiones de administración expulsadas. Es el
+        estado normal de un host con una actualización pendiente: la firma la verificó apt al instalarla."""
+        self._patch(self.p, "_q", lambda argv, timeout=10: self.STALE)
+        self._patch(self.p, "_trusted_yes_urls", lambda: [])
+        ok, why = self.p.signed_origin("openssh-server")
+        self.assertTrue(ok)
+        self.assertIn("no longer listed", why)
+
+    def test_a_stale_version_from_a_trusted_yes_repo_is_still_not_signed(self):
+        self._patch(self.p, "_q", lambda argv, timeout=10: self.STALE)
+        self._patch(self.p, "_trusted_yes_urls", lambda: ["http://archive.ubuntu.com/ubuntu"])
+        self.assertFalse(self.p.signed_origin("openssh-server")[0])
+
     def test_a_trusted_yes_repository_is_not_signed(self):
         self._patch(self.p, "_q", lambda argv, timeout=10: self.POLICY)
         self._patch(self.p, "_trusted_yes_urls", lambda: ["http://ports.ubuntu.com/ubuntu-ports"])
@@ -6035,7 +6134,38 @@ class ConfinementTests(unittest.TestCase):
         self.assertTrue(any(c[:4] == ["nft", "delete", "element", "inet"] and c[5] == "confallow2v4" for c in self.calls))
         self.assertFalse(os.path.exists(os.path.join(d, "ssh.service.d", "91-arx-confallow.conf")))
 
+    def test_confining_again_reapplies_nothing(self):
+        """B43 (F2): cada re-evaluación del mismo servicio re-aplicaba drop-in, set-property y
+        daemon-reload — una sacudida tras otra para las sesiones vivas. Ya confinado ⇒ solo registrar."""
+        self._patch(self.r, "_confined_already", lambda set_name, cgroup: True)
+        o = self.r.handle(self._update(), enforce=True, cfg={})
+        self.assertIn("already confined", o["status"])
+        self.assertFalse(any(c[:3] == ["nft", "add", "element"] for c in self.calls))
+        self.assertFalse(any(c[:2] == ["systemctl", "set-property"] for c in self.calls))
+        self.assertEqual(len(self.r._load_blocks()), 1)  # el hallazgo también queda liberable
+
+    def test_confining_ssh_protects_the_live_sessions_first(self):
+        """B43 (F2): dos sesiones de administración expulsadas. Lo que sale del puerto de escucha de
+        sshd son siempre respuestas de sesiones entrantes: una excepción explícita las mantiene aunque
+        conntrack hubiera tomado la conexión a mitad de camino con la dirección al revés."""
+        d = tempfile.mkdtemp()
+        self._patch(self.r, "_SYSTEMD_DIR", d)
+        self._patch(self.r, "auth_backends", lambda: [("udp", "127.0.0.53", 53)])
+        self._patch(self.r, "_ssh_templates", lambda: [])
+        o = self.r.handle(self._update("ssh.service", "system.slice/ssh.service", "openssh-server=1:9.6"),
+                          enforce=True, cfg={})
+        live = ["nft", "insert", "rule", "inet", "arx", "output", "tcp", "sport", "{ 22 }", "socket",
+                "cgroupv2", "level", "2", "@confined2", "accept", "comment", "arx-ssh-live-2"]
+        confine = ["nft", "add", "element", "inet", "arx", "confined2", '{ "system.slice/ssh.service" }']
+        self.assertIn(live, self.calls)
+        self.assertIn(confine, self.calls)
+        self.assertLess(self.calls.index(live), self.calls.index(confine))  # la excepción, antes de cerrar
+        self.assertIn("open SSH sessions keep working", o["status"])
+        self.r.accept(o["fp"])
+        self.assertIn(["nft", "-a", "list", "chain", "inet", "arx", "output"], self.calls)  # unpin
+
     def test_the_backends_ssh_needs_come_from_its_configuration(self):
+
         files = {"/etc/resolv.conf": "nameserver 127.0.0.53\nnameserver 192.0.2.1\n",
                  "/etc/krb5.conf": "[realms]\n EX.COM = {\n  kdc = kdc1.ex.com\n  kdc = 192.0.2.9:750\n }\n",
                  "/etc/sssd/sssd.conf": "ldap_uri = ldaps://ldap.ex.com, ldap://192.0.2.7\n",

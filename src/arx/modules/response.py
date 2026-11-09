@@ -1625,6 +1625,53 @@ def _unpin_confinement(name: str) -> None:
     subprocess.run(["systemctl", "daemon-reload"], capture_output=True, timeout=30)
 
 
+# ── sesiones SSH ya abiertas: confinar sshd no las corta (B43) ──────────────
+_SSH_LIVE_MARK = "arx-ssh-live"
+
+
+def _pin_ssh_live(levels: set[int]) -> None:
+    """Las sesiones SSH ya abiertas sobreviven al confinamiento de sshd. Las reglas de corte piden
+    `ct direction original`, pero si conntrack tomó la conexión a mitad de camino (el módulo cargó tarde,
+    con las sesiones ya en pie) la dirección la fija el primer paquete visto — si fue uno del servidor,
+    sus paquetes casan con «original» y la sesión muere (2 expulsiones reales en la prueba F2). Lo que
+    sale del puerto de escucha de sshd son siempre respuestas de sesiones entrantes: pasa, confinado o
+    no. Nadie inicia conexiones DESDE ese puerto (lo tiene sshd en escucha), así que la excepción no abre
+    salida al servicio confinado: su tráfico nuevo usa puertos efímeros y sigue cayendo."""
+    try:
+        listing = subprocess.run(["nft", "list", "chain", "inet", "arx", "output"],
+                                 capture_output=True, text=True, timeout=15).stdout or ""
+    except (OSError, subprocess.TimeoutExpired):
+        return
+    ports = "{ " + ", ".join(str(p) for p in sorted(ssh_ports())) + " }"
+    for level in sorted(levels):
+        set_name = _CONFINE_SETS.get(level)
+        if not set_name or f"{_SSH_LIVE_MARK}-{level}" in listing:
+            continue
+        r = subprocess.run(["nft", "insert", "rule", "inet", "arx", "output", "tcp", "sport", ports,
+                            "socket", "cgroupv2", "level", str(level), f"@{set_name}", "accept",
+                            "comment", f"{_SSH_LIVE_MARK}-{level}"], capture_output=True, text=True, timeout=15)
+        if r.returncode != 0:  # un nft viejo sin `comment`: la regla importa más que su etiqueta
+            subprocess.run(["nft", "insert", "rule", "inet", "arx", "output", "tcp", "sport", ports,
+                            "socket", "cgroupv2", "level", str(level), f"@{set_name}", "accept"],
+                           capture_output=True, text=True, timeout=15)
+
+
+def _unpin_ssh_live() -> None:
+    """Fuera la excepción de sesiones vivas (ya no queda ssh confinado)."""
+    try:
+        out = subprocess.run(["nft", "-a", "list", "chain", "inet", "arx", "output"],
+                             capture_output=True, text=True, timeout=15).stdout or ""
+    except (OSError, subprocess.TimeoutExpired):
+        return
+    for line in out.splitlines():
+        if _SSH_LIVE_MARK not in line:
+            continue
+        m = re.search(r"handle (\d+)", line)
+        if m:
+            subprocess.run(["nft", "delete", "rule", "inet", "arx", "output", "handle", m.group(1)],
+                           capture_output=True, text=True, timeout=15)
+
+
 # ── ssh: sin red de salida, salvo lo que necesita para autenticar (A#1) ─────────
 _SSH_UNIT_RE = re.compile(r"^sshd?\.service$")
 _ALLOW_DROPIN = "91-arx-confallow.conf"
@@ -2033,6 +2080,7 @@ def _confine(exe: str, pids: list[int], finding: dict) -> tuple[str, dict | None
 
 def _release_confinement(revert: dict) -> str:
     done = []
+    freed_ssh = False
     for u in revert.get("units") or []:
         name = str(u.get("unit", ""))
         if not re.match(r"^[A-Za-z0-9@_.:\\-]{1,200}\.service$", name):
@@ -2041,11 +2089,15 @@ def _release_confinement(revert: dict) -> str:
         _unpin_confinement(name)
         if isinstance(u.get("allow"), list):
             _unpin_allow(name, str(u.get("path", "")), _valid_allow(u["allow"]))
+        freed_ssh = freed_ssh or bool(_SSH_UNIT_RE.match(name))
         done.append(name)
     for sc in revert.get("scopes") or []:
         _nft_cgroup("delete", str(sc.get("set")), str(sc.get("path", "")))
         done.append(f"pid {sc.get('pid')}")
+    freed_ssh = freed_ssh or bool(revert.get("templates"))
     done += _release_ssh_instances(revert.get("templates"))
+    if freed_ssh:  # si otro bloqueo sigue teniendo ssh confinado, el próximo barrido la repone
+        _unpin_ssh_live()
     for path in revert.get("frozen_cgroups") or []:  # primero descongelar el scope, luego SIGCONT
         if isinstance(path, str):
             _freeze_cgroup(path, False)
@@ -2135,7 +2187,28 @@ def _restore_confinements() -> int:
                                    capture_output=True, text=True, timeout=15)
                 if _nft_cgroup("add", _CONFINE_SETS[2], path):
                     restored += 1
+    live = set()
+    for b in _load_blocks():  # con ssh confinado, la excepción de sesiones vivas vuelve también
+        r = b.get("revert")
+        if not (isinstance(r, dict) and r.get("tool") == "confine"):
+            continue
+        if any(_SSH_UNIT_RE.match(str(u.get("unit", ""))) for u in r.get("units") or []):
+            live.add(str(next(iter(r.get("units") or []), {}).get("path", "")).count("/") + 1)
+        if r.get("templates"):
+            live.add(2)
+    if live:
+        _pin_ssh_live(live)
     return restored
+
+
+def _confined_already(set_name: str, cgroup: str) -> bool:
+    """¿Este cgroup ya está en el set? La re-aplicación (drop-in, set-property, daemon-reload de nuevo)
+    no aporta nada y cada una fue una sacudida para las sesiones vivas (B43)."""
+    try:
+        return subprocess.run(["nft", "get", "element", "inet", "arx", set_name, f'{{ "{cgroup}" }}'],
+                              capture_output=True, timeout=15).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
 
 
 def _confine_unit(unit: str, cgroup: str, finding: dict) -> tuple[str, dict | None]:
@@ -2149,21 +2222,31 @@ def _confine_unit(unit: str, cgroup: str, finding: dict) -> tuple[str, dict | No
     if not set_name or not _can_confine():
         return tr("confinement is not possible on this host: decide yourself (arx accept, or stop {unit})",
                   unit=unit), None
+    is_ssh = bool(_SSH_UNIT_RE.match(unit))
+    if _confined_already(set_name, cgroup):
+        # Ya confinado: solo se registra este hallazgo (para que también sea liberable); ni drop-ins,
+        # ni set-property, ni daemon-reload otra vez.
+        revert = {"tool": "confine", "exe": None, "units": [{"unit": unit, "path": cgroup, "set": set_name}],
+                  "scopes": []}
+        register_block(finding, revert, ttl_min=None)
+        return tr("{unit} was already confined; nothing re-applied", unit=unit), revert
     entry = {"unit": unit, "path": cgroup, "set": set_name}
-    if _SSH_UNIT_RE.match(unit):  # sin salida, pero con DNS y sus servidores de autenticación; la entrada, intacta
+    if is_ssh:  # sin salida, pero con DNS y sus servidores de autenticación; la entrada, intacta
         entry["allow"] = [list(x) for x in auth_backends()]
         if not _pin_allow(unit, cgroup, _valid_allow(entry["allow"])):
             return tr("could not prepare what {unit} needs to keep authenticating: not confined", unit=unit), None
+        _pin_ssh_live({cgroup.count("/") + 1, 2})  # antes de cerrar: las sesiones abiertas no se cortan
     _nft_cgroup("add", set_name, cgroup)
     _pin_confinement(unit, cgroup, set_name)
     revert = {"tool": "confine", "exe": None, "units": [entry], "scopes": []}
     what = unit
-    if _SSH_UNIT_RE.match(unit):  # y las conexiones por instancia, si las hay
+    if is_ssh:  # y las conexiones por instancia, si las hay
         revert["templates"] = _confine_ssh_instances(_valid_allow(entry["allow"]))
         what += "".join(f", {t['template']}@" for t in revert["templates"])
     register_block(finding, revert, ttl_min=None)
+    note = tr("; your open SSH sessions keep working") if is_ssh else ""
     return tr("confined without outbound network: {what}. It keeps running; it does not expire, "
-              "you decide", what=what), revert
+              "you decide{note}", what=what, note=note), revert
 
 
 def _freeze_cgroup(path: str, on: bool) -> bool:
@@ -2485,7 +2568,10 @@ def handle(finding: dict, enforce: bool = False, authorized: bool = False,
             status, revert = _execute_tier1(finding, cfg)
             if revert:
                 outcome["revert"] = revert
-                _note_action(now)
+                # lo que el vigilante ya congeló no gasta el freno: en una cadena de ataque, el cupo
+                # queda para lo que aún necesita decisión (B48, prueba real F2)
+                if not (finding.get("target") or {}).get("stopped"):
+                    _note_action(now)
                 if finding.get("set"):  # lo primero que quiere saber quien acaba de instalar algo
                     status += tr(" · if legitimate:  arx accept {fp}", fp=fp)
         elif tier == 2 and (blk := _active_block(fp, now) or _lock_of(finding)):
