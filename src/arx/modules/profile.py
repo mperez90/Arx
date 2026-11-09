@@ -796,20 +796,15 @@ def _unit_execs(unit: str) -> set[str]:
 
 def _exec_phase(s: dict, now: datetime, cfg: dict) -> str:
     """learn mientras se observa (o, en un servicio ya vigilado, durante su propia ventana), luego watch."""
-    return _phase(s, "exec", now, cfg)
-
-
-def _phase(s: dict, key: str, now: datetime, cfg: dict) -> str:
-    """learn / watch para un aspecto que llegó después de que el servicio ya estuviera vigilado."""
-    if s.get(f"{key}_open"):
+    if s.get("exec_open"):
         return "open"
     if s["status"] == "observing":
         return "learn"
-    if not s.get(f"{key}_until"):  # vigilado antes de existir esto: su propia ventana, con su azar
+    if not s.get("exec_until"):  # vigilado antes de existir esto: su propia ventana, con su azar
         days = float(cfg.get("profile_observe_days", OBSERVE_DAYS))
         jitter = float(cfg.get("profile_jitter_days", JITTER_DAYS))
-        s[f"{key}_until"] = _iso(now + timedelta(days=days) + timedelta(seconds=_share(s["unit"], key) * jitter * 86400))
-    return "learn" if now < _parse(s[f"{key}_until"]) else "watch"
+        s["exec_until"] = _iso(now + timedelta(days=days) + timedelta(seconds=_share(s["unit"], "exec") * jitter * 86400))
+    return "learn" if now < _parse(s["exec_until"]) else "watch"
 
 
 def _exec_known(s: dict, ev: dict, known: set) -> bool:
