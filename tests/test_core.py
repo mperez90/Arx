@@ -2967,6 +2967,33 @@ class AcceptFlowTests(unittest.TestCase):
         import hashlib
         self.assertEqual(manifest[crit]["sha256"], hashlib.sha256(b"dos\n").hexdigest())
 
+    def test_a_second_different_change_to_the_same_file_alerts_again(self):
+        """B51: la huella sin contenido condenaba al silencio la 2.ª modificación del mismo fichero:
+        ni incidente, ni pendiente, ni Telegram (prueba real F2, llave trampa 2 vueltas)."""
+        crit = os.path.join(self.d, "authorized_keys")
+        open(crit, "w").write("clave-sellada\n")
+        with mock.patch.object(self.b, "integrity_paths", lambda: {"authorized_keys_root": [crit]}), \
+             mock.patch.object(self.b, "suid_fingerprint", lambda: None):
+            self.b.save({**self.b.new_baseline(), "integrity": self.b.integrity_fingerprint()})
+            open(crit, "w").write("clave-atacante-1\n")
+            d1 = self.g._integrity_drift(self.b.load(), False)
+            self.assertEqual(len(d1), 1)
+            o1 = self.r.handle(d1[0], enforce=True, cfg={})
+            self.assertTrue(o1["new"])
+            self.assertEqual(len(self.r.list_pending()), 1)
+            # segunda vuelta, contenido DISTINTO, fichero aún sin resolver: tiene que sonar otra vez
+            open(crit, "w").write("clave-atacante-2\n")
+            d2 = self.g._integrity_drift(self.b.load(), False)
+            self.assertEqual(len(d2), 1)
+            self.assertNotEqual(self.r.fingerprint(d1[0]), self.r.fingerprint(d2[0]))
+            o2 = self.r.handle(d2[0], enforce=True, cfg={})
+            self.assertTrue(o2["new"])
+            self.assertEqual(len(self.r.list_pending()), 2)
+            # y la deduplicación sigue viva: sin cambios nuevos, el mismo drift no suena dos veces
+            o3 = self.r.handle(d2[0], enforce=True, cfg={})
+            self.assertFalse(o3["new"])
+            self.assertEqual(len(self.r.list_pending()), 2)
+
     def test_guard_notices_an_accept_without_restarting(self):
         base = {**self.b.new_baseline(), "sets": {"login_users": {}}, "meta": {**self.b.new_baseline()["meta"], "sealed": True}}
         self.b.save(base)

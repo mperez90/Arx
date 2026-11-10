@@ -97,7 +97,7 @@ def _integrity_drift(base: dict, include_suid: bool) -> list[dict]:
                 response.record({"kind": "integrity_watch_added", "detail": k})
             continue
         findings.append(_integrity_finding(k, tr("{k} appeared since the baseline was sealed", k=k),
-                                           f"integrity|apareció {k}"))
+                                           f"integrity|apareció {k}|{now[k]}"))
     if not late:
         baseline.mark_late_watches()
         base.setdefault("meta", {})["late_watches"] = True
@@ -109,14 +109,16 @@ def _integrity_drift(base: dict, include_suid: bool) -> list[dict]:
                     findings += _new_suid(known_suid)
                 else:  # base antigua, sin la lista: al menos el aviso genérico
                     findings.append(_integrity_finding(k, tr("{k} changed since the baseline was sealed", k=k),
-                                                       f"integrity|cambió {k} desde el sellado de la línea base"))
+                                                       f"integrity|cambió {k} desde el sellado de la línea base|{now[k]}"))
             continue
         if k not in now:
             findings.append(_integrity_finding(k, tr("{k} disappeared since the baseline was sealed", k=k),
                                                f"integrity|desapareció {k}"))
         elif now[k] != v:
+            # la huella lleva el contenido: si no, una 2.ª modificación distinta del mismo fichero
+            # cae en la misma entrada y queda totalmente silenciada (B51, prueba real F2)
             findings.append(_integrity_finding(k, tr("{k} changed since the baseline was sealed", k=k),
-                                               f"integrity|cambió {k} desde el sellado de la línea base"))
+                                               f"integrity|cambió {k} desde el sellado de la línea base|{now[k]}"))
     return findings
 
 
