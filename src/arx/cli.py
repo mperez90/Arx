@@ -247,6 +247,36 @@ def cmd_authorize(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_unblock(args: argparse.Namespace) -> int:
+    import getpass
+
+    from arx import config
+    from arx.modules import response
+
+    if args.query is None:
+        blocks = response.active_blocks()
+        if not blocks:
+            print(tr("No temporary blocks in force."))
+            return 0
+        print(tr("Temporary blocks in force (they lift on their own at expiry):"))
+        for b in blocks:
+            print(tr("  {fp}  {detail}  ·  {until}", fp=str(b.get("fp"))[:10],
+                     detail=b.get("detail"), until=response._until(b)))
+        print(tr("\nLift one now with:  arx unblock <ip|fp>"))
+        return 0
+    cfg = config.load_config()
+    if not cfg.get("auth_word"):
+        print(tr("No authorization word configured. Run:  arx setup"))
+        return 1
+    word = getpass.getpass(tr("Authorization word: ")).strip()
+    if not config.verify_word(word, cfg.get("auth_word", {})):
+        print(tr("Wrong word. The block stays in force."))
+        return 1
+    ok, msg = response.unblock(args.query)
+    print(("✓ " if ok else "⚠ ") + msg)
+    return 0 if ok else 1
+
+
 def cmd_unlock(args: argparse.Namespace) -> int:
     import getpass
 
@@ -450,6 +480,8 @@ def main(argv: list[str] | None = None) -> int:
     p_auth.add_argument("pending_id", nargs="?", help=tr("id to authorize (no id: list pending)"))
     p_unl = sub.add_parser("unlock", help=tr("view/unlock accounts locked by Arx"))
     p_unl.add_argument("user", nargs="?", help=tr("account to unlock (no account: list locked)"))
+    p_unb = sub.add_parser("unblock", help=tr("view/lift a temporary block (IP, port) before it expires"))
+    p_unb.add_argument("query", nargs="?", help=tr("exact IP or finding id (empty: list blocks in force)"))
     p_res = sub.add_parser("restore", help=tr("view/put back quarantined files"))
     p_res.add_argument("qid", nargs="?", help=tr("file id (no id: list the quarantine)"))
     p_vac = sub.add_parser("vaccines", help=tr("signed vaccines: what other Arx hosts learned"))
@@ -526,6 +558,7 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
     handlers = {"setup": cmd_setup, "recon": cmd_recon, "learn": cmd_learn,
                 "guard": cmd_guard, "status": cmd_status, "authorize": cmd_authorize, "unlock": cmd_unlock,
+                "unblock": cmd_unblock,
                 "restore": cmd_restore, "metrics": cmd_metrics, "vaccines": cmd_vaccines,
                 "proposals": cmd_proposals,
                 "canaries": cmd_canaries, "scan": cmd_scan, "forensics": cmd_forensics,

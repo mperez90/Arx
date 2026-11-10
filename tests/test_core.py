@@ -208,6 +208,46 @@ class ResponseTests(unittest.TestCase):
         self.assertEqual(len(self.response.expire_blocks(now=now + timedelta(minutes=61))), 1)
         self.assertEqual(self.response._load_blocks(), [])
 
+    def test_unblock_lifts_a_temporary_ip_block_now(self):
+        """F3: no había vía de operador para levantar un bloqueo IP antes de los 60 min (accept lo
+        rechazaba y el nft delete manual se auto-reponía). unblock lo revierte ya, lo registra y,
+        como al expirar, si reaparece escala al humano en vez de re-bloquear."""
+        now = datetime.now(timezone.utc)
+        self.response._save_blocks([])
+        self.response.handle({"kind": "auth_bruteforce", "sev": "high", "detail": "42 fallos ssh",
+                              "target": {"ip": "203.0.113.66"}})
+        fp = next(iter(self.response.load_findings()))
+        self.response.register_block({"kind": "auth_bruteforce", "detail": "42 fallos ssh"},
+                                     {"tool": "nft_ip", "ip": "203.0.113.66"}, ttl_min=60, now=now)
+        ran = []
+        with mock.patch.object(self.response, "_is_linux_root", lambda: True), \
+                mock.patch.object(self.response.subprocess, "run", lambda *a, **k: ran.append(a[0])):
+            ok, msg = self.response.unblock("203.0.113.66", now=now + timedelta(minutes=5))
+        self.assertTrue(ok, msg)
+        self.assertEqual(ran, [["nft", "delete", "element", "inet", "arx", "block_ipv4",
+                                "{ 203.0.113.66 }"]])
+        self.assertEqual(self.response._load_blocks(), [])
+        self.assertTrue(self.response.load_findings()[fp]["blocked_before"])  # si vuelve: escala
+        # por huella (prefijo), como accept: la que el operador ve en el listado de `arx unblock`
+        self.response.register_block({"kind": "port_scan", "detail": "scan"},
+                                     {"tool": "nft_ip", "ip": "198.51.100.7"}, ttl_min=60, now=now)
+        new_fp = self.response._load_blocks()[0]["fp"]
+        with mock.patch.object(self.response, "_is_linux_root", lambda: True), \
+                mock.patch.object(self.response.subprocess, "run", lambda *a, **k: None):
+            ok, _ = self.response.unblock(new_fp[:10])
+        self.assertTrue(ok)
+        self.assertEqual(self.response._load_blocks(), [])
+        # sin coincidencias / cuenta (eso es unlock) / ambigua
+        ok, msg = self.response.unblock("192.0.2.99")
+        self.assertFalse(ok)
+        self.assertIn("bloqueo", msg)
+        self.response._save_blocks([{"fp": "aaa111", "detail": "cuenta",
+                                     "revert": {"tool": "usermod", "user": "u", "uid": 1000},
+                                     "expires_at": None}])
+        ok, msg = self.response.unblock("aaa")
+        self.assertFalse(ok)
+        self.assertIn("unlock", msg)
+
 
 class RedactTests(unittest.TestCase):
     def setUp(self):
@@ -4139,6 +4179,39 @@ class ExecWatchTests(unittest.TestCase):
         self.assertTrue(found[0]["harm"])  # ruta temporal y oculta: se congelará
         self.assertEqual(found[0]["target"]["pid"], 4242)
 
+    def test_an_accepted_shell_no_longer_sounds_as_a_webshell(self):
+        """B56: el barrido evaluaba «webshell» antes de lo aprendido: aceptar el bash de un servicio
+        web no blindaba nada y re-disparaba (y congelaba) a los minutos (prueba real F3, u24).
+        La vía caliente ya honraba lo aceptado; ahora el barrido también."""
+        web = dict(unit="system.slice/app.service", exe="/usr/bin/bash",
+                   parent_exe="/usr/sbin/nginx", parent_user="www-data")
+        self.assertTrue(self.x.webshell(self._ev(**web)))
+        found = self._events(self._subjects(), self._ev(**web))
+        self.assertEqual([(f["kind"], f["sev"]) for f in found], [("unexpected_exec", "high")])
+        self.assertIn("started /usr/bin/bash as www-data", found[0]["detail"])  # sin aceptar: suena
+        self.assertEqual(self._events(self._subjects(execs=["/usr/bin/bash"]), self._ev(**web)), [])
+        # y un servicio sin perfil (nada que aceptar) sigue sonando
+        self.assertEqual(len(self._events({}, self._ev(**web))), 1)
+
+    def test_a_recent_exec_names_an_ephemeral_reader_after_it_died(self):
+        """B57: un cat del señuelo vive ms: cuando fanotify entrega el open, /proc ya no lo tiene y
+        filewatch descartaba el evento (3 lecturas, 0 incidentes en F3). El exec visto al nacer por
+        netlink lo nombra hasta 2 min después; fuera de ventana, no."""
+        ev = {"pid": 4242, "start": 777, "exe": "/usr/bin/cat", "unit": "system.slice/web.service"}
+        self.x._remember(4242, ev)
+        self.addCleanup(self.x._recent.clear)
+        got = self.x.recent_exec(4242)
+        self.assertEqual(got["exe"], "/usr/bin/cat")
+        got["file"] = "/home/u/.ssh/id_rsa"  # es una copia: no contamina el evento original
+        self.assertNotIn("file", self.x._recent[4242][1])
+        self.assertIsNone(self.x.recent_exec(9999))
+        self.x._recent[4242] = (time.monotonic() - self.x.RECENT_TTL_S - 1, ev)
+        self.assertIsNone(self.x.recent_exec(4242))
+        self.x._recent.clear()
+        with mock.patch.object(self.x, "describe", lambda pid, root: self._ev()):
+            self.assertIsNotNone(self.x.handle_pid(4242, "", lambda: False))
+        self.assertEqual(self.x.recent_exec(4242)["pid"], 4242)  # el listener lo deja nombrado
+
     def test_a_new_child_from_a_verified_package_only_alerts_unless_it_is_an_attack_tool(self):
         """Ruido: un servicio que estrena una herramienta de su paquete no se ve aislado; curl o bash, sí."""
         child = dict(unit="system.slice/app.service", parent_exe="/usr/sbin/app", parent_user="app")
@@ -4711,6 +4784,23 @@ class InjectedLibraryAndSensitiveFileTests(unittest.TestCase):
         self.assertFalse(self.p._suspect_lib("/usr/lib/x86_64-linux-gnu/libc.so.6 (deleted)", learned))  # tras apt upgrade
         self.assertFalse(self.p._suspect_lib("/usr/local/lib/python3.12/dist-packages/numpy/linalg/_b.so", learned))
         self.assertTrue(self.p._suspect_lib("/opt/evil/libx.so", learned))
+
+    def test_an_ephemeral_reader_of_a_sensitive_file_is_named_by_its_recent_exec(self):
+        """B57: `cat` del señuelo muere en ms: describe() ya no lo veía y el evento se descartaba
+        (3 lecturas, 0 incidentes, F3). Con el exec reciente como respaldo, la lectura cuenta."""
+        from arx.modules import execwatch
+        ev = {"pid": 4242, "start": 1, "exe": "/usr/bin/cat", "unit": "system.slice/app.service",
+              "user": "www-data"}
+        self.f._events.clear()
+        self.addCleanup(self.f._events.clear)
+        with mock.patch.object(execwatch, "describe", lambda pid, root: None), \
+                mock.patch.object(execwatch, "recent_exec", lambda pid: dict(ev)):
+            got = self.f._record(4242, "/home/u/.ssh/id_rsa", "")
+        self.assertEqual(got["file"], "/home/u/.ssh/id_rsa")
+        self.assertIn(got, list(self.f._events))
+        with mock.patch.object(execwatch, "describe", lambda pid, root: None), \
+                mock.patch.object(execwatch, "recent_exec", lambda pid: None):
+            self.assertIsNone(self.f._record(4242, "/home/u/.ssh/id_rsa", ""))  # sin respaldo: nada
 
     def _subjects(self, status):
         return {"system.slice/app.service": {"unit": "app.service", "status": status, "dest": {}, "extensions": [],
@@ -7319,6 +7409,61 @@ class IntegrityGroupTests(unittest.TestCase):
         self.assertEqual([f["target"]["file"] for f in found], ["apt_keys"])  # ya no: un repositorio nuevo
         found = self._drift({"passwd": "a"}, {"passwd": "a", "authorized_keys_root": "x"}, late=False)
         self.assertEqual([f["target"]["file"] for f in found], ["authorized_keys_root"])  # nunca se adopta
+
+
+class ProfileSetMigrationTests(unittest.TestCase):
+    """B54: los sets creados por Arx ≤0.0.8rc2 (cgroupv2 sin «level 2») no matchean por jerarquía;
+    setup() los tira (reglas por handle + set) y los recrea — nft no cambia el typeof de un set vivo."""
+
+    OLD = ('table inet arx {\n'
+           '\tset denied4 {\n'
+           '\t\ttypeof socket cgroupv2 . meta l4proto . ip daddr . th dport\n'
+           '\t\tflags dynamic,timeout\n'
+           '\t\ttimeout 1d\n'
+           '\t}\n'
+           '\tchain output {\n'
+           '\t\ttype filter hook output priority filter; policy accept;\n'
+           '\t}\n'
+           '}\n')
+    CHAIN_A = ('table inet arx {\n\tchain output {\n'
+               '\t\tmeta oifname != "lo" ct state new socket cgroupv2 level 2 @watched2 socket cgroupv2 '
+               'level 2 . meta l4proto . ip daddr . th dport != @ok4 add @denied4 { socket cgroupv2 '
+               'level 2 . meta l4proto . ip daddr . th dport } drop # handle 42\n\t}\n}\n')
+    EMPTY = ('table inet arx {\n\tchain output {\n'
+             '\t\ttype filter hook output priority filter; policy accept;\n\t}\n}\n')
+
+    def setUp(self):
+        _isolate()
+        from arx.modules import profile, response
+        self.p = profile
+        self.cmds = []
+        p = mock.patch.object(response, "_nft_setup", lambda: True)
+        p.start()
+        self.addCleanup(p.stop)
+        p = mock.patch.object(profile, "_nft", lambda *a: self.cmds.append(a) or True)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _setup(self, listing, chain_a=""):
+        def nft_out(*a):
+            if a[0] == "-a":
+                return chain_a
+            migrated = any(c[:1] == ("delete",) and "set" in c for c in self.cmds)
+            return self.EMPTY if migrated else listing
+        with mock.patch.object(self.p, "_nft_out", nft_out):
+            return self.p.setup()
+
+    def test_sets_from_an_old_arx_are_recreated_hierarchical(self):
+        self.assertTrue(self._setup(self.OLD, self.CHAIN_A))
+        self.assertIn(("delete", "rule", "inet", "arx", "output", "handle", "42"), self.cmds)
+        self.assertIn(("delete", "set", "inet", "arx", "denied4"), self.cmds)
+        add = [c for c in self.cmds if c[:3] == ("add", "set", "inet") and c[4] == "denied4"]
+        self.assertTrue(add and "level" in add[0])  # recreado ya con level 2
+
+    def test_current_sets_are_not_touched(self):
+        fresh = self.OLD.replace("typeof socket cgroupv2 .", "typeof socket cgroupv2 level 2 .")
+        self.assertTrue(self._setup(fresh, self.CHAIN_A))
+        self.assertFalse([c for c in self.cmds if c[0] == "delete"])
 
 
 class ArxDropinRecognitionTests(unittest.TestCase):

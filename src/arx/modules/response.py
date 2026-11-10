@@ -533,6 +533,51 @@ def _lock_of(finding: dict) -> dict | None:
     return next((b for b in _load_blocks() if _is_account_lock(b) and b["revert"].get("user") == user), None)
 
 
+def active_blocks(now=None) -> list[dict]:
+    """Los bloqueos temporales vigentes (IP, puerto): lo que `arx unblock` puede levantar ya.
+    Los que no caducan solos (cuenta, confinamiento) van por unlock/accept, no por aquí."""
+    now = now or _now()
+    return [b for b in _load_blocks() if not _holds_until_human(b)
+            and not ((exp := _parse_dt(b.get("expires_at"))) and exp <= now)]
+
+
+def unblock(query: str, now=None) -> tuple[bool, str]:
+    """Levanta YA un bloqueo temporal por IP exacta o por huella (prefijo, como accept).
+    Lo decide una persona; si reaparece, ya no se re-bloquea solo: escala al humano (como al expirar)."""
+    now = now or _now()
+    with config.locked():
+        blocks = _load_blocks()
+        try:
+            ip = str(ipaddress.ip_address(str(query)))
+            hits = [b for b in blocks if not _holds_until_human(b)
+                    and isinstance(b.get("revert"), dict) and str(b["revert"].get("ip") or "") == ip]
+        except ValueError:
+            hits = [b for b in blocks if not _holds_until_human(b)
+                    and str(b.get("fp") or "").startswith(str(query))]
+        if not hits:
+            held = [b for b in blocks if _holds_until_human(b)
+                    and (str(b.get("fp") or "").startswith(str(query))
+                         or str((b.get("revert") or {}).get("ip") or "") == str(query))]
+            if held:
+                return False, tr("that one does not expire on its own: lift it with arx unlock "
+                                 "(account) or arx accept (confinement)")
+            return False, tr("no block in force matches {q}", q=query)
+        if len(hits) > 1:
+            return False, tr("several blocks match {q}: be more specific", q=query)
+        b = hits[0]
+        done = _apply_revert(b.get("revert")) if _is_linux_root() else None
+        if _is_linux_root() and done is None:
+            return False, tr("the revert of that block is not valid: it stays in force")
+        blocks.remove(b)
+        _save_blocks(blocks)
+        st = load_findings()
+        if b.get("fp") in st:
+            st[b["fp"]]["blocked_before"] = True
+            _save_findings(st)
+    record({"kind": "block_lifted", "detail": b.get("detail"), "by": "operator", "reverted": done})
+    return True, tr("block lifted: {detail}", detail=b.get("detail"))
+
+
 def _active_block(fp: str, now=None) -> dict | None:
     now = now or _now()
     for b in _load_blocks():

@@ -387,6 +387,30 @@ ES = {
         "Arx no tiene bloqueada la cuenta '{user}'.",
     "Wrong word. The account stays locked.":
         "Palabra incorrecta. La cuenta sigue bloqueada.",
+    "No temporary blocks in force.":
+        "No hay bloqueos temporales en vigor.",
+    "Temporary blocks in force (they lift on their own at expiry):":
+        "Bloqueos temporales en vigor (se levantan solos al caducar):",
+    "  {fp}  {detail}  ·  {until}":
+        "  {fp}  {detail}  ·  {until}",
+    "\nLift one now with:  arx unblock <ip|fp>":
+        "\nLevanta uno ya con:  arx unblock <ip|huella>",
+    "Wrong word. The block stays in force.":
+        "Palabra incorrecta. El bloqueo sigue en vigor.",
+    "that one does not expire on its own: lift it with arx unlock (account) or arx accept (confinement)":
+        "ese no caduca solo: se levanta con arx unlock (cuenta) o arx accept (confinamiento)",
+    "no block in force matches {q}":
+        "ningún bloqueo en vigor coincide con {q}",
+    "several blocks match {q}: be more specific":
+        "varios bloqueos coinciden con {q}: sé más concreto",
+    "the revert of that block is not valid: it stays in force":
+        "la reversión de ese bloqueo no es válida: sigue en vigor",
+    "block lifted: {detail}":
+        "bloqueo levantado: {detail}",
+    "view/lift a temporary block (IP, port) before it expires":
+        "ver/levantar un bloqueo temporal (IP, puerto) antes de que caduque",
+    "exact IP or finding id (empty: list blocks in force)":
+        "IP exacta o id de hallazgo (vacío: lista los bloqueos en vigor)",
     "⚠ {done}. The account stays locked.":
         "⚠ {done}. La cuenta sigue bloqueada.",
     "Quarantined files (evidence preserved, 0600, root only):":

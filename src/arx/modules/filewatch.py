@@ -64,8 +64,22 @@ def _mark(libc, fd: int) -> None:
         libc.fanotify_mark(fd, FAN_MARK_ADD, FAN_OPEN, AT_FDCWD, path.encode())
 
 
-def _listen(libc, fd: int, root: str) -> None:
+def _record(pid: int, path: str, root: str) -> dict | None:
     from arx.modules import execwatch
+    if pid == os.getpid() or not path:
+        return None
+    ev = execwatch.describe(pid, root)  # solo procesos de un servicio; las sesiones no cuentan
+    if not ev:
+        # el lector efímero (un cat del señuelo vive ms) ya murió: su exec reciente lo nombra (B57, F3)
+        ev = execwatch.recent_exec(pid)
+    if not ev:
+        return None
+    ev["file"] = path
+    _events.append(ev)
+    return ev
+
+
+def _listen(libc, fd: int, root: str) -> None:
     marked = time.monotonic()
     while True:
         if time.monotonic() - marked > MARK_EVERY_S:
@@ -85,12 +99,7 @@ def _listen(libc, fd: int, root: str) -> None:
                 path = ""
             finally:
                 os.close(efd)
-            if pid == os.getpid() or not path:
-                continue
-            ev = execwatch.describe(pid, root)  # solo procesos de un servicio; las sesiones no cuentan
-            if ev:
-                ev["file"] = path
-                _events.append(ev)
+            _record(pid, path, root)
 
 
 def start() -> bool:

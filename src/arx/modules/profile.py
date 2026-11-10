@@ -130,6 +130,27 @@ def _nft_out(*args: str) -> str:
 # ── kernel: la pista, la lista permitida y el corte ──────────────────────────
 _KEY = ["socket", "cgroupv2", "level", "2", ".", "meta", "l4proto", "."]
 
+_STALE_SET_RE = re.compile(r"set (seen4|seen6|denied4|denied6|ok4|ok6|watched2) \{\s*\n\s*typeof "
+                           r"socket cgroupv2(?! level)")
+
+
+def _migrate_stale_sets(listing: str) -> bool:
+    """Un set creado por Arx ≤0.0.8rc2 lleva cgroupv2 sin «level 2»: no matchea por jerarquía (B54,
+    u24 con los sets de una versión vieja). nft no cambia el typeof de un set vivo: se tiran las
+    reglas que lo nombran y el set, y setup() los recrea ya jerárquicos. False = nada que migrar."""
+    stale = set(_STALE_SET_RE.findall(listing))
+    if not stale:
+        return False
+    chain = _nft_out("-a", "list", "chain", "inet", "arx", "output")
+    for line in chain.splitlines():
+        handle = re.search(r"handle (\d+)\s*$", line)
+        if handle and any(f"@{name}" in line for name in stale):
+            _nft("delete", "rule", "inet", "arx", "output", "handle", handle.group(1))
+    for name in sorted(stale):
+        if not _nft("delete", "set", "inet", "arx", name):
+            return False  # quedó una referencia: se reintenta en el próximo arranque
+    return True
+
 
 def setup() -> bool:
     """Sets y reglas. Aparte del resto: sin soporte de cgroups en nft, el host no pierde lo demás."""
@@ -137,6 +158,8 @@ def setup() -> bool:
     if not response._nft_setup():
         return False
     listing = _nft_out("list", "table", "inet", "arx")
+    if _migrate_stale_sets(listing):
+        listing = _nft_out("list", "table", "inet", "arx")
     output = response._nft_chain(listing, "output")
     cmds = []
     for fam, addr in (("4", "ip"), ("6", "ip6")):
@@ -941,7 +964,13 @@ def _exec_events(subjects: dict, now: datetime, cfg: dict, st: dict | None = Non
                 seen.append(item)
             continue
         s = subjects.get(ev["unit"])
-        why = "sshd" if ev.get("preauth") else "webshell" if execwatch.webshell(ev) else None
+        if ev.get("preauth"):
+            why = "sshd"
+        elif execwatch.webshell(ev):
+            # lo aceptado por una persona no vuelve a sonar: la vía caliente ya lo honraba (B56, F3)
+            why = None if s and _exec_known(s, ev, set(s.get("execs") or [])) else "webshell"
+        else:
+            why = None
         if not why and s and not (_EXEC_FREE.match(s["unit"]) or _OBSERVE_ONLY.match(s["unit"])):
             phase = _exec_phase(s, now, cfg)
             known = set(s.setdefault("execs", []))

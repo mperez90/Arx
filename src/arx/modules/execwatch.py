@@ -53,6 +53,25 @@ _state = {"mode": None, "lost": 0}
 _allow = {"at": 0.0, "paths": set(), "sure": False}
 _declared: dict = {}  # (pid, inicio) de comandos declarados: lo que ejecuten en sí mismos sigue siendo suyo
 _seen: set = set()
+_recent: dict = {}  # pid → (monotonic, ev): un exec reciente, para quien llega cuando el proceso ya murió
+RECENT_TTL_S = 120  # un lector efímero (cat de un señuelo) muere en ms; dos minutos sobran (B57)
+
+
+def _remember(pid: int, ev: dict) -> None:
+    _recent[pid] = (time.monotonic(), ev)
+    if len(_recent) > 4096:
+        cutoff = time.monotonic() - RECENT_TTL_S
+        for k in [k for k, (t, _) in _recent.items() if t < cutoff]:
+            del _recent[k]
+
+
+def recent_exec(pid: int) -> dict | None:
+    """El exec reciente de un pid ya muerto (un cat del señuelo vive ms: a fanotify le llega el open
+    cuando /proc ya no lo tiene — B57, prueba real F3). Copia: quien consulta añade sus campos."""
+    hit = _recent.get(pid)
+    if not hit or time.monotonic() - hit[0] > RECENT_TTL_S:
+        return None
+    return dict(hit[1])
 
 
 # ── el conector de procesos ──────────────────────────────────────────────────
@@ -632,6 +651,7 @@ def handle_pid(pid: int, root: str, enforce, ts: int | None = None) -> dict | No
     ev = describe(pid, root)
     if not ev:
         return None
+    _remember(pid, ev)  # nace vivo por netlink: si muere en ms, quien llegue tarde aún lo identifica
     ev["preauth"] = sshd_preauth(ev)
     ev["sure"] = sshd_sure() if ev["preauth"] else True
     hot = None
@@ -697,6 +717,7 @@ def _scan(root: str) -> list[dict]:
         if not ev or (pid, ev["start"]) in _seen:
             continue
         _seen.add((pid, ev["start"]))
+        _remember(pid, ev)  # igual que en el hilo: un efímero visto vivo en este barrido queda nombrado
         ev["preauth"] = sshd_preauth(ev)
         ev["sure"] = sshd_sure() if ev["preauth"] else True
         out.append(ev)
