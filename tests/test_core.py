@@ -7415,9 +7415,11 @@ class ProfileSetMigrationTests(unittest.TestCase):
     """B54: los sets creados por Arx ≤0.0.8rc2 (cgroupv2 sin «level 2») no matchean por jerarquía;
     setup() los tira (reglas por handle + set) y los recrea — nft no cambia el typeof de un set vivo."""
 
+    # Renderizado literal de «nft list table inet arx» en u24 (regresión RC3): nft añade «level 0».
     OLD = ('table inet arx {\n'
            '\tset denied4 {\n'
-           '\t\ttypeof socket cgroupv2 . meta l4proto . ip daddr . th dport\n'
+           '\t\ttypeof socket cgroupv2 level 0 . meta l4proto . ip daddr . th dport\n'
+           '\t\tsize 65535\n'
            '\t\tflags dynamic,timeout\n'
            '\t\ttimeout 1d\n'
            '\t}\n'
@@ -7461,7 +7463,7 @@ class ProfileSetMigrationTests(unittest.TestCase):
         self.assertTrue(add and "level" in add[0])  # recreado ya con level 2
 
     def test_current_sets_are_not_touched(self):
-        fresh = self.OLD.replace("typeof socket cgroupv2 .", "typeof socket cgroupv2 level 2 .")
+        fresh = self.OLD.replace("typeof socket cgroupv2 level 0 .", "typeof socket cgroupv2 level 2 .")
         self.assertTrue(self._setup(fresh, self.CHAIN_A))
         self.assertFalse([c for c in self.cmds if c[0] == "delete"])
 

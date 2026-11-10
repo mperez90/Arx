@@ -131,7 +131,7 @@ def _nft_out(*args: str) -> str:
 _KEY = ["socket", "cgroupv2", "level", "2", ".", "meta", "l4proto", "."]
 
 _STALE_SET_RE = re.compile(r"set (seen4|seen6|denied4|denied6|ok4|ok6|watched2) \{\s*\n\s*typeof "
-                           r"socket cgroupv2(?! level)")
+                           r"socket cgroupv2(?! level 2)")  # nft renderiza el viejo como «level 0» (B54)
 
 
 def _migrate_stale_sets(listing: str) -> bool:
