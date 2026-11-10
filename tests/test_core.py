@@ -4094,6 +4094,16 @@ class ExecWatchTests(unittest.TestCase):
         self.assertFalse(self.x.webshell(self._ev(**{**web, "parent_user": "root"})))  # logs por tubería al arrancar
         self.assertFalse(self.x.webshell(self._ev(**web, exe="/usr/bin/php8.3")))
 
+    def test_a_python_or_ruby_app_server_is_also_a_webshell_parent(self):
+        """B52: Flask/Django/Rails sirven la web desde python/ruby; sin ellos en el regex, el veredicto
+        webshell no existía para el stack más común (prueba real F2, web-demo en python3)."""
+        for parent in ("/usr/bin/python3", "/usr/local/bin/python3.12", "/usr/bin/ruby3.1", "/usr/bin/perl"):
+            web = dict(unit="system.slice/web.service", parent_exe=parent, parent_user="www-data")
+            self.assertTrue(self.x.webshell(self._ev(**web)), parent)
+        # pero un python3 de root (administración) NO es un servidor web
+        self.assertFalse(self.x.webshell(self._ev(unit="system.slice/x.service",
+                                                  parent_exe="/usr/bin/python3", parent_user="root")))
+
     def test_sshd_is_frozen_on_the_spot_only_in_enforce(self):
         kills = []
         for enforce in (True, False):
@@ -4210,9 +4220,49 @@ class ExecWatchTests(unittest.TestCase):
                                                           parent_exe="/usr/sbin/app", exe="/tmp/x", parent_user="app"))[0]
         self.r.handle(harmful, enforce=True, cfg={})
         self.assertIn((4343, signal.SIGSTOP), kills)
-        with mock.patch.object(self.x, "same_process", lambda pid, exe, start: False):
+        with mock.patch.object(self.x, "same_process", lambda pid, exe, start: False), \
+                mock.patch.object(self.x, "exe_now_if_same_birth", lambda pid, start: None):
             gone = {**f, "fp_key": "otro", "target": {**f["target"], "pid": 5000}}
             self.assertIn("no longer alive", self.r.handle(gone, enforce=True, cfg={})["status"])
+
+    def test_an_exec_transition_does_not_save_the_flagged_process(self):
+        """B52: `bash -c 'sleep 60'` hace exec en el mismo pid en microsegundos; la contención
+        apuntaba al exe de nacimiento, veía «proceso ya no vivo» y el comando completaba su minuto."""
+        import signal
+        kills, scopes = [], []
+        for obj, name, value in [(self.r, "_is_linux_root", lambda: True),
+                                 (self.r, "_can_confine", lambda: True),
+                                 (self.r, "_cgroup_of", lambda pid: "system.slice/app.service"),
+                                 (self.r, "_freeze_cgroup", lambda path, on: True),
+                                 (self.r, "_adopt_into_scope", lambda pid, also=None: scopes.append(pid) or {
+                                     "scope": f"arxconfine-{pid}.scope",
+                                     "path": f"arxconfine.slice/arxconfine-{pid}.scope",
+                                     "set": "confined2", "pid": pid}),
+                                 (self.x, "same_process", lambda pid, exe, start: False),  # ya no corre bash…
+                                 (self.x, "exe_now_if_same_birth", lambda pid, start: "/usr/bin/sleep"),  # …corre sleep
+                                 (self.x, "freeze_family", lambda pid: []),
+                                 (self.r.os, "kill", lambda pid, sig: kills.append((pid, sig)))]:
+            p = mock.patch.object(obj, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+        f = self._events(self._subjects(), self._ev(unit="system.slice/app.service", pid=4242, start=900,
+                                                    exe="/usr/bin/bash", parent_user="app"))[0]
+        f["harm"] = True
+        o = self.r.handle(f, enforce=True, cfg={})
+        self.assertIn((4242, signal.SIGSTOP), kills)
+        self.assertIn("re-exec'd as /usr/bin/sleep", o["status"])
+        blk = self.r._load_blocks()[0]
+        self.assertEqual(blk["revert"]["exe"], "/usr/bin/sleep")  # el SIGCONT compara contra lo que corre AHORA
+        self.assertEqual(scopes, [4242])
+
+    def test_exe_now_if_same_birth_distinguishes_exec_transition_from_pid_reuse(self):
+        with mock.patch.object(self.x, "_stat", lambda pid: (1, 900)), \
+                mock.patch.object(self.x.os, "readlink", lambda path: "/usr/bin/sleep"):
+            self.assertEqual(self.x.exe_now_if_same_birth(4242, 900), "/usr/bin/sleep")
+        with mock.patch.object(self.x, "_stat", lambda pid: (1, 901)):  # otro inicio: pid reutilizado
+            self.assertIsNone(self.x.exe_now_if_same_birth(4242, 900))
+        with mock.patch.object(self.x, "_stat", lambda pid: None):  # muerto
+            self.assertIsNone(self.x.exe_now_if_same_birth(4242, 900))
 
     def test_what_it_already_started_is_frozen_too(self):
         """Lab xz: `sh -c` crea su hijo en menos de un milisegundo; congelar solo al padre no basta."""

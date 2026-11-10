@@ -201,6 +201,8 @@ ES = {
         "pid {pid} ({exe}) sin red",
     "pid {pid} suspended":
         "pid {pid} congelado",
+    "it had already re-exec'd as {exe}: the transition did not save it":
+        "ya había hecho exec a {exe}: la transición no lo salvó",
     " · it does not expire, you decide":
         " · no caduca, decides tú",
     "{unit}: {pkg} {version} was just updated; no outbound network while its trust is checked":

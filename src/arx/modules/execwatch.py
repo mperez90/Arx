@@ -165,6 +165,21 @@ def same_process(pid: int, exe: str, start: int) -> bool:
         return False
 
 
+def exe_now_if_same_birth(pid: int, start: int) -> str | None:
+    """El exe actual si (pid, inicio) sigue siendo el mismo proceso, aunque haya hecho exec.
+
+    `bash -c 'sleep 60'` hace exec en el mismo pid en microsegundos: un exe distinto con el mismo
+    inicio no es otro proceso (la reutilización de pid cambia el inicio), es el señalado con otro
+    programa — la transición no lo salva (B52, prueba real F2)."""
+    st = _stat(pid)
+    if not st or st[1] != start:
+        return None
+    try:
+        return os.readlink(f"/proc/{pid}/exe").removesuffix(" (deleted)")
+    except OSError:
+        return None
+
+
 # ── reglas ───────────────────────────────────────────────────────────────────
 SSHD_CONFIG = "/etc/ssh/sshd_config"
 _COMMAND_KEYS = ("authorizedkeyscommand", "authorizedprincipalscommand")
@@ -566,8 +581,13 @@ def freeze_family(pid: int) -> list[dict]:
 
 
 def _freeze(ev: dict) -> bool:
-    if ev["pid"] in (os.getpid(), 1) or not same_process(ev["pid"], ev["exe"], ev["start"]):
+    if ev["pid"] in (os.getpid(), 1):
         return False
+    if not same_process(ev["pid"], ev["exe"], ev["start"]):
+        current = exe_now_if_same_birth(ev["pid"], ev["start"]) if isinstance(ev.get("start"), int) else None
+        if not current:
+            return False
+        ev["execed_to"] = current  # hizo exec antes del SIGSTOP: se congela lo que corre ahora
     try:
         os.kill(ev["pid"], signal.SIGSTOP)
     except OSError:

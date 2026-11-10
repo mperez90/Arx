@@ -2277,8 +2277,14 @@ def _contain_process(target: dict, finding: dict) -> tuple[str, dict | None]:
     pid, start, exe = target.get("pid"), target.get("start"), str(target.get("exe") or "")
     if not (isinstance(pid, int) and pid > 1 and pid != os.getpid() and isinstance(start, int) and exe.startswith("/")):
         return tr("invalid process: nothing contained"), None
+    transitioned = False
     if not execwatch.same_process(pid, exe, start):
-        return tr("the process is no longer alive: nothing to suspend"), None
+        # transición exec (bash -c 'sleep 60' hace exec en el mismo pid): mismo (pid, inicio) =
+        # mismo proceso con otro programa; se contiene lo que corre ahora (B52, prueba real F2)
+        current = execwatch.exe_now_if_same_birth(pid, start)
+        if not current:
+            return tr("the process is no longer alive: nothing to suspend"), None
+        exe, transitioned = current, True
     if "arx.service" in (_cgroup_of(pid) or ""):
         return tr("critical process ({base})", base="arx"), None
     stopped = bool(target.get("stopped"))
@@ -2312,6 +2318,8 @@ def _contain_process(target: dict, finding: dict) -> tuple[str, dict | None]:
     parts = [tr("pid {pid} ({exe}) without network", pid=pid, exe=exe)] if scope else []
     if stopped:
         parts.append(tr("pid {pid} suspended", pid=pid))
+    if transitioned:
+        parts.append(tr("it had already re-exec'd as {exe}: the transition did not save it", exe=exe))
     return " · ".join(parts) + tr(" · it does not expire, you decide"), revert
 
 

@@ -43,12 +43,14 @@ _RISKY_DROPIN_KEYS = re.compile(r"^\s*(?:Exec[A-Za-z]*|Environment(?:File)?|User
                                 r"CapabilityBoundingSet)\s*=\s*\S", re.M)
 _UNIT_RE = re.compile(r"^[A-Za-z0-9@_.:\\-]{1,200}\.service$")
 _SUSPECT_DIRS = ("/tmp/", "/dev/shm/", "/var/tmp/", "/run/user/")
-# Quien atiende la red: un programa desconocido que nace de ellos es la firma de una webshell
+# Quien atiende la red: un programa desconocido que nace de ellos es la firma de una webshell.
+# python/ruby/perl son los servidores de aplicación más comunes (Flask, Django, Rails): sin ellos,
+# un servicio web servido por python nunca recibe veredicto webshell (B52, prueba real F2).
 _NET_USERS = {"www-data", "nginx", "apache", "http", "httpd", "nobody", "tomcat", "jetty", "caddy",
               "lighttpd", "nginx-unit", "php-fpm"}
 _NET_PARENT_RE = re.compile(r"^(?:nginx|apache2|httpd|lighttpd|caddy|php-fpm[0-9.]*|php[0-9.]*|"
                             r"uwsgi|gunicorn|tomcat[0-9]*|java|node|unitd|haproxy|postgres|"
-                            r"mysqld|mariadbd|redis-server|mongod)$")
+                            r"mysqld|mariadbd|redis-server|mongod|python[0-9.]*|ruby[0-9.]*|perl[0-9.]*)$")
 
 _cache: dict = {}
 
