@@ -6808,6 +6808,27 @@ class BehaviorWatchTests(unittest.TestCase):
         self.assertEqual(self._sweep(11.02, enforce=True), [])
         self.assertEqual(self.p.load()["reported"], {})
 
+    def test_a_dropin_written_by_an_older_arx_is_rewritten(self):
+        """B55: el drop-in con ExecStartPre sin «+» (Arx ≤0.0.8rc2) no elevaba a root y fallaba en
+        servicios con User=; el barrido lo reescribe solo al texto actual."""
+        d = tempfile.mkdtemp()
+        with mock.patch.object(self.p, "SYSTEMD_DIR", d):
+            self._sweep(0)
+            self._sweep(11, enforce=True)
+            self.pinned.clear()
+            old = self.p.dropin_text(str(self.p._files_dir() / "sshd.service.nft")).replace(
+                "ExecStartPre=-+", "ExecStartPre=-")
+            os.makedirs(os.path.join(d, "sshd.service.d"))
+            with open(os.path.join(d, "sshd.service.d", self.p.DROPIN), "w", encoding="utf-8") as f:
+                f.write(old)
+            self._sweep(11.01, enforce=True)
+            self.assertIn("system.slice/sshd.service", self.pinned)
+            self.pinned.clear()
+            with open(os.path.join(d, "sshd.service.d", self.p.DROPIN), "w", encoding="utf-8") as f:
+                f.write(self.p.dropin_text(str(self.p._files_dir() / "sshd.service.nft")))
+            self._sweep(11.02, enforce=True)
+            self.assertEqual(self.pinned, [])  # ya al día: no se toca
+
     def test_observe_mode_only_says_what_it_would_cut(self):
         self._sweep(0)
         self._sweep(11)
@@ -7321,6 +7342,24 @@ class ArxDropinRecognitionTests(unittest.TestCase):
         cpath = "/etc/systemd/system/x.service.d/90-arx-confine.conf"
         self.assertTrue(self.v._is_arx_dropin(cpath, confine))
         self.assertFalse(self.v._is_arx_dropin(cpath, confine + "ExecStart=/tmp/evil\n"))
+
+    def test_the_profile_dropin_runs_its_pre_start_as_root(self):
+        """B55: con User=www-data, ExecStartPre hereda ese usuario: no lee el .nft (dir 0700 root)
+        ni abre netlink sin CAP_NET_ADMIN, y el servicio arranca sin su lista cargada (prueba real
+        F2, restart de web-demo en u24). El prefijo «+» eleva solo este comando a root."""
+        text = self.p.dropin_text("/var/lib/arx/profiles/web-demo.service.nft")
+        self.assertIn("ExecStartPre=-+", text)
+        self.assertNotIn("ExecStartPre=-/usr", text)
+
+    def test_the_pre_plus_dropin_format_is_still_recognized(self):
+        """El drop-in sin «+» lo escribió Arx ≤0.0.8rc2: no puede volverse «sospechoso» al
+        actualizar el paquete (B55); el barrido lo migrará, pero mientras tanto es de Arx."""
+        unit = "nginx.service"
+        path = f"/etc/systemd/system/{unit}.d/90-arx-profile.conf"
+        old = self.p.dropin_text(str(self.p._files_dir() / f"{unit}.nft")).replace(
+            "ExecStartPre=-+", "ExecStartPre=-")
+        self.assertTrue(self.v._is_arx_dropin(path, old))
+        self.assertFalse(self.v._is_arx_dropin(path, old.replace(".nft", ".sh")))
 
 
 if __name__ == "__main__":

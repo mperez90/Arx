@@ -617,8 +617,11 @@ def nft_text(path: str, s: dict) -> str:
 
 def dropin_text(file: str) -> str:
     nft = shutil.which("nft") or "/usr/sbin/nft"
+    # «-» el fallo no impide el arranque (la tabla puede no existir aún en el boot);
+    # «+» corre como root: con User=www-data el ExecStartPre heredaría ese usuario y no
+    # podría leer el archivo (dir 0700) ni tocar nft sin CAP_NET_ADMIN (B55, prueba real F2)
     return ("# Arx: behavior watch. Do not edit; arx service uninstall removes it.\n"
-            f"[Service]\nExecStartPre=-{nft} -f {file}\n")
+            f"[Service]\nExecStartPre=-+{nft} -f {file}\n")
 
 
 def _pin(path: str, s: dict) -> bool:
@@ -759,6 +762,15 @@ def sweep(enforce: bool = False, cfg: dict | None = None, now: datetime | None =
             elif enforce and s.get("enforced") and _cgroup_exists(path) and \
                     not _nft("get", "element", "inet", "arx", "watched2", f'{{ "{path}" }}'):
                 _nft("-f", str(_files_dir() / f"{s['unit']}.nft"))  # un flush o un reinicio sin la tabla
+            if s.get("enforced"):
+                dropin = os.path.join(SYSTEMD_DIR, f"{s['unit']}.d", DROPIN)
+                try:
+                    with open(dropin, encoding="utf-8", errors="replace") as f:
+                        stale = f.read() != dropin_text(str(_files_dir() / f"{s['unit']}.nft"))
+                except OSError:
+                    stale = False
+                if stale:
+                    _pin(path, s)  # drop-in escrito por otra versión de Arx (sin «+», B55): se migra solo
         if enforce:
             # un servicio que intentó salir y se reinició antes de este barrido sale como número: el
             # corte ya ocurrió, pero el aviso no se puede perder

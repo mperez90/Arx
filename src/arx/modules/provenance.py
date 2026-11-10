@@ -288,7 +288,9 @@ def _is_arx_dropin(path: str, text: str) -> bool:
     from arx.modules import profile  # perezoso: profile importa este módulo
     name, unit = os.path.basename(path), os.path.basename(os.path.dirname(path))[:-2]
     if name == profile.DROPIN:
-        return text == profile.dropin_text(str(profile._files_dir() / f"{unit}.nft"))
+        want = profile.dropin_text(str(profile._files_dir() / f"{unit}.nft"))
+        # el formato sin «+» lo escribió Arx ≤0.0.8rc2 (B55): sigue siendo de Arx hasta el re-pin
+        return text == want or text == want.replace("ExecStartPre=-+", "ExecStartPre=-")
     return name == "90-arx-confine.conf" and bool(_ARX_CONFINE_DROPIN.match(text))
 
 
