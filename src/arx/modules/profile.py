@@ -46,6 +46,7 @@ EXTEND_MAX_FACTOR = 3
 LATE_SHARE = 0.2      # un destino nuevo en el último tramo: el comportamiento aún no se ha asentado
 OPEN_DIVERSITY = 64   # redes distintas a partir de las cuales el perfil es por puertos
 ID_HISTORY = 8        # cgroups recientes de cada servicio, para nombrarlo aunque ya se haya reiniciado
+REPORTED_DEDUP_S = 24 * 3600  # como el timeout del elemento nft: el mismo corte no se repite en un día
 MAX_LIBS = 200
 LIBS_PER_SWEEP = 4    # servicios cuyas librerías se aprenden por barrido (dpkg -S por fichero cuesta)
 PREVENTIVE_MAX = 3    # servicios afectados por una actualización hasta los que se corta mientras se prueba
@@ -762,12 +763,23 @@ def sweep(enforce: bool = False, cfg: dict | None = None, now: datetime | None =
             # un servicio que intentó salir y se reinició antes de este barrido sale como número: el
             # corte ya ocurrió, pero el aviso no se puede perder
             by_id = {i: p for p, s in subjects.items() for i in s.get("ids") or []}
+            alive = set()
             for fam in ("4", "6"):
                 for cg, proto, ip, port in _elements(f"denied{fam}"):
                     path = cg if cg in subjects else by_id.get(cg) or (cg if cg.isdigit() else None)
-                    if path and f"{path}|{proto}|{ip}|{port}" not in reported:
-                        reported[f"{path}|{proto}|{ip}|{port}"] = _iso(now)
+                    if not path:
+                        continue
+                    key = f"{path}|{proto}|{ip}|{port}"
+                    alive.add(key)
+                    last = _parse(reported.get(key) or "")
+                    # la deduplicación caduca como el elemento nft (1 día): el mismo corte hoy no se
+                    # repite; al día siguiente vuelve a ser noticia (B53, prueba real F2)
+                    if not last or (now - last).total_seconds() >= REPORTED_DEDUP_S:
+                        reported[key] = _iso(now)
                         findings.append(_finding_denied(path, proto, ip, port, enforced=True))
+            for key in list(reported):  # el elemento ya no está en nft: fuera la entrada muerta
+                if key not in alive:
+                    del reported[key]
         # el veredicto en caliente del vigilante (B44): servicios vigilados, sin cron/ssh ni observados
         from arx.modules import execwatch
         execwatch.set_hot_verdict(hot_verdict)

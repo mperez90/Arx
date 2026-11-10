@@ -6785,6 +6785,29 @@ class BehaviorWatchTests(unittest.TestCase):
         self.assertIn("a watched service that has restarted since tried to reach 203.0.113.67", found[1]["detail"])
         self.assertEqual(self._sweep(11.02, enforce=True), [])
 
+    def test_the_same_cut_a_day_later_is_news_again(self):
+        """B53: la deduplicación de reported no caducaba nunca: la revancha del escenario de exfil
+        (mismo servicio, mismo destino, al día siguiente) no generó incidente (prueba real F2)."""
+        self._sweep(0)
+        self._sweep(11, enforce=True)
+        self.sets["denied4"] = 'elements = { "system.slice/sshd.service" . tcp . 203.0.113.66 . 4444 timeout 1d }'
+        found = self._sweep(11.01, enforce=True)
+        self.assertEqual([f["kind"] for f in found], ["egress_profile"])
+        self.assertEqual(self._sweep(11.02, enforce=True), [])  # el mismo día: deduplicado
+        found = self._sweep(12.02, enforce=True)  # al día siguiente: vuelve a sonar
+        self.assertEqual([f["kind"] for f in found], ["egress_profile"])
+
+    def test_a_reported_entry_is_forgotten_when_its_element_expires(self):
+        """La entrada de reported vive lo que vive el elemento en nft: si no, crece sin fin."""
+        self._sweep(0)
+        self._sweep(11, enforce=True)
+        self.sets["denied4"] = 'elements = { "system.slice/sshd.service" . tcp . 203.0.113.66 . 4444 timeout 1d }'
+        self._sweep(11.01, enforce=True)
+        self.assertEqual(len(self.p.load()["reported"]), 1)
+        self.sets["denied4"] = ""  # el elemento expiró en nft
+        self.assertEqual(self._sweep(11.02, enforce=True), [])
+        self.assertEqual(self.p.load()["reported"], {})
+
     def test_observe_mode_only_says_what_it_would_cut(self):
         self._sweep(0)
         self._sweep(11)
