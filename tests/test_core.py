@@ -583,6 +583,27 @@ class NotifyTests(unittest.TestCase):
         self.assertTrue(res["telegram"].startswith("error"))
         self.assertEqual(len(calls), 1)  # un 4xx no se arregla reintentando
 
+    def test_a_bounded_alert_gives_every_channel_a_turn_and_preserves_time_to_record(self):
+        """B60: dos canales lentos no pueden consumir el timeout de systemd antes de persistir resultados."""
+        now = [0.0]
+        calls = []
+
+        def slow(url, payload, timeout=15):
+            calls.append((url, timeout))
+            now[0] += timeout
+            raise TimeoutError("slow channel")
+
+        with mock.patch.object(self.notify, "_post", slow), \
+                mock.patch.object(self.notify.time, "monotonic", lambda: now[0]), \
+                mock.patch.object(self.notify.time, "sleep", lambda seconds: now.__setitem__(0, now[0] + seconds)):
+            res = self.notify.send("hola", self.cfg, budget_s=45)
+        self.assertEqual(now[0], 45)
+        self.assertEqual(set(res), {"telegram", "webhook"})
+        self.assertTrue(all(v.startswith("error:") for v in res.values()))
+        self.assertEqual([url.split("/bot")[0] for url, _ in calls].count("https://api.telegram.org"), 2)
+        self.assertEqual(sum("hook.example" in url for url, _ in calls), 2)
+        self.assertTrue(all(0 < timeout <= 15 for _, timeout in calls))
+
 
 class StateIOTests(unittest.TestCase):
     def setUp(self):
@@ -4212,6 +4233,18 @@ class ExecWatchTests(unittest.TestCase):
             self.assertIsNotNone(self.x.handle_pid(4242, "", lambda: False))
         self.assertEqual(self.x.recent_exec(4242)["pid"], 4242)  # el listener lo deja nombrado
 
+    def test_an_exec_already_gone_before_describe_cannot_be_attributed(self):
+        """F4/B59: si /proc ya no existe al recibir el PID de netlink, no hay exe, cgroup ni nacimiento
+        que rescatar. El evento se pierde también para _recent; el test fija este límite, no una detección."""
+        self.x._events.clear()
+        self.x._recent.clear()
+        self.addCleanup(self.x._events.clear)
+        self.addCleanup(self.x._recent.clear)
+        with mock.patch.object(self.x, "describe", lambda pid, root: None):
+            self.assertIsNone(self.x.handle_pid(4242, "", lambda: False))
+        self.assertEqual(list(self.x._events), [])
+        self.assertIsNone(self.x.recent_exec(4242))
+
     def test_a_new_child_from_a_verified_package_only_alerts_unless_it_is_an_attack_tool(self):
         """Ruido: un servicio que estrena una herramienta de su paquete no se ve aislado; curl o bash, sí."""
         child = dict(unit="system.slice/app.service", parent_exe="/usr/sbin/app", parent_user="app")
@@ -4529,6 +4562,74 @@ class ExecWatchTests(unittest.TestCase):
         self.assertIn("/usr/local/bin/akc2", self.p.load()["sshd_allowed"])
         self.assertFalse(self.p.accept_exec("system.slice/system-sshd.slice/../x.service|/x"))
 
+    def test_an_exec_accepted_by_another_process_counts_before_the_next_sweep(self):
+        """F4: `arx accept` corre en otro proceso. _HOT es una copia del último barrido; sin releer
+        el perfil, un bash ya aceptado vuelve a congelarse si se ejecuta antes del barrido siguiente."""
+        from arx import config
+        config.write_json(self.p._state_path(), {"subjects": self._subjects()})
+        self.p._HOT.clear()
+        self.p._HOT.update(self._subjects())  # la copia caliente todavía no conoce la aceptación
+        self.addCleanup(self.p._HOT.clear)
+        ev = self._ev(unit="system.slice/app.service", exe="/usr/bin/bash",
+                      parent_exe="/usr/sbin/nginx", parent_user="www-data")
+        self.assertEqual(self.p.hot_verdict(ev), "webshell")
+        self.assertTrue(self.p.accept_exec("system.slice/app.service|/usr/bin/bash"))
+        self.assertIsNone(self.p.hot_verdict(ev))
+
+    def test_hot_acceptance_honours_exact_directory_and_children_scopes_with_negative_controls(self):
+        """B58: la recarga entre procesos no puede limitarse al exec exacto ni blanquear rutas hermanas."""
+        from arx import config
+        config.write_json(self.p._state_path(), {"subjects": self._subjects()})
+        self.p._HOT.clear()
+        self.p._HOT.update(self._subjects())
+        self.addCleanup(self.p._HOT.clear)
+        web = dict(unit="system.slice/app.service", parent_exe="/usr/sbin/nginx", parent_user="www-data")
+
+        exact = self._ev(**web, exe="/usr/bin/bash")
+        self.assertEqual(self.p.hot_verdict(exact), "webshell")
+        self.assertTrue(self.p.accept_exec("system.slice/app.service|/usr/bin/bash"))
+        self.assertIsNone(self.p.hot_verdict(exact))
+        self.assertEqual(self.p.hot_verdict(self._ev(**web, exe="/usr/bin/curl")), "webshell")
+
+        self.assertTrue(self.p.accept_exec("system.slice/app.service|/opt/app/tools/bash", "dir"))
+        self.assertIsNone(self.p.hot_verdict(self._ev(**web, exe="/opt/app/tools/curl")))
+        self.assertEqual(self.p.hot_verdict(self._ev(**web, exe="/opt/app/other/curl")), "webshell")
+
+        child = self._ev(**web, exe="/usr/bin/curl")
+        self.assertEqual(self.p.hot_verdict(child), "webshell")
+        self.assertTrue(self.p.accept_exec("system.slice/app.service|/usr/sbin/nginx", "children"))
+        self.assertIsNone(self.p.hot_verdict(child))
+        self.assertEqual(self.p.hot_verdict(self._ev(**{**web, "parent_exe": "/usr/sbin/apache2"},
+                                                     exe="/usr/bin/wget")), "webshell")
+
+    def test_hot_profile_cache_uses_file_identity_and_fails_closed_on_missing_or_bad_json(self):
+        """B58: una copia sin cambios se reutiliza; rename a igual mtime, borrado o JSON malo no dan confianza."""
+        from arx import config
+        config.write_json(self.p._state_path(), {"subjects": self._subjects()})
+        self.p._HOT.clear()
+        self.p._HOT.update(self._subjects())
+        self.addCleanup(self.p._HOT.clear)
+        self.p._HOT_DISK.update(path=None, stamp=None, subjects={})
+        self.addCleanup(self.p._HOT_DISK.update, path=None, stamp=None, subjects={})
+        ev = self._ev(unit="system.slice/app.service", exe="/usr/bin/bash",
+                      parent_exe="/usr/sbin/nginx", parent_user="www-data")
+        original_load = self.p.load
+        with mock.patch.object(self.p, "load", wraps=original_load) as load:
+            self.assertEqual(self.p.hot_verdict(ev), "webshell")
+            self.assertEqual(self.p.hot_verdict(ev), "webshell")
+            self.assertEqual(load.call_count, 1)
+            st = os.stat(self.p._state_path())
+            self.assertTrue(self.p.accept_exec("system.slice/app.service|/usr/bin/bash"))
+            os.utime(self.p._state_path(), ns=(st.st_atime_ns, st.st_mtime_ns))  # mismo mtime: inode nuevo igualmente
+            load.reset_mock()  # la escritura de accept también consulta el estado: medir solo la vía caliente
+            self.assertIsNone(self.p.hot_verdict(ev))
+            self.assertEqual(load.call_count, 1)
+        os.unlink(self.p._state_path())
+        self.p._HOT.update(self._subjects())  # la copia caliente vuelve a no conocer la aceptación
+        self.assertEqual(self.p.hot_verdict(ev), "webshell")
+        open(self.p._state_path(), "w").write("{bad json")
+        self.assertEqual(self.p.hot_verdict(ev), "webshell")
+
     def test_an_accepted_sshd_command_counts_at_the_next_login_without_waiting(self):
         """A#11 (lab Debian 13): `arx accept` corre en otro proceso; sin esto, cada login hasta el barrido
         siguiente se congelaba otra vez. En el camino caliente, solo un stat."""
@@ -4630,18 +4731,62 @@ class SelfProtectionTests(unittest.TestCase):
     def test_stopping_arx_runs_a_report(self):
         self.assertIn("ExecStopPost=-/usr/bin/arx service stopped", self.s.unit_text("/usr/bin/arx"))
 
-    def test_if_systemd_gives_up_it_alerts_and_retries_only_after_a_failure(self):
-        """DEC#11: sin ser la primera víctima de la presión de memoria; caído, se avisa y se reintenta."""
+    def test_on_failure_reports_the_real_restart_state_and_keeps_the_revive_policy(self):
+        """B61: OnFailure también corre con auto-restart; no equivale a StartLimit agotado."""
         unit = self.s.unit_text("/usr/bin/arx")
         self.assertIn("OOMScoreAdjust=0", unit)
         self.assertIn("OnFailure=arx-down.service", unit)
-        self.assertIn("ExecStart=/usr/bin/arx service down", self.s.down_unit_text("/usr/bin/arx"))
+        self.assertIn("TimeoutStopSec=90", unit)
+        down_unit = self.s.down_unit_text("/usr/bin/arx")
+        self.assertIn("ExecStart=/usr/bin/arx service down", down_unit)
+        self.assertIn("TimeoutStartSec=90", down_unit)
+        self.assertNotIn("gave up restarting", down_unit)
         revive = self.s.revive_unit_text()
         self.assertIn("is-failed -q arx.service", revive.split("ExecStart")[0])  # una parada a mano no se deshace
         self.assertIn("OnUnitActiveSec=15min", self.s.revive_timer_text())
-        sent = []
-        self.s.down(notify_send=sent.append)
-        self.assertIn("Arx is down", sent[0])
+
+        cases = [
+            ("scheduled", "ActiveState=activating\nSubState=auto-restart\nResult=oom-kill\nNRestarts=1\n",
+             "restart 1 is scheduled in 10 seconds"),
+            ("recovered", "ActiveState=active\nSubState=running\nResult=success\nNRestarts=1\n",
+             "has already recovered"),
+            ("exhausted", "ActiveState=failed\nSubState=failed\nResult=start-limit-hit\nNRestarts=10\n",
+             "restart limit is exhausted"),
+            ("failed", "ActiveState=failed\nSubState=failed\nResult=exit-code\nNRestarts=0\n",
+             "remains failed without evidence that the restart limit was exhausted"),
+            ("unknown", "", "restart state is unknown"),
+        ]
+        from arx.modules import response
+        for expected, stdout, phrase in cases:
+            with self.subTest(state=expected):
+                class R:
+                    returncode = 0
+                R.stdout = stdout
+                sent = []
+                with mock.patch.object(self.s.subprocess, "run", return_value=R()), \
+                        mock.patch.object(response, "record") as record:
+                    self.s.down(notify_send=lambda text: sent.append(text) or {"telegram": "ok"})
+                incident = record.call_args_list[0].args[0]
+                self.assertEqual(incident["kind"], "self_down")
+                self.assertEqual(incident["sev"], "crit")
+                self.assertEqual(incident["restart_state"], expected)
+                self.assertIn(phrase, incident["detail"])
+                self.assertIn(phrase, sent[0])
+                self.assertNotIn("gave up restarting", incident["detail"])
+                self.assertEqual(record.call_args_list[1].args[0]["results"], {"telegram": "ok"})
+        self.assertEqual(incident["restart_state"], "unknown")
+        self.assertIsNone(incident["restarts"])
+
+    def test_an_active_unit_wins_over_a_stale_start_limit_result(self):
+        """B61: un Result viejo jamás convierte un Arx que ya corre en caída terminal."""
+        from arx.modules import response
+        class R:
+            returncode = 0
+            stdout = "ActiveState=active\nSubState=running\nResult=start-limit-hit\nNRestarts=10\n"
+        with mock.patch.object(self.s.subprocess, "run", return_value=R()), \
+                mock.patch.object(response, "record") as record:
+            self.s.down(notify_send=lambda text: {})
+        self.assertEqual(record.call_args_list[0].args[0]["restart_state"], "recovered")
 
     def test_an_untouched_arx_says_nothing(self):
         self.assertEqual(self._check(), [])
@@ -4682,8 +4827,69 @@ class SelfProtectionTests(unittest.TestCase):
             self.s.stopped(env, notify_send=sent.append)
         self.assertEqual(len(sent), 2)
         from arx.modules import response
-        log = open(response._incidents_path()).read()
-        self.assertEqual(log.count("self_stopped"), 3)  # lo planificado no se anota; el apagado, sí (sin avisar)
+        import json
+        with open(response._incidents_path()) as f:
+            entries = [json.loads(line) for line in f]
+        self.assertEqual(sum(e.get("kind") == "self_stopped" for e in entries), 3)  # planificada no; apagado, sí
+        self.assertEqual(sum(e.get("kind") == "notify_result" for e in entries), 2)  # ni planificada ni apagado
+
+    def test_the_stop_notification_result_is_kept_for_every_channel_outcome(self):
+        """F4/C3: un envío «ok», un error ya redactado y la ausencia de canales deben quedar en evidencia."""
+        from arx.modules import response
+        env = {"SERVICE_RESULT": "success", "EXIT_CODE": "exited", "EXIT_STATUS": "0"}
+
+        class R:
+            stdout = "running\n"
+
+        for results in ({"telegram": "ok"}, {"telegram": "error: [REDACTED]"}, {}):
+            with self.subTest(results=results):
+                with (mock.patch.object(self.s.subprocess, "run", lambda *a, **k: R()),
+                      mock.patch.object(response, "record") as record):
+                    self.s.stopped(env, notify_send=lambda text: results)
+                entries = [call.args[0] for call in record.call_args_list]
+                self.assertEqual(entries[0]["kind"], "self_stopped")
+                self.assertEqual(entries[1], {"kind": "notify_result", "sev": "info",
+                                              "event": "self_stopped", "results": results})
+
+    def test_the_down_notification_result_is_kept_too(self):
+        from arx.modules import response
+        results = {"telegram": "ok"}
+        with mock.patch.object(response, "record") as record:
+            self.s.down(notify_send=lambda text: results)
+        entries = [call.args[0] for call in record.call_args_list]
+        self.assertEqual(entries[0]["kind"], "self_down")
+        self.assertEqual(entries[1], {"kind": "notify_result", "sev": "info",
+                                      "event": "self_down", "results": results})
+
+    def test_notification_results_round_trip_through_jsonl_without_nested_secrets(self):
+        """B60: evidencia real, no solo mocks; un canal ok no oculta el error redactado del otro."""
+        from arx import config, redact
+        from arx.modules import response
+        token = "123456789:AAH-bot-secret-token-xyz"
+        config.save_secrets({"telegram_bot_token": token})
+        results = {"telegram": "ok", "webhook": f"error: https://user:{token}@hook.invalid/ timed out"}
+        self.s._notify_and_record("self_stopped", "Arx stopped", notify_send=lambda text: results)
+        raw = open(response._incidents_path(), encoding="utf-8").read()
+        self.assertNotIn(token, raw)
+        entry = json.loads(raw.splitlines()[-1])
+        self.assertEqual(entry["kind"], "notify_result")
+        self.assertEqual(entry["event"], "self_stopped")
+        self.assertEqual(entry["results"]["telegram"], "ok")
+        self.assertIn(redact.REDACTED, entry["results"]["webhook"])
+        self.assertNotIn(token, entry["results"]["webhook"])
+
+    def test_nested_secrets_are_redacted_at_the_incident_writer_boundary(self):
+        """La frontera de persistencia protege también futuros resultados anidados, no solo notify."""
+        from arx import config, redact
+        from arx.modules import response
+        token = "123456789:AAH-bot-secret-token-xyz"
+        config.save_secrets({"telegram_bot_token": token})
+        response.record({"kind": "test", "results": {"channels": [{"detail": token}], "ok": True}})
+        raw = open(response._incidents_path(), encoding="utf-8").read()
+        self.assertNotIn(token, raw)
+        entry = json.loads(raw)
+        self.assertEqual(entry["results"]["channels"][0]["detail"], redact.REDACTED)
+        self.assertTrue(entry["results"]["ok"])
 
 
 class DnsWatchTests(unittest.TestCase):

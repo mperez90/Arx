@@ -147,12 +147,20 @@ ES = {
         "para un programa que lanzó un servicio: aceptar también lo que lance",
     " (frozen {ms} ms after it started)":
         " (congelado {ms} ms después de arrancar)",
-    "Arx is down: systemd gave up restarting it":
-        "Arx está caído: systemd dejó de reiniciarlo",
-    "🛑 Arx is down on {host}: systemd gave up restarting it. It will try again every 15 minutes; check: journalctl -u arx":
-        "🛑 Arx está caído en {host}: systemd dejó de reiniciarlo. Lo volverá a intentar cada 15 minutos; revisa: journalctl -u arx",
-    "report that systemd gave up restarting Arx (systemd runs it)":
-        "avisar de que systemd dejó de reiniciar Arx (lo ejecuta systemd)",
+    "systemd restart {n} is scheduled in 10 seconds after {result}; arx-revive.timer retries every 15 minutes only while Arx remains failed":
+        "systemd tiene programado el reinicio {n} en 10 segundos tras {result}; arx-revive.timer lo reintenta cada 15 minutos solo mientras Arx siga fallando",
+    "Arx has already recovered after {result}; systemd reports it active":
+        "Arx ya se ha recuperado tras {result}; systemd lo marca activo",
+    "Arx is down: the systemd restart limit is exhausted after {n} restarts ({result}); arx-revive.timer will retry every 15 minutes":
+        "Arx está caído: systemd agotó el límite de reinicios tras {n} intentos ({result}); arx-revive.timer lo reintentará cada 15 minutos",
+    "Arx remains failed without evidence that the restart limit was exhausted ({result}); arx-revive.timer will retry every 15 minutes":
+        "Arx sigue fallando sin evidencia de que se haya agotado el límite de reinicios ({result}); arx-revive.timer lo reintentará cada 15 minutos",
+    "Arx failed, but its systemd restart state is unknown; check: systemctl status arx && journalctl -u arx":
+        "Arx falló, pero se desconoce el estado de reinicio de systemd; revisa: systemctl status arx && journalctl -u arx",
+    "🛑 Arx failure on {host}: {detail}":
+        "🛑 Fallo de Arx en {host}: {detail}",
+    "report Arx's real systemd restart state (systemd runs it)":
+        "informar del estado real de reinicio de Arx en systemd (lo ejecuta systemd)",
     "sshd's configuration could not be read with certainty: alert only, nothing frozen":
         "la configuración de sshd no se pudo leer con certeza: solo se avisa, no se congela nada",
     "Arx's unit {path} was changed or removed":

@@ -72,9 +72,15 @@ def muted(now: float | None = None) -> bool:
 RETRY_WAITS = (2, 5)  # VPS real: un «Connection reset by peer» suelto perdía la alerta (B42)
 
 
-def _deliver(fn) -> None:
-    """Un corte transitorio (reset, timeout, 5xx, 429) se reintenta; un 4xx (token o chat mal), no."""
+def _deliver(fn, deadline: float | None = None) -> None:
+    """Un corte transitorio (reset, timeout, 5xx, 429) se reintenta; un 4xx (token o chat mal), no.
+
+    Con plazo, ni otra espera ni otro intento pueden cruzarlo: el llamador necesita tiempo para
+    persistir el resultado antes de que systemd termine su unit.
+    """
     for wait in (*RETRY_WAITS, None):
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError("notification deadline exceeded")
         try:
             return fn()
         except urllib.error.HTTPError as e:
@@ -83,25 +89,49 @@ def _deliver(fn) -> None:
         except (urllib.error.URLError, TimeoutError, OSError):
             if wait is None:
                 raise
+        if deadline is not None and time.monotonic() + wait >= deadline:
+            raise TimeoutError("notification deadline exceeded")
         time.sleep(wait)
 
 
-def send(text: str, cfg: dict | None = None, post=_post) -> dict:
-    """Envía `text` (redactado) por todos los canales. Devuelve {canal: ok|error}."""
+def send(text: str, cfg: dict | None = None, post=None, budget_s: float | None = None) -> dict:
+    """Envía `text` (redactado) por todos los canales. Devuelve {canal: ok|error}.
+
+    `budget_s` reparte el tiempo restante entre los canales pendientes; el transporte real recibe
+    ese resto como timeout de socket. Así un canal lento no deja al siguiente sin intento ni al
+    llamador sin margen para escribir la evidencia.
+    """
+    post = _post if post is None else post
     n = settings(cfg)
     text = redact.scrub(text)[:3900]  # límite de Telegram: 4096
     host = socket.gethostname()
     results: dict = {}
-    for ch in channels(cfg):
+    pending = channels(cfg)
+    deadline = time.monotonic() + max(0.0, budget_s) if budget_s is not None else None
+    for index, ch in enumerate(pending):
+        channel_deadline = None
+        if deadline is not None:
+            now = time.monotonic()
+            channel_deadline = now + max(0.0, deadline - now) / (len(pending) - index)
         try:
             if ch == "telegram":
                 token = config.load_secrets()["telegram_bot_token"]
                 url = f"{n.get('telegram_api') or 'https://api.telegram.org'}/bot{token}/sendMessage"
                 body = {"chat_id": n["telegram_chat_id"], "text": f"🛡 Arx · {host}\n{text}",
                         "disable_web_page_preview": True}
-                _deliver(lambda: post(url, body))
             else:
-                _deliver(lambda: post(n["webhook_url"], {"source": "arx", "host": host, "text": text}))
+                url = n["webhook_url"]
+                body = {"source": "arx", "host": host, "text": text}
+
+            def attempt():
+                if post is _post:
+                    timeout = 15
+                    if channel_deadline is not None:
+                        timeout = max(0.05, min(15, channel_deadline - time.monotonic()))
+                    return post(url, body, timeout=timeout)
+                return post(url, body)  # transportes inyectados en pruebas conservan su firma
+
+            _deliver(attempt, channel_deadline)
             results[ch] = "ok"
         except (urllib.error.URLError, TimeoutError, OSError, KeyError, ValueError) as e:
             # el error puede contener la URL con el token del bot → redactar también

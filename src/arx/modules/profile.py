@@ -899,17 +899,39 @@ def _exec_known(s: dict, ev: dict, known: set) -> bool:
 
 # Unidades en vigilancia cuyas shells/descargadores se paran al instante (B44). Lo renueva cada barrido.
 _HOT: dict = {}
+_HOT_DISK = {"path": None, "stamp": None, "subjects": {}}
+
+
+def _hot_subject_now(path: str) -> dict | None:
+    """El perfil en disco cuando la copia del barrido aún no conoce un exec. `arx accept` corre en otro
+    proceso: antes de congelar, un stat y, solo si cambió, una lectura evitan repetir esa alarma (F4)."""
+    state = _state_path()
+    try:
+        st = os.stat(state)
+        # write_json reemplaza el archivo: mtime solo pierde un rename que conserve tiempos. La identidad
+        # completa evita congelar de nuevo un exec aceptado desde otro proceso en esa carrera.
+        stamp = (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+    except OSError:
+        return None
+    if _HOT_DISK.get("path") != str(state) or _HOT_DISK.get("stamp") != stamp:
+        subjects = (load().get("subjects") or {})
+        _HOT_DISK.update(path=str(state), stamp=stamp, subjects=subjects)
+    return _HOT_DISK["subjects"].get(path)
 
 
 def hot_verdict(ev: dict) -> str | None:
     """Veredicto en caliente para execwatch: una shell o un descargador lanzado por un servicio de red ya
     vigilado se congela al instante — una reverse shell no espera al próximo barrido (B44, prueba real F2).
-    Solo lo que el barrido también cazaría; lo ya conocido por el perfil, nunca."""
+    Solo lo que el barrido también cazaría; lo ya conocido por el perfil o recién aceptado, nunca."""
     from arx.modules import execwatch
-    s = _HOT.get(ev.get("unit") or "")
+    unit = ev.get("unit") or ""
+    s = _HOT.get(unit)
     if not s or not execwatch.webshell(ev):
         return None
-    return None if _exec_known(s, ev, set(s.get("execs") or [])) else "webshell"
+    if _exec_known(s, ev, set(s.get("execs") or [])):
+        return None
+    current = _hot_subject_now(unit)
+    return None if current and _exec_known(current, ev, set(current.get("execs") or [])) else "webshell"
 
 
 def _verified(exe: str) -> bool:

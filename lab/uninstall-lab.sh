@@ -64,12 +64,13 @@ v bash -c 'mkdir -p /etc/systemd/system/arx.service.d && printf "[Service]\nEnvi
 check "un drop-in ajeno en su unit da alerta crítica" wait_for 60 incident "someone added drop-ins to Arx"
 v bash -c 'rm -rf /etc/systemd/system/arx.service.d; systemctl daemon-reload; systemctl restart arx'
 
-step "si systemd deja de reiniciarlo: aviso de caído y relanzamiento (DEC#11)"
+step "fallo con reinicio programado, agotamiento real y relanzamiento (B61/DEC#11)"
 check "el relanzador está programado" v systemctl is-active -q arx-revive.timer
 v bash -c 'mv /var/lib/arx/baseline.json /root/baseline.lab && systemctl restart arx'   # sin base sellada: sale con error
+check "el primer fallo dice reinicio programado, no agotamiento" wait_for 30 incident '"restart_state": "scheduled"'
 failed() { v systemctl is-failed -q arx; }
 check "tras los reintentos, systemd lo da por caído" wait_for 240 failed
-check "y se avisa: Arx caído" wait_for 30 incident "self_down"
+check "el estado terminal sí declara StartLimit agotado" wait_for 30 incident '"restart_state": "exhausted"'
 v bash -c 'mv /root/baseline.lab /var/lib/arx/baseline.json && systemctl start arx-revive.service'
 check "el relanzador lo vuelve a arrancar" wait_for 30 v systemctl is-active -q arx
 v systemctl stop arx

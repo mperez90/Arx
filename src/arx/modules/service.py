@@ -54,7 +54,7 @@ After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=600
 StartLimitBurst=10
-# if systemd gives up restarting it: a critical alert, and arx-revive.timer tries again every 15 min
+# every failure runs this, including a scheduled restart: arx-down records the real systemd state
 OnFailure=arx-down.service
 
 [Service]
@@ -62,6 +62,8 @@ Type=simple
 ExecStart={exec_start} guard{' --enforce' if enforce else ''}
 # Whoever stops Arx gets reported outside the host (unless it is Arx's own uninstall, or a shutdown).
 ExecStopPost=-{exec_start} service stopped
+# Alerts have a 45 s total budget; the rest is margin to persist every channel result.
+TimeoutStopSec=90
 Restart=always
 RestartSec=10
 # Arx never takes the host down: capped and at low priority. MemoryMax already keeps it from starving the
@@ -113,12 +115,13 @@ WantedBy=sysinit.target
 
 def down_unit_text(exec_start: str) -> str:
     return f"""[Unit]
-Description=Arx - report that systemd gave up restarting it
+Description=Arx - report its real systemd restart state
 
 [Service]
 Type=oneshot
 ExecStart={exec_start} service down
-TimeoutStartSec=60
+# notify.send gets 45 s in total; keep ample margin for JSONL persistence and slow storage.
+TimeoutStartSec=90
 """
 
 
@@ -255,14 +258,88 @@ def _tamper(detail: str, key: str) -> dict:
             "why": tr("someone changed Arx itself: it may be an attempt to blind it"), "fp_key": f"self_tamper|{key}"}
 
 
+NOTIFY_BUDGET_S = 45
+
+
+def _notify_and_record(event: str, text: str, notify_send=None) -> None:
+    """Conserva el resultado por canal sin sustituir el incidente crítico que motivó el aviso.
+
+    «ok» acredita que el canal aceptó el envío local, no que una persona lo haya leído. El presupuesto
+    deja margen para escribir todos los resultados; response.record redacta también valores anidados.
+    """
+    from arx import notify
+    from arx.modules import response
+    try:
+        results = notify_send(text) if notify_send is not None else notify.send(text, budget_s=NOTIFY_BUDGET_S)
+    except Exception as e:  # avisar nunca puede impedir registrar el incidente ni romper ExecStopPost
+        results = {"notifier": f"error: {e}"}
+    if not isinstance(results, dict):
+        results = {"notifier": "error: notifier returned no per-channel result"}
+    response.record({"kind": "notify_result", "sev": "info", "event": event, "results": results})
+
+
+def _restart_status() -> dict:
+    """Estado real de arx.service al entrar en OnFailure; ninguna ausencia de datos se inventa."""
+    unknown = {"restart_state": "unknown", "active_state": None, "sub_state": None,
+               "result": None, "restarts": None}
+    try:
+        r = subprocess.run(["systemctl", "show", "arx.service", "--no-pager",
+                            "--property=ActiveState,SubState,Result,NRestarts"],
+                           capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return unknown
+    if r.returncode != 0:
+        return unknown
+    values = dict(line.split("=", 1) for line in r.stdout.splitlines() if "=" in line)
+    active, sub, result = (values.get(k) or None for k in ("ActiveState", "SubState", "Result"))
+    try:
+        restarts = int(values["NRestarts"])
+    except (KeyError, TypeError, ValueError):
+        restarts = None
+    if active == "active":  # un Result anterior no puede convertir una recuperación en caída terminal
+        state = "recovered"
+    elif sub == "auto-restart" or active == "activating":
+        state = "scheduled"
+    elif result == "start-limit-hit":
+        state = "exhausted"
+    elif active == "failed" or sub == "failed":
+        state = "failed"
+    else:
+        state = "unknown"
+    return {"restart_state": state, "active_state": active, "sub_state": sub,
+            "result": result, "restarts": restarts}
+
+
+def _down_detail(status: dict) -> str:
+    state, result = status["restart_state"], status.get("result") or "unknown"
+    n = status.get("restarts") if status.get("restarts") is not None else "?"
+    if state == "scheduled":
+        return tr("systemd restart {n} is scheduled in 10 seconds after {result}; arx-revive.timer retries "
+                  "every 15 minutes only while Arx remains failed", n=n, result=result)
+    if state == "recovered":
+        return tr("Arx has already recovered after {result}; systemd reports it active", result=result)
+    if state == "exhausted":
+        return tr("Arx is down: the systemd restart limit is exhausted after {n} restarts ({result}); "
+                  "arx-revive.timer will retry every 15 minutes", n=n, result=result)
+    if state == "failed":
+        return tr("Arx remains failed without evidence that the restart limit was exhausted ({result}); "
+                  "arx-revive.timer will retry every 15 minutes", result=result)
+    return tr("Arx failed, but its systemd restart state is unknown; check: systemctl status arx && "
+              "journalctl -u arx")
+
+
 def down(notify_send=None) -> int:
-    """OnFailure: systemd dejó de reiniciarlo. Alerta crítica fuera del host; arx-revive.timer lo reintenta."""
+    """OnFailure: registra si el reinicio está programado, recuperado, agotado o indeterminado."""
     import socket
     from arx.modules import response
-    response.record({"kind": "self_down", "sev": "crit", "detail": tr("Arx is down: systemd gave up restarting it")})
-    from arx import notify
-    (notify_send or notify.send)(tr("🛑 Arx is down on {host}: systemd gave up restarting it. It will try again every "
-                                    "15 minutes; check: journalctl -u arx", host=socket.gethostname()))
+    status = _restart_status()
+    detail = _down_detail(status)
+    response.record({"kind": "self_down", "sev": "crit", "detail": detail,
+                     "restart_state": status["restart_state"], "active_state": status["active_state"],
+                     "sub_state": status["sub_state"], "systemd_result": status["result"],
+                     "restarts": status["restarts"]})
+    _notify_and_record("self_down", tr("🛑 Arx failure on {host}: {detail}",
+                                      host=socket.gethostname(), detail=detail), notify_send)
     return 0
 
 
@@ -286,9 +363,9 @@ def stopped(env=None, notify_send=None) -> int:
     response.record({"kind": "self_stopped", "sev": "crit", "detail": tr("Arx stopped: {why}", why=why)})
     if state == "stopping":  # un apagado: sin red y sin prisa por avisar
         return 0
-    from arx import notify
-    (notify_send or notify.send)(tr("⚠ Arx stopped on {host}: {why}. If it wasn't you, someone may be trying "
-                                    "to blind it.", host=socket.gethostname(), why=why))
+    _notify_and_record("self_stopped",
+                       tr("⚠ Arx stopped on {host}: {why}. If it wasn't you, someone may be trying "
+                          "to blind it.", host=socket.gethostname(), why=why), notify_send)
     return 0
 
 

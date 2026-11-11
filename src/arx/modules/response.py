@@ -187,12 +187,24 @@ def _incidents_path():
     return config.state_dir() / "incidents.jsonl"
 
 
+def _without_secrets(value):
+    """Redacción recursiva en la última frontera antes de JSONL, también dentro de resultados por canal."""
+    from arx import redact
+    if isinstance(value, str):
+        return redact.scrub(value)
+    if isinstance(value, dict):
+        return {_without_secrets(k) if isinstance(k, str) else k: _without_secrets(v)
+                for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_without_secrets(v) for v in value]
+    return value
+
+
 def record(entry: dict) -> None:
     """Al registro de incidentes, nunca un secreto: claves de API, licencia, token del bot (DoD-9)."""
     import json
 
-    from arx import redact
-    entry = {"at": _iso(_now()), **{k: redact.scrub(v) if isinstance(v, str) else v for k, v in entry.items()}}
+    entry = {"at": _iso(_now()), **{k: _without_secrets(v) for k, v in entry.items()}}
     fd = os.open(_incidents_path(), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
     with os.fdopen(fd, "a", encoding="utf-8", errors="backslashreplace") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
