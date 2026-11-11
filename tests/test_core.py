@@ -7439,33 +7439,86 @@ class ProfileSetMigrationTests(unittest.TestCase):
         from arx.modules import profile, response
         self.p = profile
         self.cmds = []
-        p = mock.patch.object(response, "_nft_setup", lambda: True)
-        p.start()
-        self.addCleanup(p.stop)
-        p = mock.patch.object(profile, "_nft", lambda *a: self.cmds.append(a) or True)
-        p.start()
-        self.addCleanup(p.stop)
+        self.probe_lists = 0
+        self.clock = [1000.0]
+        for target, attr, value in (
+                (response, "_nft_setup", lambda: True),
+                (profile, "_L2_SUPPORT", {"supported": None, "at": 0.0, "migrated": False}),
+                (profile.time, "monotonic", lambda: self.clock[0])):
+            p = mock.patch.object(target, attr, value, create=True)
+            p.start()
+            self.addCleanup(p.stop)
 
-    def _setup(self, listing, chain_a=""):
+    def _fake_host(self, listing, chain_a="", honors_level2=True, probe_level=None):
+        """Host nft: recrear un set no garantiza que el kernel conserve «level 2» (regresión RC4)."""
+        self.listing = listing
+
+        def nft(*a):
+            self.cmds.append(a)
+            if a[:4] == ("delete", "set", "inet", "arx") and not a[4].startswith("arx_l2probe"):
+                self.listing = self.EMPTY
+            elif a[:4] == ("add", "set", "inet", "arx") and not a[4].startswith("arx_l2probe") \
+                    and not honors_level2:
+                self.listing = listing  # acepta «level 2», pero vuelve a renderizar «level 0»
+            return True
+
         def nft_out(*a):
             if a[0] == "-a":
                 return chain_a
-            migrated = any(c[:1] == ("delete",) and "set" in c for c in self.cmds)
-            return self.EMPTY if migrated else listing
-        with mock.patch.object(self.p, "_nft_out", nft_out):
-            return self.p.setup()
+            if a[:4] == ("list", "set", "inet", "arx") and a[4].startswith("arx_l2probe"):
+                self.probe_lists += 1
+                level = probe_level if probe_level is not None else (2 if honors_level2 else 0)
+                return (f'table inet arx {{\n\tset {a[4]} {{\n\t\ttypeof socket cgroupv2 level {level} '
+                        '. meta l4proto . ip daddr . th dport\n\t}\n}\n')
+            return self.listing
+
+        for attr, fn in (("_nft", nft), ("_nft_out", nft_out)):
+            p = mock.patch.object(self.p, attr, fn)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _production_deletes(self):
+        return [c for c in self.cmds if c[:4] == ("delete", "set", "inet", "arx")
+                and not c[4].startswith("arx_l2probe")]
 
     def test_sets_from_an_old_arx_are_recreated_hierarchical(self):
-        self.assertTrue(self._setup(self.OLD, self.CHAIN_A))
+        self._fake_host(self.OLD, self.CHAIN_A)
+        self.assertTrue(self.p.setup())
         self.assertIn(("delete", "rule", "inet", "arx", "output", "handle", "42"), self.cmds)
         self.assertIn(("delete", "set", "inet", "arx", "denied4"), self.cmds)
         add = [c for c in self.cmds if c[:3] == ("add", "set", "inet") and c[4] == "denied4"]
         self.assertTrue(add and "level" in add[0])  # recreado ya con level 2
+        self.assertTrue(self.p.setup())
+        self.assertEqual(len(self._production_deletes()), 1)  # una migración, no una por barrido
 
     def test_current_sets_are_not_touched(self):
         fresh = self.OLD.replace("typeof socket cgroupv2 level 0 .", "typeof socket cgroupv2 level 2 .")
-        self.assertTrue(self._setup(fresh, self.CHAIN_A))
+        self._fake_host(fresh, self.CHAIN_A)
+        self.assertTrue(self.p.setup())
         self.assertFalse([c for c in self.cmds if c[0] == "delete"])
+
+    def test_a_host_that_renders_level_zero_never_loses_its_live_sets(self):
+        """u24 acepta la creación con level 2 y devuelve level 0: RC4 migraba y vaciaba los sets en
+        cada barrido. La sonda temporal puede recrearse; los sets y reglas activos no se tocan."""
+        self._fake_host(self.OLD, self.CHAIN_A, honors_level2=False)
+        self.assertTrue(self.p.setup())
+        self.assertTrue(self.p.setup())
+        self.assertEqual(self._production_deletes(), [])
+        self.assertEqual(self.probe_lists, 1)  # el resultado adverso queda en backoff
+        self.clock[0] += 3601
+        self.assertTrue(self.p.setup())
+        self.assertEqual(self.probe_lists, 2)  # reintentar la sonda no reintenta la migración
+        self.assertFalse([c for c in self.cmds if c[:2] == ("delete", "rule")])
+
+    def test_even_a_wrong_probe_cannot_cause_a_migration_loop(self):
+        """Guardarraíl independiente del renderizado: una sonda falsa positiva no puede repetir
+        el borrado en el barrido siguiente; como mucho hubo una migración desde este arranque."""
+        self._fake_host(self.OLD, self.CHAIN_A, honors_level2=False, probe_level=2)
+        self.assertTrue(self.p.setup())
+        self.assertTrue(self.p.setup())
+        self.assertTrue(self.p.setup())
+        self.assertEqual(len(self._production_deletes()), 1)
+        self.assertEqual(self.probe_lists, 1)
 
 
 class ArxDropinRecognitionTests(unittest.TestCase):

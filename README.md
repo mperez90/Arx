@@ -8,7 +8,7 @@ actions it can undo. Anything irreversible waits for you.
 
 <sub>Real output of [`lab/demo.sh`](lab/demo.sh), with long waits shortened.</sub>
 
-> **Status:** v0.0.8rc4 (Core release candidate), early public testing. **Arx Core is free and available now.** The paid
+> **Status:** v0.0.8rc5 (Core release candidate), early public testing. **Arx Core is free and available now.** The paid
 > tiers open after Core completes its public testing phase, **Pro first, Business last**.
 > Founding pricing (half price, first 500 purchases of each plan) is reserved for that
 > opening: [get notified](https://github.com/mperez90/Arx/discussions/1).
@@ -172,6 +172,9 @@ Read these before you rely on it.
   get told.
 - **Confining needs cgroup v2, nftables that can match by cgroup, and systemd.** Without them, Arx
   suspends instead. Tested on Ubuntu 22.04 and 24.04 VMs, across service restarts and reboots.
+  Some kernels accept `socket cgroupv2 level 2` but keep rendering `level 0`. Arx detects this with
+  a temporary, unreferenced set and leaves the active sets untouched; nested cgroup scopes do not
+  get hierarchical matching on those hosts.
 - **Run Arx on the host, not inside a container that shares the host's cgroup tree.** There, proof
   of origin and confinement work, but behavior watching doesn't. LXC containers (tested unprivileged,
   with Incus) work like a machine.
