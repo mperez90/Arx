@@ -3948,8 +3948,8 @@ class ExecFanWatchTests(unittest.TestCase):
         self.x._state.update(running=True, fd=10, captured=0, dropped=0, expired=0, superseded=0,
                              overflow=0, late=0, errors=0, responses=0)
         self.addCleanup(self.x._snapshots.clear)
-        self.addCleanup(self.x._state.clear)
         self.addCleanup(self.x._state.update, self.old_state)
+        self.addCleanup(self.x._state.clear)
 
     def test_permission_is_allowed_and_every_fd_is_closed_when_capture_fails(self):
         import struct
@@ -4018,11 +4018,50 @@ class ExecFanWatchTests(unittest.TestCase):
         self.assertEqual(self.x._state["late"], 1)
 
     def test_an_unexpected_listener_exit_also_closes_the_group(self):
-        with mock.patch.object(self.x.select, "poll", side_effect=RuntimeError("reader died")), \
+        ready = self.x.threading.Event()
+        with mock.patch.object(self.x, "_mark_mounts", return_value=(["/"], [])) as mark, \
+                mock.patch.object(self.x.select, "poll", side_effect=RuntimeError("reader died")), \
                 mock.patch.object(self.x, "_close") as close:
+            mark.side_effect = lambda libc, fd: self.x._state.update(marks=["/"], failed=[]) or (["/"], [])
             with self.assertRaises(RuntimeError):
-                self.x._listen(None, 10, "")
+                self.x._listen(None, 10, "", ready)
+        mark.assert_called_once_with(None, 10)
+        self.assertTrue(ready.is_set())
         close.assert_called_once_with(10)
+
+    def test_start_delegates_marking_to_the_watched_listener_and_requests_nonblock(self):
+        class InlineThread:
+            def __init__(self, target, args=(), name=None, daemon=None):
+                self.target, self.args = target, args
+
+            def start(self):
+                self.target(*self.args)
+
+        def listener(libc, fd, root, ready):
+            self.x._state["marks"] = ["/"]
+            ready.set()
+
+        self.x._state.update(running=False, fd=-1, mode="off")
+        libc = mock.Mock()
+        libc.fanotify_init.return_value = 10
+        with mock.patch.object(self.x, "_libc", return_value=libc), \
+                mock.patch.object(self.x, "_mark_mounts") as mark, \
+                mock.patch.object(self.x, "_listen", side_effect=listener), \
+                mock.patch.object(self.x, "_watchdog"), \
+                mock.patch.object(self.x.threading, "Thread", InlineThread):
+            self.assertEqual(self.x.start(""), "full")
+        libc.fanotify_init.assert_called_once_with(
+            self.x.FAN_CLASS_CONTENT | self.x.FAN_CLOEXEC | self.x.FAN_NONBLOCK,
+            os.O_RDONLY | getattr(os, "O_LARGEFILE", 0) | os.O_CLOEXEC)
+        mark.assert_not_called()
+
+    def test_close_invalidates_the_fd_without_holding_the_lock_in_the_kernel(self):
+        with mock.patch.object(self.x.os, "close") as close:
+            close.side_effect = lambda fd: self.assertFalse(self.x._lock.locked())
+            self.x._close(10)
+        close.assert_called_once_with(10)
+        self.assertFalse(self.x._state["running"])
+        self.assertEqual(self.x._state["fd"], -1)
 
     def test_the_parser_rejects_wrong_versions_and_truncated_events(self):
         import struct
@@ -5595,6 +5634,8 @@ class InjectedLibraryAndSensitiveFileTests(unittest.TestCase):
         from arx import i18n
         from arx.modules import filewatch, profile, provenance, response
         self.p, self.f, self.prov, self.r = profile, filewatch, provenance, response
+        self.f._pending.clear()
+        self.addCleanup(self.f._pending.clear)
         i18n.set_lang("en")
         self.addCleanup(i18n.set_lang, "es")
         owned = {"/usr/lib/x86_64-linux-gnu/libc.so.6": "libc6", "/usr/lib/x86_64-linux-gnu/libbz2.so.1.0": "libbz2"}
@@ -5640,12 +5681,85 @@ class InjectedLibraryAndSensitiveFileTests(unittest.TestCase):
         import struct
         self.f._state.update(fd=10, running=True)
         self.addCleanup(self.f._state.update, running=False, fd=-1)
-        with mock.patch.object(self.f, "_record", side_effect=OSError("gone")), \
+        errors = self.f._state["errors"]
+        with mock.patch.object(self.f, "_record", side_effect=OSError("gone")) as record, \
                 mock.patch.object(self.f.os, "write", return_value=8) as write, \
                 mock.patch.object(self.f.os, "close") as close:
             self.f._permission(10, 7, 4242, "/etc/shadow", 1, "")
+            self.assertEqual(self.f.drain(), [])
         write.assert_called_once_with(10, struct.pack("=iI", 7, self.f.FAN_ALLOW))
         close.assert_called_once_with(7)
+        record.assert_called_once_with(4242, 1, "/etc/shadow", "")
+        self.assertEqual(self.f._state["errors"], errors + 1)
+
+    def test_sensitive_permission_is_released_before_live_proc_attribution(self):
+        """Ninguna lectura de /proc puede retener el open que la está bloqueando en el kernel."""
+        self.f._state.update(fd=10, running=True)
+        self.addCleanup(self.f._state.update, running=False, fd=-1)
+        order = []
+        with mock.patch.object(self.f, "_respond", side_effect=lambda fd, efd: order.append("allow") or True), \
+                mock.patch.object(self.f, "_record", side_effect=lambda *args: order.append("record")), \
+                mock.patch.object(self.f.os, "close"):
+            self.f._permission(10, 7, 4242, "/etc/shadow", 1, "")
+            self.assertEqual(order, ["allow"])
+            self.f.drain()
+        self.assertEqual(order, ["allow", "record"])
+
+    def test_file_listener_marks_in_the_watched_thread_and_closes_on_an_unexpected_exit(self):
+        self.f._state.update(fd=10, running=True, marks=[], failed=[])
+        self.addCleanup(self.f._state.update, running=False, fd=-1)
+        ready = self.f.threading.Event()
+        with mock.patch.object(self.f, "_mark") as mark, \
+                mock.patch.object(self.f.select, "poll", side_effect=RuntimeError("reader died")), \
+                mock.patch.object(self.f, "_close") as close:
+            mark.side_effect = lambda libc, fd: self.f._state.update(marks=["/etc/shadow"], failed=[])
+            with self.assertRaises(RuntimeError):
+                self.f._listen(None, 10, "", ready)
+        mark.assert_called_once_with(None, 10)
+        self.assertTrue(ready.is_set())
+        close.assert_called_once_with(10)
+
+    def test_file_start_delegates_marking_to_the_watched_listener_and_requests_nonblock(self):
+        class InlineThread:
+            def __init__(self, target, args=(), name=None, daemon=None):
+                self.target, self.args = target, args
+
+            def start(self):
+                self.target(*self.args)
+
+        def listener(libc, fd, root, ready):
+            self.f._state["marks"] = ["/etc/shadow"]
+            ready.set()
+
+        old_state = dict(self.f._state)
+        self.addCleanup(self.f._state.update, old_state)
+        self.addCleanup(self.f._state.clear)
+        self.f._state.update(running=False, fd=-1, mode="off")
+        libc = mock.Mock()
+        libc.fanotify_init.return_value = 10
+        with mock.patch.object(self.f, "_libc", return_value=libc), \
+                mock.patch.object(self.f, "_mark") as mark, \
+                mock.patch.object(self.f, "_listen", side_effect=listener), \
+                mock.patch.object(self.f, "_watchdog"), \
+                mock.patch.object(self.prov, "system_root", return_value=""), \
+                mock.patch.object(self.f.threading, "Thread", InlineThread):
+            self.assertTrue(self.f.start())
+        libc.fanotify_init.assert_called_once_with(
+            self.f.FAN_CLASS_CONTENT | self.f.FAN_CLOEXEC | self.f.FAN_NONBLOCK,
+            os.O_RDONLY | getattr(os, "O_LARGEFILE", 0) | os.O_CLOEXEC)
+        mark.assert_not_called()
+
+    def test_file_close_invalidates_the_fd_without_holding_the_lock_in_the_kernel(self):
+        old_state = dict(self.f._state)
+        self.addCleanup(self.f._state.update, old_state)
+        self.addCleanup(self.f._state.clear)
+        self.f._state.update(fd=10, running=True)
+        with mock.patch.object(self.f.os, "close") as close:
+            close.side_effect = lambda fd: self.assertFalse(self.f._lock.locked())
+            self.f._close(10)
+        close.assert_called_once_with(10)
+        self.assertFalse(self.f._state["running"])
+        self.assertEqual(self.f._state["fd"], -1)
 
     def test_a_failed_sensitive_open_response_closes_the_group(self):
         self.f._state.update(fd=10, running=True)
@@ -5656,6 +5770,8 @@ class InjectedLibraryAndSensitiveFileTests(unittest.TestCase):
         close.assert_called_once_with(10)
 
     def test_sensitive_marks_use_permission_events_and_check_every_result(self):
+        self.f._state.update(fd=10, running=True)
+        self.addCleanup(self.f._state.update, running=False, fd=-1)
         libc = mock.Mock()
         libc.fanotify_mark.side_effect = [0, -1]
         with mock.patch.object(self.f, "sensitive_files", return_value=["/etc/shadow", "/etc/sudoers"]):

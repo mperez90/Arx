@@ -15,7 +15,7 @@ import struct
 import threading
 import time
 
-FAN_CLASS_CONTENT, FAN_CLOEXEC = 0x4, 0x1
+FAN_CLASS_CONTENT, FAN_CLOEXEC, FAN_NONBLOCK = 0x4, 0x1, 0x2
 FAN_OPEN_PERM = 0x00010000
 FAN_Q_OVERFLOW = 0x00004000
 FAN_ALLOW = 0x01
@@ -33,6 +33,7 @@ SENSITIVE = ("/etc/shadow", "/etc/gshadow", "/etc/sudoers", "/etc/ssh/ssh_host_*
              "/home/*/.ethereum/keystore/*")
 
 _events: collections.deque = collections.deque(maxlen=MAX_EVENTS)
+_pending: collections.deque = collections.deque(maxlen=MAX_EVENTS)  # identidad mínima; se atribuye fuera del listener
 _state = {"running": False, "mode": "off", "fd": -1, "marks": [], "failed": [],
           "overflow": 0, "late": 0, "errors": 0, "responses": 0, "last_progress": 0.0}
 _lock = threading.Lock()
@@ -76,7 +77,8 @@ def _mark(libc, fd: int) -> None:
             marked.append(path)
         else:
             failed.append({"path": path, "errno": ctypes.get_errno()})
-    _state["marks"], _state["failed"] = marked, failed
+    if _state["running"] and _state["fd"] == fd:
+        _state["marks"], _state["failed"] = marked, failed
 
 
 def _record(pid: int, start: int, path: str, root: str) -> dict | None:
@@ -117,18 +119,16 @@ def _respond(fd: int, efd: int) -> bool:
 
 
 def _permission(fd: int, efd: int, pid: int, path: str, start: int | None, root: str) -> None:
+    """Solo memoria antes de FAN_ALLOW: describe()/recent_exec() esperan al bucle del guardián."""
+    if isinstance(start, int):
+        _pending.append((pid, start, path, root))
     try:
-        _record(pid, start, path, root)
-    except Exception:
-        _state["errors"] += 1
+        _respond(fd, efd)
     finally:
         try:
-            _respond(fd, efd)
-        finally:
-            try:
-                os.close(efd)
-            except OSError:
-                pass
+            os.close(efd)
+        except OSError:
+            pass
 
 
 def _event(fd: int, efd: int, pid: int, root: str) -> None:
@@ -147,11 +147,13 @@ def _close(fd: int) -> None:
     with _lock:
         if _state["fd"] != fd:
             return
+        # Invalida antes de entrar al kernel: ningún write nuevo usará este fd, y un close lento
+        # no deja al listener esperando el mutex que necesita para liberar otros permisos.
         _state.update(running=False, fd=-1, mode="degraded")
-        try:
-            os.close(fd)  # libera en el kernel cualquier apertura que estuviera esperando
-        except OSError:
-            pass
+    try:
+        os.close(fd)  # libera en el kernel cualquier apertura que estuviera esperando
+    except OSError:
+        pass
 
 
 def _watchdog(fd: int) -> None:
@@ -163,15 +165,22 @@ def _watchdog(fd: int) -> None:
         time.sleep(0.5)
 
 
-def _listen(libc, fd: int, root: str) -> None:
+def _listen(libc, fd: int, root: str, ready: threading.Event) -> None:
     try:
+        # Marcar activa permisos de inmediato: nunca se hace antes de tener listener y watchdog.
+        _mark(libc, fd)
+        if not _state["marks"] or not _state["running"] or _state["fd"] != fd:
+            return
+        _state["mode"] = "partial" if _state["failed"] else "full"
+        _state["last_progress"] = time.monotonic()
         poll = select.poll()
         poll.register(fd, select.POLLIN)
-        marked = time.monotonic()
+        marked_at = time.monotonic()
+        ready.set()
         while _state["running"] and _state["fd"] == fd:
             _state["last_progress"] = time.monotonic()
             try:
-                ready = poll.poll(POLL_MS)
+                ready_events = poll.poll(POLL_MS)
             except OSError:
                 if not _state["running"]:
                     break
@@ -179,13 +188,15 @@ def _listen(libc, fd: int, root: str) -> None:
                 time.sleep(0.1)
                 continue
             _state["last_progress"] = time.monotonic()
-            if time.monotonic() - marked > MARK_EVERY_S:
+            if time.monotonic() - marked_at > MARK_EVERY_S:
                 _mark(libc, fd)
-                marked = time.monotonic()
-            if not ready:
+                marked_at = time.monotonic()
+            if not ready_events:
                 continue
             try:
                 data = os.read(fd, 65536)
+            except BlockingIOError:
+                continue  # poll puede quedar desactualizado al drenar o cerrar desde otro hilo
             except OSError:
                 if not _state["running"]:
                     break
@@ -205,6 +216,7 @@ def _listen(libc, fd: int, root: str) -> None:
                     except OSError:
                         pass
     finally:
+        ready.set()
         _close(fd)
 
 
@@ -217,7 +229,7 @@ def start() -> bool:
         _state[key] = 0
     try:
         libc = _libc()
-        fd = libc.fanotify_init(FAN_CLASS_CONTENT | FAN_CLOEXEC,
+        fd = libc.fanotify_init(FAN_CLASS_CONTENT | FAN_CLOEXEC | FAN_NONBLOCK,
                                 os.O_RDONLY | getattr(os, "O_LARGEFILE", 0) | os.O_CLOEXEC)
     except (OSError, AttributeError):
         _state["mode"] = "unavailable"
@@ -227,17 +239,20 @@ def start() -> bool:
         return False
     _state.update(running=True, fd=fd, mode="full", last_progress=time.monotonic())
     from arx.modules import provenance
-    _mark(libc, fd)
-    if not _state["marks"]:
+    ready = threading.Event()
+    try:
+        threading.Thread(target=_listen, args=(libc, fd, provenance.system_root(), ready),
+                         name="arx-files", daemon=True).start()
+        threading.Thread(target=_watchdog, args=(fd,), name="arx-files-wd", daemon=True).start()
+    except (OSError, RuntimeError):
         _close(fd)
         _state["mode"] = "unavailable"
         return False
-    _state["mode"] = "partial" if _state["failed"] else "full"
-    try:
-        threading.Thread(target=_listen, args=(libc, fd, provenance.system_root()), name="arx-files",
-                         daemon=True).start()
-        threading.Thread(target=_watchdog, args=(fd,), name="arx-files-wd", daemon=True).start()
-    except (OSError, RuntimeError):
+    deadline = time.monotonic() + WATCHDOG_STALL_S + 1
+    while not ready.wait(0.05):
+        if not _state["running"] or time.monotonic() >= deadline:
+            break
+    if not _state["running"] or not _state["marks"]:
         _close(fd)
         _state["mode"] = "unavailable"
         return False
@@ -258,6 +273,12 @@ def status() -> dict:
 
 
 def drain() -> list[dict]:
+    while _pending:
+        pid, start, path, root = _pending.popleft()
+        try:
+            _record(pid, start, path, root)
+        except Exception:
+            _state["errors"] += 1
     out = []
     while _events:
         out.append(_events.popleft())
