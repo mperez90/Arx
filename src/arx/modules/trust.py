@@ -220,6 +220,15 @@ def check_repository_copy(f: dict) -> dict:
                     compared += 1
                     if actual != expected:
                         differ.append(path)
+            # Cortado entre dos miembros (el slice lo mató, un timeout, un kill), tarfile en modo stream lo
+            # toma por el final del archivo: solo el código de salida de dpkg-deb dice si se leyó entero.
+            while proc.stdout.read(1 << 16):  # el relleno final, para que dpkg-deb pueda terminar
+                if time.monotonic() > deadline:
+                    break
+            try:
+                complete = proc.wait(timeout=max(1.0, min(30.0, deadline - time.monotonic()))) == 0
+            except subprocess.TimeoutExpired:
+                complete = False
         except (tarfile.TarError, OSError):
             return _check("matches_repository", "unknown", tr("could not open the official package"))
         finally:
@@ -227,6 +236,8 @@ def check_repository_copy(f: dict) -> dict:
         if differ:
             return _check("matches_repository", "fail",
                           tr("differs from the official package: {files}", files=", ".join(differ[:3])))
+        if not complete:
+            return _check("matches_repository", "unknown", tr("the official package could not be read to the end"))
         return _check("matches_repository", "pass",
                       tr("{n} files identical to the official package", n=compared))
 

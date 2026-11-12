@@ -18,7 +18,7 @@ Core release candidate. This release strengthens hot-path acceptance, alert evid
 - An identity recovered after a process has exited supports detection and forensics only. Arx does not claim retroactive freezing or network containment for that process.
 - Fanotify permission handling is fail-open: if the reader stalls or its response fails, the group is closed so pending executions and opens are released. Coverage is then explicitly degraded.
 - Script and interpreter chains can produce more fanotify events than netlink confirmations. Captures are promoted to incidents only after kernel exec confirmation.
-- The maintenance slice starts with provisional 384 MiB `MemoryHigh` and 512 MiB `MemoryMax` budgets. Platform-specific package workloads may require different limits after measurement.
+- The maintenance slice is capped at 384 MiB `MemoryHigh` and 512 MiB `MemoryMax`. Measured on Debian 13 with helpers serialized, the largest real helper (`apt-get download` of a kernel package, page cache included) peaked at 52 MiB. Hosts with much larger APT caches have not been measured; a helper that exceeds the cap is killed inside its own scope and that check reports `unknown`.
 - A notification result of `ok` does not prove delivery by the external provider, receipt, or that a person read the alert.
 - Existing cgroup and nftables limitations still apply; see the README for platform-specific behavior.
 

@@ -104,6 +104,8 @@ ES = {
         "registro de instalación ilegible",
     "could not open the official package":
         "no se pudo abrir el paquete oficial",
+    "the official package could not be read to the end":
+        "no se pudo leer el paquete oficial hasta el final",
     "the model flagged {dest} of {unit} against its documentation: {reason}":
         "el modelo marcó {dest} de {unit} frente a su documentación: {reason}",
     "it will be cut the first time it is used; accept it if it is legitimate":

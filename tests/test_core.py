@@ -8346,6 +8346,9 @@ class TrustTests(unittest.TestCase):
         class Proc:
             stdout = io.BytesIO(buf.getvalue())
 
+            def wait(self, timeout=None):
+                return 0
+
             def close(self):
                 pass
         with mock.patch.object(self.t, "_cached_deb", lambda f: deb), \
@@ -8358,6 +8361,54 @@ class TrustTests(unittest.TestCase):
         self.assertIn(os.path.join(root, "missing"), c["detail"])
         self.assertIn(os.path.join(root, "linked"), c["detail"])
         self.assertNotIn(os.path.join(root, "same"), c["detail"])
+
+    def test_a_helper_killed_mid_stream_never_passes_the_repository_comparison(self):
+        """B62: el slice mata a su auxiliar al agotar memoria. Cortado justo entre dos miembros, tarfile en
+        modo stream lo toma por el final del archivo: sin el código de salida de dpkg-deb, una comparación
+        parcial pasaba por «idéntico al paquete oficial»."""
+        import io
+        import tarfile
+        root = tempfile.mkdtemp()
+        for name in ("first", "second"):
+            with open(os.path.join(root, name), "wb") as f:
+                f.write(b"oficial")
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w") as tar:
+            for name in ("first", "second"):
+                info = tarfile.TarInfo("." + os.path.join(root, name))
+                info.size = len(b"oficial")
+                tar.addfile(info, io.BytesIO(b"oficial"))
+        deb = os.path.join(root, "pkg.deb")
+        open(deb, "wb").write(b"x")
+
+        def proc(data, rc):
+            class Proc:
+                stdout = io.BytesIO(data)
+                closed = []
+
+                def wait(self, timeout=None):
+                    return rc
+
+                def close(self):
+                    self.closed.append(True)
+            return Proc()
+
+        def compare(data, rc):
+            p = proc(data, rc)
+            with mock.patch.object(self.t, "_cached_deb", lambda f: deb), \
+                    mock.patch.object(self.t.shutil, "which", lambda name: "/usr/bin/" + name), \
+                    mock.patch.object(self.t, "_conffiles", lambda pkg: set()), \
+                    mock.patch.object(self.t.maintenance, "Popen", lambda *a, **k: p):
+                result = self.t.check_repository_copy({"package": "acme", "version": "1.0"})
+            self.assertEqual(p.closed, [True])  # el scope se recoge pase lo que pase
+            return result
+        cut = buf.getvalue()[:1024]  # cabecera + datos del primer miembro: el segundo no llega
+        self.assertEqual(compare(cut, -9)["result"], "unknown")
+        self.assertEqual(compare(buf.getvalue(), 1)["result"], "unknown")  # dpkg-deb falló al final
+        self.assertEqual(compare(buf.getvalue(), 0)["result"], "pass")
+        with open(os.path.join(root, "first"), "wb") as f:
+            f.write(b"alterado")
+        self.assertEqual(compare(cut, -9)["result"], "fail")  # una diferencia ya vista sigue contando
 
     def test_the_deb_apt_just_installed_is_used_only_if_the_signed_index_vouches_for_it(self):
         import hashlib

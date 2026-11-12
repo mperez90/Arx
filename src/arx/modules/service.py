@@ -130,8 +130,10 @@ TimeoutStartSec=90
 def maintenance_slice_text() -> str:
     """Presupuesto agregado de APT/dpkg, separado de los 512 MiB del guardián.
 
-    Los auxiliares se serializan. 384/512 MiB parten del incidente medido (varios auxiliares
-    agotaron los 512 MiB de Arx); el laboratorio debe medir paquetes grandes antes del RC.
+    En d13 lo que agotó los 512 MiB de Arx fue la concurrencia: 20 apt-get/apt-cache a la vez, cada
+    uno ≤58 MiB RSS. Serializados, el mayor auxiliar medido (Debian 13: apt-get download de un
+    kernel, page cache incluida) llegó a 52 MiB: 384 MiB dejan ~7× para cachés APT mayores sin
+    estrangular, y 512 MiB acotan el peor caso. Son techos, no reservas.
     """
     return """[Unit]
 Description=Arx - bounded APT and dpkg maintenance helpers
