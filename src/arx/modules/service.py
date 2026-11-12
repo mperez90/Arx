@@ -237,7 +237,11 @@ def refresh_maintenance() -> int:
     sealed = config.read_json(config.state_dir() / "self.json", {}) or {}
     sealed[MAINTENANCE_SLICE_PATH] = _sha(MAINTENANCE_SLICE_PATH)
     config.write_json(config.state_dir() / "self.json", sealed)
-    subprocess.run(["systemctl", "daemon-reload"], check=False)
+    try:
+        subprocess.run(["systemctl", "daemon-reload"], check=False, timeout=20)
+    except subprocess.TimeoutExpired:
+        # Un refresco opcional no puede retener dpkg para siempre si D-Bus/systemd no responde.
+        return 1
     return 0
 
 

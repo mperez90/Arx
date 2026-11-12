@@ -5329,7 +5329,14 @@ class SelfProtectionTests(unittest.TestCase):
         self.assertEqual(sealed[self.unit], "preserve-the-existing-unit-seal")
         self.assertEqual(sealed[self.s.MAINTENANCE_SLICE_PATH], self.s._sha(self.s.MAINTENANCE_SLICE_PATH))
         self.assertIn("MemoryMax=512M", open(self.s.MAINTENANCE_SLICE_PATH).read())
-        systemctl.assert_called_once_with(["systemctl", "daemon-reload"], check=False)
+        systemctl.assert_called_once_with(["systemctl", "daemon-reload"], check=False, timeout=20)
+
+    def test_a_stuck_daemon_reload_does_not_hang_a_package_upgrade(self):
+        with mock.patch.object(self.s, "_systemd_available", lambda: True), \
+                mock.patch.object(self.s, "_is_root", lambda: True), \
+                mock.patch.object(self.s.subprocess, "run",
+                                  side_effect=self.s.subprocess.TimeoutExpired("systemctl", 20)):
+            self.assertEqual(self.s.refresh_maintenance(), 1)
 
     def test_an_old_seal_without_the_maintenance_slice_is_not_clean(self):
         path = self.s.config.state_dir() / "self.json"
