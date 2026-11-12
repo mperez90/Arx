@@ -3957,6 +3957,17 @@ class ExecFanWatchTests(unittest.TestCase):
         self.assertEqual(self.x.recover(4242, "", 250)["exe"], "/usr/bin/second")
         self.assertIsNone(self.x.recover(4242, "", 300))
 
+    def test_claim_marks_a_later_reexec_even_of_the_same_executable(self):
+        first = {"pid": 4242, "start": 777, "exe": "/usr/bin/same", "_captured_ns": 100}
+        second = {"pid": 4242, "start": 777, "exe": "/usr/bin/same", "_captured_ns": 200}
+        self.x._store(first)
+        self.x._store(second)
+        claimed, later = self.x.claim(4242, "", 150)
+        self.assertEqual(claimed["exe"], "/usr/bin/same")
+        self.assertTrue(later)
+        self.assertTrue(self.x.has_later(claimed))
+        self.assertEqual(self.x.recover(4242, "", 250)["exe"], "/usr/bin/same")
+
     def test_a_live_description_retires_snapshots_it_has_already_superseded(self):
         self.x._store({"pid": 4242, "start": 777, "exe": "/usr/bin/old", "_captured_ns": 100})
         self.x._store({"pid": 4242, "start": 777, "exe": "/usr/bin/new", "_captured_ns": 200})
@@ -4376,7 +4387,7 @@ class ExecWatchTests(unittest.TestCase):
         partial = self._ev(argv=[], partial=True, gone=True, exe="/tmp/short-lived",
                            unit="system.slice/app.service", parent_exe="/usr/sbin/app", parent_user="app")
         with mock.patch.object(self.x, "describe", lambda pid, root: None), \
-                mock.patch.object(execfanwatch, "recover", lambda pid, root, ts: dict(partial)), \
+                mock.patch.object(execfanwatch, "claim", lambda pid, root, ts: (dict(partial), False)), \
                 mock.patch.object(self.x, "_freeze") as freeze:
             got = self.x.handle_pid(4242, "", lambda: True, ts=123)
         self.assertTrue(got["partial"])
@@ -4389,12 +4400,67 @@ class ExecWatchTests(unittest.TestCase):
         self.assertTrue(found[0]["target"]["alert_only"])
         self.assertIn("already exited", found[0]["target"]["alert_reason"])
 
+    def test_a_burst_larger_than_the_noise_cap_does_not_drop_exec_findings(self):
+        """B59: el límite de ruido no puede consumir y descartar eventos ya confirmados por el kernel."""
+        subjects = self._subjects()
+        events = [self._ev(pid=5000 + n, exe=f"/tmp/arx-b59-{n:02d}",
+                           unit="system.slice/app.service", parent_exe="/usr/sbin/app", parent_user="app")
+                  for n in range(25)]
+        with mock.patch.object(self.p, "_verified", return_value=False):
+            found = self._events(subjects, *events)
+        self.assertEqual(len(found), 25)
+        self.assertEqual({f["target"]["pid"] for f in found}, {5000 + n for n in range(25)})
+
     def test_without_a_fanotify_snapshot_an_exec_already_gone_remains_unattributed(self):
         self.x._events.clear()
         self.addCleanup(self.x._events.clear)
         with mock.patch.object(self.x, "describe", lambda pid, root: None):
             self.assertIsNone(self.x.handle_pid(987654, "", lambda: False))
         self.assertEqual(list(self.x._events), [])
+
+    def test_a_delayed_netlink_event_cannot_inherit_the_identity_of_a_later_reexec(self):
+        """El snapshot fecha CADA exec; describir el re-exec final no puede reetiquetar el evento anterior."""
+        from arx.modules import execfanwatch
+        self.x._events.clear()
+        self.x._recent.clear()
+        execfanwatch._snapshots.clear()
+        old_state = dict(execfanwatch._state)
+        execfanwatch._state.update(captured=0, dropped=0, expired=0, superseded=0)
+        self.addCleanup(execfanwatch._state.clear)
+        self.addCleanup(execfanwatch._state.update, old_state)
+        self.addCleanup(self.x._events.clear)
+        self.addCleanup(self.x._recent.clear)
+        self.addCleanup(execfanwatch._snapshots.clear)
+        base = self._ev(unit="system.slice/app.service", parent_exe="/usr/sbin/app", parent_user="app")
+        for captured, exe in ((100, "/tmp/arx-b59-first"), (200, "/tmp/arx-b59-final")):
+            execfanwatch._store({**base, "exe": exe, "uid": 0, "parent_uid": 0,
+                                 "_captured_ns": captured, "_root": ""})
+        final = {**base, "exe": "/tmp/arx-b59-final", "argv": ["/tmp/arx-b59-final"]}
+        with mock.patch.object(self.x, "describe", return_value=dict(final)), \
+                mock.patch.object(self.x, "_freeze") as freeze:
+            first = self.x.handle_pid(4242, "", lambda: True, ts=150)
+            second = self.x.handle_pid(4242, "", lambda: True, ts=250)
+        self.assertEqual(first["exe"], "/tmp/arx-b59-first")
+        self.assertTrue(first["partial"])
+        self.assertTrue(first["gone"])
+        self.assertEqual(second["exe"], "/tmp/arx-b59-final")
+        self.assertFalse(second.get("partial"))
+        freeze.assert_not_called()
+
+    def test_a_delayed_netlink_event_does_not_take_argv_from_a_same_exe_reexec(self):
+        """Mismo PID, nacimiento y ejecutable: solo el snapshot posterior delata el re-exec."""
+        from arx.modules import execfanwatch
+        snapshot = self._ev(exe="/usr/bin/same", unit="system.slice/app.service", uid=0, parent_uid=0,
+                            _captured_ns=100)
+        live = self._ev(exe="/usr/bin/same", unit="system.slice/app.service", argv=["/usr/bin/same", "new"])
+        with mock.patch.object(execfanwatch, "claim", return_value=(snapshot, True)), \
+                mock.patch.object(self.x, "describe", return_value=live), \
+                mock.patch.object(self.x, "_freeze") as freeze:
+            got = self.x.handle_pid(4242, "", lambda: True, ts=150)
+        self.assertTrue(got["partial"])
+        self.assertEqual(got["argv"], [])
+        self.assertNotIn("_captured_ns", got)
+        freeze.assert_not_called()
 
     def test_a_new_child_from_a_verified_package_only_alerts_unless_it_is_an_attack_tool(self):
         """Ruido: un servicio que estrena una herramienta de su paquete no se ve aislado; curl o bash, sí."""

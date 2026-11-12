@@ -152,27 +152,60 @@ def _store(ev: dict) -> None:
         _state["captured"] += 1
 
 
-def recover(pid: int, root: str, ts: int | None = None) -> dict | None:
-    """El último snapshot anterior al `exec` confirmado por netlink, consumido una sola vez.
+def claim(pid: int, root: str, ts: int | None = None) -> tuple[dict | None, bool]:
+    """Toma el snapshot de ESTE timestamp y avisa si ya existe otro exec posterior del mismo PID.
 
-    El reloj de proc_connector y `monotonic_ns` es el mismo. En una cadena de re-exec, el timestamp
-    evita entregar el programa siguiente al evento anterior.
+    El segundo valor también es cierto si solo hay un snapshot posterior: en ese caso una lectura viva
+    no puede atribuirse con seguridad al evento netlink anterior. `_captured_ns` queda en el snapshot
+    para que `has_later()` repita la comprobación después de leer `/proc`.
     """
     with _lock:
         _prune_locked()
         chosen = None
+        later = False
         for key, ev in reversed(_snapshots.items()):
             if ev.get("pid") != pid or ev.get("_root", "") != root.strip("/"):
                 continue
             if isinstance(ts, int) and ts > 0 and ev.get("_captured_ns", 0) > ts:
+                later = True
                 continue
             chosen = key
             break
         if chosen is None:
-            return None
+            return None, later
         ev = dict(_snapshots.pop(chosen))
-    for key in ("_captured_ns", "_stored_ns", "_root"):
-        ev.pop(key, None)
+        captured = ev.get("_captured_ns", 0)
+        later = later or any(other.get("pid") == pid and other.get("start") == ev.get("start")
+                             and other.get("_captured_ns", 0) > captured
+                             for other in _snapshots.values())
+    ev.pop("_stored_ns", None)
+    ev.pop("_root", None)
+    return ev, later
+
+
+def has_later(snapshot: dict) -> bool:
+    """Descarta enriquecer con `/proc` si hubo otro exec mientras se leía el proceso."""
+    captured = snapshot.get("_captured_ns")
+    if not isinstance(captured, int):
+        return True
+    with _lock:
+        return any(ev.get("pid") == snapshot.get("pid") and ev.get("start") == snapshot.get("start")
+                   and ev.get("_captured_ns", 0) > captured for ev in _snapshots.values())
+
+
+def has_pending(pid: int, root: str) -> bool:
+    """Sin snapshot previo, uno concurrente impide confiar en una identidad leída a posteriori."""
+    with _lock:
+        return any(ev.get("pid") == pid and ev.get("_root", "") == root.strip("/")
+                   for ev in _snapshots.values())
+
+
+def recover(pid: int, root: str, ts: int | None = None) -> dict | None:
+    """Recupera evidencia forense de un exec cuyo proceso ya no puede describirse."""
+    ev, _ = claim(pid, root, ts)
+    if ev is None:
+        return None
+    ev.pop("_captured_ns", None)
     ev.update(argv=[], parent_title="", partial=True, gone=True)
     return ev
 

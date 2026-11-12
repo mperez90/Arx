@@ -687,13 +687,26 @@ def _complete_partial(ev: dict) -> dict:
 
 def handle_pid(pid: int, root: str, enforce, ts: int | None = None) -> dict | None:
     from arx.modules import execfanwatch
-    ev = describe(pid, root)
-    if ev:
-        execfanwatch.discard_through(pid, ev["start"], ts)
-    else:
-        # netlink confirma el exec; fanotify guardó su identidad antes de que pudiera terminar (B59)
-        snapshot = execfanwatch.recover(pid, root, ts)
-        ev = _complete_partial(snapshot) if snapshot else None
+    # Fanotify fija la identidad de ESTE exec. Netlink puede llegar tras uno o varios re-execs: leer
+    # primero `/proc` reetiquetaba el evento anterior con el programa final, aunque (pid,start) no cambie.
+    snapshot, later = execfanwatch.claim(pid, root, ts)
+    live = describe(pid, root)
+    ev = None
+    if snapshot:
+        same_live = bool(live and not live.get("gone")
+                         and all(live.get(key) == snapshot.get(key) for key in ("pid", "start", "exe", "unit")))
+        if same_live and not later:
+            later = execfanwatch.has_later(snapshot)  # otro exec pudo ocurrir mientras se leía `/proc`
+        if same_live and not later:
+            ev = live  # argv/títulos solo se enriquecen cuando todavía representan al exec confirmado
+            execfanwatch.discard_through(pid, live["start"], ts)
+        else:
+            snapshot.pop("_captured_ns", None)
+            snapshot.update(partial=True, gone=True)
+            ev = _complete_partial(snapshot)
+    elif live and not later and not execfanwatch.has_pending(pid, root):
+        ev = live
+        execfanwatch.discard_through(pid, live["start"], ts)
     if not ev:
         return None
     _remember(ev)  # identidad fuerte: un lector efímero no hereda nunca un pid reutilizado

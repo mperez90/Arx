@@ -53,7 +53,7 @@ MAX_LIBS = 200
 LIBS_PER_SWEEP = 4    # servicios cuyas librerías se aprenden por barrido (dpkg -S por fichero cuesta)
 PREVENTIVE_MAX = 3    # servicios afectados por una actualización hasta los que se corta mientras se prueba
 MAX_EXECS = 64        # programas distintos que lanza un servicio; más, y no hay perfil de hijos que valga
-MAX_EXEC_FINDINGS = 20
+MAX_DNS_FINDINGS = 20
 MAX_DOMAINS = 512     # dominios registrables distintos; más, y no hay perfil de DNS que valga
 MAX_MAPS = 800        # librerías distintas que mapea un servicio
 LIB_PROCS_PER_SWEEP = 40  # procesos cuyas librerías se leen por barrido, por turnos
@@ -1067,8 +1067,10 @@ def _exec_events(subjects: dict, now: datetime, cfg: dict, st: dict | None = Non
             elif phase == "watch" and not _exec_known(s, ev, known):
                 why = "unexpected" if _LOLBINS.match(os.path.basename(ev["exe"])) or not _verified(ev["exe"]) \
                     else "verified"
-        if why and (len(findings) < MAX_EXEC_FINDINGS or why == "sshd"):
-            findings.append(_exec_finding(ev, why))  # cada pid cuenta: el aviso, uno por servicio y programa
+        # La cola ya tiene cota dura. Un límite de ruido aquí consumía y perdía el resto de la ráfaga:
+        # response.handle deduplica por servicio/programa sin borrar ejecutables ni PIDs distintos.
+        if why:
+            findings.append(_exec_finding(ev, why))
     return findings
 
 
@@ -1103,7 +1105,7 @@ def _dns_events(subjects: dict, now: datetime, cfg: dict) -> list[dict]:
             learned.append(dom)
             if len(learned) > MAX_DOMAINS:
                 s["dns_open"] = True
-        elif phase == "watch" and dom not in learned and (path, dom) not in said and len(findings) < MAX_EXEC_FINDINGS:
+        elif phase == "watch" and dom not in learned and (path, dom) not in said and len(findings) < MAX_DNS_FINDINGS:
             said.add((path, dom))
             odd = dnswatch.dga_like(dom)
             findings.append({
