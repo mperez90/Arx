@@ -55,6 +55,10 @@ EOF
 cat > "$PKG/DEBIAN/postinst" <<'EOF'
 #!/bin/sh
 set -e
+# Una actualización de un servicio ya instalado recibe el slice sin rearrancar Arx ni resellar otras units.
+if [ -d /run/systemd/system ] && [ -f /etc/systemd/system/arx.service ]; then
+  arx service refresh-maintenance >/dev/null 2>&1 || true
+fi
 cat <<'MSG'
 
 Arx installed. To put it on guard:
@@ -76,7 +80,15 @@ set -e
 # Sin Arx no queda nada suyo: lo que confinó recupera la red, y sus units, drop-ins y tabla nft se van.
 if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
   if [ -d /run/systemd/system ]; then
-    arx service uninstall >/dev/null 2>&1 || systemctl disable --now arx arx-firewall 2>/dev/null || true
+    if ! arx service uninstall >/dev/null 2>&1; then
+      systemctl disable --now arx arx-firewall 2>/dev/null || true
+      systemctl list-units --type=scope --all --plain --no-legend 2>/dev/null \
+        | awk '$1 ~ /^arx-maint-.*\.scope$/ {print $1}' | xargs -r systemctl stop 2>/dev/null || true
+      rm -f /etc/systemd/system/arx.service /etc/systemd/system/arx-firewall.service \
+        /etc/systemd/system/arx-down.service /etc/systemd/system/arx-revive.service \
+        /etc/systemd/system/arx-revive.timer /etc/systemd/system/arx-maintenance.slice
+      systemctl daemon-reload 2>/dev/null || true
+    fi
   fi
 fi
 exit 0

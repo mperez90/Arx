@@ -4699,6 +4699,287 @@ class RedactionTests(unittest.TestCase):
         self.assertIn("redact", texts[0] + texts[1])
 
 
+class MaintenanceIsolationTests(unittest.TestCase):
+    """Los auxiliares pesados nacen fuera del memcg de Arx; sin aislamiento no se ejecutan dentro."""
+
+    def setUp(self):
+        _isolate()
+        from arx.modules import maintenance
+        self.m = maintenance
+
+    def test_apt_and_dpkg_start_in_a_sibling_scope_only_inside_the_daemon(self):
+        calls = []
+
+        class Proc:
+            def __init__(self, argv, **kwargs):
+                calls.append((argv, kwargs))
+                self.returncode = 0
+
+            def communicate(self, input=None, timeout=None):
+                return "verified\n", ""
+
+        with mock.patch.object(self.m, "_in_arx_service", lambda: True), \
+                mock.patch.object(self.m.shutil, "which", lambda name: "/usr/bin/" + name), \
+                mock.patch.object(self.m.subprocess, "Popen", Proc):
+            result = self.m.run(["dpkg", "--verify", "arx"], capture_output=True, text=True,
+                                cwd="/tmp", env={"PATH": "/usr/bin", "LC_ALL": "C"})
+        argv, kwargs = calls[0]
+        self.assertEqual(argv[:3], ["/usr/bin/systemd-run", "--system", "--scope"])
+        for expected in ("--collect", "--slice=arx-maintenance.slice", "--working-directory=/tmp",
+                         "--property=BindsTo=arx.service", "--property=After=arx.service"):
+            self.assertIn(expected, argv)
+        self.assertIn("--setenv=LC_ALL=C", argv)
+        self.assertEqual(argv[-3:], ["dpkg", "--verify", "arx"])
+        self.assertNotIn("shell", kwargs)
+        self.assertEqual(result.args, ["dpkg", "--verify", "arx"])
+        self.assertEqual(result.stdout, "verified\n")
+
+        calls.clear()
+        with mock.patch.object(self.m, "_in_arx_service", lambda: False), \
+                mock.patch.object(self.m.subprocess, "Popen", Proc):
+            self.m.run(["dpkg", "--verify", "arx"], capture_output=True, text=True)
+        self.assertEqual(calls[0][0], ["dpkg", "--verify", "arx"])
+
+    def test_light_commands_stay_direct_even_inside_the_daemon(self):
+        calls = []
+
+        class Proc:
+            def __init__(self, argv, **kwargs):
+                calls.append(argv)
+                self.returncode = 0
+
+            def communicate(self, input=None, timeout=None):
+                return "", ""
+
+        with mock.patch.object(self.m, "_in_arx_service", lambda: True), \
+                mock.patch.object(self.m.subprocess, "Popen", Proc):
+            self.m.run(["systemctl", "show", "sshd"], capture_output=True)
+        self.assertEqual(calls, [["systemctl", "show", "sshd"]])
+
+    def test_no_isolation_means_unavailable_never_a_direct_retry(self):
+        with mock.patch.object(self.m, "_in_arx_service", lambda: True), \
+                mock.patch.object(self.m.shutil, "which", lambda name: None), \
+                mock.patch.object(self.m.subprocess, "Popen") as popen:
+            with self.assertRaises(self.m.MaintenanceUnavailable):
+                self.m.run(["apt-get", "download", "nginx"])
+        popen.assert_not_called()
+
+    def test_a_launch_error_releases_the_heavy_lock(self):
+        import threading
+        lock = threading.Lock()
+        with mock.patch.object(self.m, "_in_arx_service", lambda: True), \
+                mock.patch.object(self.m, "_heavy_lock", lock), \
+                mock.patch.object(self.m.shutil, "which", lambda name: "/usr/bin/" + name), \
+                mock.patch.object(self.m.subprocess, "Popen", side_effect=TypeError("invalid pipe")):
+            with self.assertRaises(TypeError):
+                self.m.Popen(["dpkg", "--verify", "arx"])
+        self.assertFalse(lock.locked())
+
+    def test_a_busy_heavy_lock_fails_instead_of_blocking_the_guard(self):
+        import threading
+        lock = threading.Lock()
+        lock.acquire()
+        try:
+            with mock.patch.object(self.m, "_in_arx_service", lambda: True), \
+                    mock.patch.object(self.m, "_heavy_lock", lock), \
+                    mock.patch.object(self.m, "LOCK_WAIT_S", 0.01), \
+                    mock.patch.object(self.m.shutil, "which", lambda name: "/usr/bin/" + name), \
+                    mock.patch.object(self.m.subprocess, "Popen") as popen:
+                with self.assertRaises(self.m.MaintenanceUnavailable):
+                    self.m.run(["dpkg-query", "-W", "nginx"], timeout=30)
+            popen.assert_not_called()
+        finally:
+            lock.release()
+
+    def test_a_pipe_error_closes_the_process_and_releases_the_lock(self):
+        import threading
+        processes, lock = [], threading.Lock()
+
+        class Proc:
+            def __init__(self, argv, **kwargs):
+                processes.append(self)
+                self.returncode = -1
+                self.stdin = None
+                self.stdout = io.BytesIO()
+                self.stderr = io.BytesIO()
+
+            def communicate(self, input=None, timeout=None):
+                raise OSError("EIO")
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+        with mock.patch.object(self.m, "_in_arx_service", lambda: True), \
+                mock.patch.object(self.m, "_heavy_lock", lock), \
+                mock.patch.object(self.m.shutil, "which", lambda name: "/usr/bin/" + name), \
+                mock.patch.object(self.m.subprocess, "Popen", Proc):
+            with self.assertRaises(OSError):
+                self.m.run(["dpkg", "--verify", "arx"], capture_output=True)
+        self.assertFalse(lock.locked())
+        self.assertTrue(processes[0].stdout.closed)
+        self.assertTrue(processes[0].stderr.closed)
+
+    def test_timeout_stops_the_whole_scope_and_preserves_the_original_argv(self):
+        import subprocess
+        stopped, calls, processes, killed_cgroups = [], [], [], []
+
+        class Proc:
+            def __init__(self, argv, **kwargs):
+                calls.append(argv)
+                processes.append(self)
+                self.returncode = None
+                self.killed = False
+                self.timeouts = []
+                self.stdin = None
+                self.stdout = io.BytesIO()
+                self.stderr = io.BytesIO()
+
+            def communicate(self, input=None, timeout=None):
+                self.timeouts.append(timeout)
+                if not self.killed:
+                    raise subprocess.TimeoutExpired("systemd-run", timeout)
+                self.returncode = -9
+                return "partial", "late"
+
+            def kill(self):
+                self.killed = True
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+        def stop(argv, **kwargs):
+            stopped.append(argv)
+            return subprocess.CompletedProcess(argv, 1)  # D-Bus falla: cgroup.kill es el respaldo
+
+        with mock.patch.object(self.m, "_in_arx_service", lambda: True), \
+                mock.patch.object(self.m.shutil, "which", lambda name: "/usr/bin/" + name), \
+                mock.patch.object(self.m.subprocess, "Popen", Proc), \
+                mock.patch.object(self.m.subprocess, "run", stop), \
+                mock.patch.object(self.m, "_kill_cgroup",
+                                  side_effect=lambda scope: killed_cgroups.append(scope) or True):
+            with self.assertRaises(subprocess.TimeoutExpired) as caught:
+                self.m.run(["dpkg-deb", "--fsys-tarfile", "/tmp/a.deb"], timeout=1)
+        self.assertEqual(caught.exception.cmd, ["dpkg-deb", "--fsys-tarfile", "/tmp/a.deb"])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(stopped), 1)
+        self.assertEqual(stopped[0][:2], ["systemctl", "stop"])
+        self.assertRegex(stopped[0][2], r"^arx-maint-.*\.scope$")
+        self.assertEqual(killed_cgroups, [stopped[0][2]])
+        self.assertEqual(processes[0].timeouts, [1, self.m.CLEANUP_WAIT_S])
+
+    def test_heavy_commands_are_serialized_and_closing_a_stream_cleans_the_scope(self):
+        import subprocess
+        import threading
+        entered = threading.Event()
+        release = threading.Event()
+        calls, stopped = [], []
+
+        class Proc:
+            def __init__(self, argv, **kwargs):
+                calls.append(argv)
+                self.returncode = None
+                self.stdout = io.BytesIO(b"tar-stream")
+                self.stderr = io.BytesIO()
+                self.stdin = None
+                self.killed = False
+
+            def communicate(self, input=None, timeout=None):
+                entered.set()
+                release.wait(2)
+                self.returncode = 0
+                return "", ""
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                self.returncode = 0
+                return 0
+
+            def kill(self):
+                self.killed = True
+                self.returncode = -9
+
+        with mock.patch.object(self.m, "_in_arx_service", lambda: True), \
+                mock.patch.object(self.m.shutil, "which", lambda name: "/usr/bin/" + name), \
+                mock.patch.object(self.m.subprocess, "Popen", Proc), \
+                mock.patch.object(self.m.subprocess, "run", side_effect=lambda a, **k: stopped.append(a)), \
+                mock.patch.object(self.m, "_heavy_lock", threading.Lock()):
+            first = threading.Thread(target=self.m.run, args=(["apt-cache", "policy", "nginx"],))
+            first.start()
+            self.assertTrue(entered.wait(1))
+            second = threading.Thread(target=self.m.run, args=(["dpkg", "--verify", "nginx"],))
+            second.start()
+            time.sleep(0.05)
+            self.assertEqual(len(calls), 1)
+            release.set()
+            first.join(2)
+            second.join(2)
+            self.assertFalse(first.is_alive() or second.is_alive())
+            self.assertEqual(len(calls), 2)
+
+            proc = self.m.Popen(["dpkg-deb", "--fsys-tarfile", "/tmp/a.deb"], stdout=subprocess.PIPE)
+            proc.close()
+            self.assertTrue(proc._raw.killed)
+        self.assertTrue(any(a[:2] == ["systemctl", "stop"] for a in stopped))
+
+
+class InvestigationQueueTests(unittest.TestCase):
+    def test_one_worker_deduplicates_exact_versions_and_applies_backpressure(self):
+        """Una librería compartida no multiplica hilos; otra versión sí es otro trabajo."""
+        import queue
+        import threading
+        from arx.modules import profile, trust
+        gate, entered, calls = threading.Event(), threading.Event(), []
+        self.addCleanup(gate.set)
+
+        def investigate(pkg, why, cfg):
+            calls.append((pkg, why))
+            entered.set()
+            gate.wait(2)
+
+        q = queue.Queue(maxsize=2)
+        patches = [(profile, "_investigate_queue", q), (profile, "_investigate_jobs", {}),
+                   (profile, "_investigate_worker", []), (trust, "investigate", investigate)]
+        for obj, name, value in patches:
+            p = mock.patch.object(obj, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+        self.assertTrue(profile._investigate_later("libssl3", "first", {}, version="3.0"))
+        self.assertTrue(entered.wait(1))  # el primer trabajo ya salió de la cola: backpressure determinista
+        self.assertTrue(profile._investigate_later("libssl3", "duplicate", {}, version="3.0"))
+        self.assertTrue(profile._investigate_later("libssl3", "new version", {}, version="3.1"))
+        self.assertTrue(profile._investigate_later("libxml2", "another package", {}, version="2.0"))
+        self.assertFalse(profile._investigate_later("zlib1g", "full", {}, version="1.3"))
+        self.assertEqual(calls, [("libssl3", "first")])
+        self.assertEqual(len(profile._investigate_worker), 1)
+        gate.set()
+        deadline = time.monotonic() + 2
+        while profile._investigate_jobs and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual([(pkg, why) for pkg, why in calls], [
+            ("libssl3", "first"), ("libssl3", "new version"), ("libxml2", "another package")])
+        self.assertEqual(profile._investigate_jobs, {})
+
+    def test_a_worker_start_failure_neither_enqueues_nor_deduplicates_the_job(self):
+        import queue
+        from arx.modules import profile
+        q, jobs = queue.Queue(maxsize=1), {}
+        with mock.patch.object(profile, "_investigate_queue", q), \
+                mock.patch.object(profile, "_investigate_jobs", jobs), \
+                mock.patch.object(profile, "_investigate_worker", []), \
+                mock.patch.object(profile.threading, "Thread", side_effect=RuntimeError("TasksMax")):
+            self.assertFalse(profile._investigate_later("libssl3", "updated", {}, version="3.0"))
+        self.assertTrue(q.empty())
+        self.assertEqual(jobs, {})
+
+
 class SelfProtectionTests(unittest.TestCase):
     """DoD-6: parar o tocar a Arx se avisa fuera del host."""
 
@@ -4714,18 +4995,21 @@ class SelfProtectionTests(unittest.TestCase):
                             ("DOWN_UNIT_PATH", os.path.join(self.d, "arx-down.service")),
                             ("REVIVE_UNIT_PATH", os.path.join(self.d, "arx-revive.service")),
                             ("REVIVE_TIMER_PATH", os.path.join(self.d, "arx-revive.timer")),
+                            ("MAINTENANCE_SLICE_PATH", os.path.join(self.d, "arx-maintenance.slice")),
                             ("PLANNED_STOP", os.path.join(self.d, "planned-stop"))]:
             p = mock.patch.object(service, name, value)
             p.start()
             self.addCleanup(p.stop)
         open(self.unit, "w").write(service.unit_text("/usr/bin/arx", enforce=True))
         open(self.early, "w").write(service.early_unit_text("/usr/bin/arx"))
+        open(service.MAINTENANCE_SLICE_PATH, "w").write(service.maintenance_slice_text())
         service._seal_units()
 
-    def _check(self, dpkg="", dropins=()):
+    def _check(self, dpkg="", dropins=(), rc=0):
         class R:
             stdout = dpkg
-        with mock.patch.object(self.s.subprocess, "run", lambda *a, **k: R()):
+            returncode = rc
+        with mock.patch.object(self.s.maintenance, "run", lambda *a, **k: R()):
             return self.s.self_check(dropin_dirs=dropins)
 
     def test_stopping_arx_runs_a_report(self):
@@ -4790,6 +5074,59 @@ class SelfProtectionTests(unittest.TestCase):
 
     def test_an_untouched_arx_says_nothing(self):
         self.assertEqual(self._check(), [])
+
+    def test_the_maintenance_slice_is_sealed_and_bounded_separately(self):
+        text = self.s.maintenance_slice_text()
+        for line in ("MemoryHigh=384M", "MemoryMax=512M", "CPUQuota=50%", "TasksMax=64"):
+            self.assertIn(line, text)
+        self.assertIn(self.s.MAINTENANCE_SLICE_PATH, self.s._units())
+        self.assertTrue(any(p.endswith("/arx-maintenance.slice.d") for p in self.s.DROPIN_DIRS))
+        self.assertIn(self.s.MAINTENANCE_SLICE_PATH,
+                      self.s.config.read_json(self.s.config.state_dir() / "self.json"))
+
+    def test_a_package_upgrade_refreshes_only_the_slice_seal_without_restarting(self):
+        path = self.s.config.state_dir() / "self.json"
+        sealed = self.s.config.read_json(path)
+        sealed[self.unit] = "preserve-the-existing-unit-seal"
+        self.s.config.write_json(path, sealed)
+        with open(self.s.MAINTENANCE_SLICE_PATH, "w") as fh:
+            fh.write("MemoryMax=64G\n")
+        with mock.patch.object(self.s, "_systemd_available", lambda: True), \
+                mock.patch.object(self.s, "_is_root", lambda: True), \
+                mock.patch.object(self.s.subprocess, "run") as systemctl:
+            self.assertEqual(self.s.refresh_maintenance(), 0)
+        sealed = self.s.config.read_json(path)
+        self.assertEqual(sealed[self.unit], "preserve-the-existing-unit-seal")
+        self.assertEqual(sealed[self.s.MAINTENANCE_SLICE_PATH], self.s._sha(self.s.MAINTENANCE_SLICE_PATH))
+        self.assertIn("MemoryMax=512M", open(self.s.MAINTENANCE_SLICE_PATH).read())
+        systemctl.assert_called_once_with(["systemctl", "daemon-reload"], check=False)
+
+    def test_an_old_seal_without_the_maintenance_slice_is_not_clean(self):
+        path = self.s.config.state_dir() / "self.json"
+        sealed = self.s.config.read_json(path)
+        del sealed[self.s.MAINTENANCE_SLICE_PATH]
+        self.s.config.write_json(path, sealed)
+        found = self._check()
+        self.assertTrue(any(f["kind"] == "self_tamper" and
+                            self.s.MAINTENANCE_SLICE_PATH in f["detail"] for f in found))
+
+    def test_unavailable_dpkg_verification_is_explicitly_unknown_not_clean(self):
+        from arx.modules import maintenance
+        with mock.patch.object(self.s.maintenance, "run",
+                               side_effect=maintenance.MaintenanceUnavailable("no sibling scope")):
+            found = self.s.self_check(dropin_dirs=())
+        self.assertEqual([(f["kind"], f["sev"]) for f in found], [("self_check_unavailable", "high")])
+        self.assertIn("could not run", found[0]["detail"])
+
+    def test_dpkg_error_output_is_unknown_not_a_clean_self_check(self):
+        found = self._check(dpkg="dpkg: unable to access the database\n", rc=2)
+        self.assertEqual([(f["kind"], f["sev"]) for f in found], [("self_check_unavailable", "high")])
+        self.assertIn("could not run", found[0]["detail"])
+
+    def test_a_missing_packaged_file_is_tamper_not_a_clean_self_check(self):
+        found = self._check(dpkg="missing   /usr/lib/arx/arx.pyz\n", rc=1)
+        self.assertEqual([(f["kind"], f["sev"]) for f in found], [("self_tamper", "crit")])
+        self.assertIn("/usr/lib/arx/arx.pyz", found[0]["detail"])
 
     def test_a_changed_unit_a_dropin_or_changed_code_is_critical(self):
         open(self.unit, "w").write(self.s.unit_text("/usr/bin/arx", enforce=False))  # alguien le quitó --enforce
@@ -6809,7 +7146,8 @@ class BehaviorWatchTests(unittest.TestCase):
                                      p: v for p, v in self.installed.items() if p in self.libs.get(unit, ())}),
                                  (trust, "assess_async", lambda pkg, deep=True, urgent=False: {
                                      "state": self.state_of.get(pkg, "done"), **self.trust_of.get(pkg, self.trust)}),
-                                 (profile, "_investigate_later", lambda pkg, why, cfg: self.investigated.append(why)),
+                                 (profile, "_investigate_later",
+                                  lambda pkg, why, cfg, version=None: self.investigated.append(why)),
                                  (profile, "_dpkg_changed", lambda st: True)]:
             p = mock.patch.object(obj, name, value)
             p.start()
@@ -7312,6 +7650,17 @@ class TrustTests(unittest.TestCase):
     def _c(self, name, result, required=False):
         return {"name": name, "result": result, "detail": name, "required": required}
 
+    def test_a_dpkg_diagnostic_is_unknown_while_real_differences_still_fail(self):
+        with mock.patch.object(self.t, "_run", return_value=(2, "dpkg: database is locked\n")):
+            self.assertEqual(self.t.check_files(self.F)["result"], "unknown")
+        with mock.patch.object(self.t, "_run", return_value=(1, "??5??????   /usr/bin/xz\n")):
+            self.assertEqual(self.t.check_files(self.F)["result"], "fail")
+        with mock.patch.object(self.t, "_run", return_value=(1, "missing   /usr/bin/xz\n")):
+            self.assertEqual(self.t.check_files(self.F)["result"], "fail")
+        with mock.patch.object(self.t, "_run", return_value=(1, "??5??????  c /etc/xz.conf\n")), \
+                mock.patch.object(self.t, "_conffiles", return_value={"/etc/xz.conf"}):
+            self.assertEqual(self.t.check_files(self.F)["result"], "pass")
+
     def test_the_repository_copy_is_compared_streaming_file_by_file(self):
         """DoD-8: un paquete grande no puede llevar a Arx a su tope de memoria: tar y hashes en streaming."""
         import io
@@ -7320,9 +7669,11 @@ class TrustTests(unittest.TestCase):
         for name, data in (("same", b"oficial"), ("changed", b"alterado")):
             with open(os.path.join(root, name), "wb") as f:
                 f.write(data)
+        os.symlink(os.path.join(root, "same"), os.path.join(root, "linked"))
         buf = io.BytesIO()
         with tarfile.open(fileobj=buf, mode="w") as tar:
-            for name, data in (("same", b"oficial"), ("changed", b"oficial")):
+            for name, data in (("same", b"oficial"), ("changed", b"oficial"),
+                               ("missing", b"oficial"), ("linked", b"oficial")):
                 info = tarfile.TarInfo("." + os.path.join(root, name))
                 info.size = len(data)
                 tar.addfile(info, io.BytesIO(data))
@@ -7332,18 +7683,17 @@ class TrustTests(unittest.TestCase):
         class Proc:
             stdout = io.BytesIO(buf.getvalue())
 
-            def kill(self):
-                pass
-
-            def wait(self):
+            def close(self):
                 pass
         with mock.patch.object(self.t, "_cached_deb", lambda f: deb), \
                 mock.patch.object(self.t.shutil, "which", lambda name: "/usr/bin/" + name), \
                 mock.patch.object(self.t, "_conffiles", lambda pkg: set()), \
-                mock.patch.object(self.t.subprocess, "Popen", lambda *a, **k: Proc()):
+                mock.patch.object(self.t.maintenance, "Popen", lambda *a, **k: Proc()):
             c = self.t.check_repository_copy({"package": "acme", "version": "1.0"})
         self.assertEqual(c["result"], "fail")
         self.assertIn(os.path.join(root, "changed"), c["detail"])
+        self.assertIn(os.path.join(root, "missing"), c["detail"])
+        self.assertIn(os.path.join(root, "linked"), c["detail"])
         self.assertNotIn(os.path.join(root, "same"), c["detail"])
 
     def test_the_deb_apt_just_installed_is_used_only_if_the_signed_index_vouches_for_it(self):

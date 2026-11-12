@@ -15,7 +15,8 @@ v() { limactl shell "$VM" sudo "$@"; }
 check() { local d="$1"; shift; if "$@"; then pass "$d"; else fail "$d"; fi; }
 wait_for() { local n="$1"; shift; local i; for i in $(seq "$n"); do "$@" && return 0; sleep 1; done; return 1; }
 in_unit() { local u="$1"; shift; v sh -c "echo \$\$ > /sys/fs/cgroup/system.slice/$u/cgroup.procs && exec $*"; }
-leftovers() { v sh -c 'ls /etc/systemd/system/*.service.d/9[01]-arx-*.conf /etc/systemd/system/arx*.service /etc/systemd/system/arx*.timer 2>/dev/null
+leftovers() { v sh -c 'ls /etc/systemd/system/*.service.d/9[01]-arx-*.conf /etc/systemd/system/arx*.service /etc/systemd/system/arx*.timer /etc/systemd/system/arx*.slice 2>/dev/null
+  systemctl list-units --type=scope --all --plain --no-legend 2>/dev/null | awk '\''$1 ~ /^arx-maint-.*\.scope$/ {print $1}'\''
   grep -lsE "inet:arx:|inet arx confined" /etc/systemd/system.control/*.service.d/*.conf
   nft list table inet arx >/dev/null 2>&1 && echo "tabla inet arx"
   ls -d /etc/arx /var/lib/arx 2>/dev/null; true'; }
@@ -24,9 +25,11 @@ limactl list --format '{{.Status}}' "$VM" 2>/dev/null | grep -q Running || limac
 
 step "víctima limpia, Arx instalado desde su paquete"
 v bash -c 'systemctl disable --now arx arx-firewall loose 2>/dev/null; pkill -9 -f "[a]rx.pyz"
+  systemctl list-units --type=scope --all --plain --no-legend | awk '\''$1 ~ /^arx-maint-.*\.scope$/ {print $1}'\'' | xargs -r systemctl stop
   apt-get -o DPkg::Lock::Timeout=300 purge -y -qq arx >/dev/null 2>&1
   rm -rf /etc/arx /var/lib/arx /tmp/arxsrc /opt/loose /etc/systemd/system/loose.service \
-    /etc/systemd/system/*.service.d/9[01]-arx-*.conf /etc/systemd/system/arx*.service /etc/systemd/system/arx*.timer
+    /etc/systemd/system/*.service.d/9[01]-arx-*.conf /etc/systemd/system/arx*.service /etc/systemd/system/arx*.timer \
+    /etc/systemd/system/arx*.slice
   grep -lsE "inet:arx:|inet arx confined" /etc/systemd/system.control/*.service.d/*.conf | xargs -r rm -f
   nft delete table inet arx 2>/dev/null; systemctl daemon-reload
   export DEBIAN_FRONTEND=noninteractive; apt-get -o DPkg::Lock::Timeout=300 install -y -qq socat nftables netcat-openbsd >/dev/null'

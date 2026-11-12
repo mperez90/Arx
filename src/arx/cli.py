@@ -522,6 +522,7 @@ def main(argv: list[str] | None = None) -> int:
     ssub.add_parser("restore", help=tr("put Arx's containment back in the kernel (runs at boot)"))
     ssub.add_parser("stopped", help=tr("report that Arx was stopped (systemd runs it)"))
     ssub.add_parser("down", help=tr("report Arx's real systemd restart state (systemd runs it)"))
+    ssub.add_parser("refresh-maintenance", help=tr("refresh the maintenance slice after a package upgrade"))
     p_acc = sub.add_parser("accept", help=tr("accept a legitimate change as normal (adds it to the "
                                              "baseline)"))
     p_acc.add_argument("fp", nargs="?", help=tr("finding id (no id: list acceptable findings)"))

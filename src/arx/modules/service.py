@@ -18,12 +18,14 @@ from pathlib import Path
 
 from arx import config
 from arx.i18n import tr
+from arx.modules import maintenance
 
 UNIT_PATH = "/etc/systemd/system/arx.service"
 EARLY_UNIT_PATH = "/etc/systemd/system/arx-firewall.service"
 DOWN_UNIT_PATH = "/etc/systemd/system/arx-down.service"
 REVIVE_UNIT_PATH = "/etc/systemd/system/arx-revive.service"
 REVIVE_TIMER_PATH = "/etc/systemd/system/arx-revive.timer"
+MAINTENANCE_SLICE_PATH = "/etc/systemd/system/arx-maintenance.slice"
 
 
 def _is_root() -> bool:
@@ -125,6 +127,23 @@ TimeoutStartSec=90
 """
 
 
+def maintenance_slice_text() -> str:
+    """Presupuesto agregado de APT/dpkg, separado de los 512 MiB del guardián.
+
+    Los auxiliares se serializan. 384/512 MiB parten del incidente medido (varios auxiliares
+    agotaron los 512 MiB de Arx); el laboratorio debe medir paquetes grandes antes del RC.
+    """
+    return """[Unit]
+Description=Arx - bounded APT and dpkg maintenance helpers
+
+[Slice]
+MemoryHigh=384M
+MemoryMax=512M
+CPUQuota=50%
+TasksMax=64
+"""
+
+
 def revive_unit_text() -> str:
     """Solo si quedó en fallo: una parada hecha a mano no se deshace."""
     systemctl = shutil.which("systemctl") or "/usr/bin/systemctl"
@@ -168,6 +187,8 @@ def _manual_instructions(dest: Path) -> None:
     else:
         print(tr("Requires root. Install it with:"))
     print(f"  sudo cp {dest} {UNIT_PATH}")
+    slice_dest = dest.with_name("arx-maintenance.slice")
+    print(f"  sudo cp {slice_dest} {MAINTENANCE_SLICE_PATH}")
     print("  sudo systemctl daemon-reload && sudo systemctl enable --now arx")
 
 
@@ -185,6 +206,7 @@ def install(exec_start: str | None = None, enforce: bool = False) -> int:
     if not (_systemd_available() and _is_root()):
         dest = config.state_dir() / "arx.service"
         dest.write_text(text)
+        (config.state_dir() / "arx-maintenance.slice").write_text(maintenance_slice_text())
         _manual_instructions(dest)
         return 0
     Path(UNIT_PATH).write_text(text)
@@ -192,6 +214,7 @@ def install(exec_start: str | None = None, enforce: bool = False) -> int:
     Path(DOWN_UNIT_PATH).write_text(down_unit_text(exec_start or _default_exec()))
     Path(REVIVE_UNIT_PATH).write_text(revive_unit_text())
     Path(REVIVE_TIMER_PATH).write_text(revive_timer_text())
+    Path(MAINTENANCE_SLICE_PATH).write_text(maintenance_slice_text())
     _seal_units()
     subprocess.run(["systemctl", "daemon-reload"], check=False)
     subprocess.run(["systemctl", "enable", "arx-firewall"], check=False)
@@ -204,12 +227,27 @@ def install(exec_start: str | None = None, enforce: bool = False) -> int:
     return 1
 
 
+def refresh_maintenance() -> int:
+    """Una actualización instala el slice sin rearrancar ni resellar units que no escribió."""
+    if not (_systemd_available() and _is_root()):
+        return 1
+    if not os.path.exists(UNIT_PATH):
+        return 0
+    Path(MAINTENANCE_SLICE_PATH).write_text(maintenance_slice_text())
+    sealed = config.read_json(config.state_dir() / "self.json", {}) or {}
+    sealed[MAINTENANCE_SLICE_PATH] = _sha(MAINTENANCE_SLICE_PATH)
+    config.write_json(config.state_dir() / "self.json", sealed)
+    subprocess.run(["systemctl", "daemon-reload"], check=False)
+    return 0
+
+
 # ── autoprotección (DoD-6): parar o tocar a Arx se avisa fuera del host ───────
 PLANNED_STOP = "/run/arx/planned-stop"
 PLANNED_STOP_S = 300
 def _units() -> tuple:
-    return UNIT_PATH, EARLY_UNIT_PATH, DOWN_UNIT_PATH, REVIVE_UNIT_PATH, REVIVE_TIMER_PATH
-DROPIN_DIRS = tuple(f"{p}.d" for p in (UNIT_PATH, EARLY_UNIT_PATH, DOWN_UNIT_PATH, REVIVE_UNIT_PATH, REVIVE_TIMER_PATH))
+    return (UNIT_PATH, EARLY_UNIT_PATH, DOWN_UNIT_PATH, REVIVE_UNIT_PATH, REVIVE_TIMER_PATH,
+            MAINTENANCE_SLICE_PATH)
+DROPIN_DIRS = tuple(f"{p}.d" for p in _units())
 
 
 def _sha(path: str) -> str | None:
@@ -230,6 +268,10 @@ def self_check(dropin_dirs=DROPIN_DIRS) -> list[dict]:
     """Arx comprueba que nadie lo ha tocado: sus units, sus drop-ins y sus ficheros (contra dpkg)."""
     findings = []
     sealed = config.read_json(config.state_dir() / "self.json", {}) or {}
+    for path in _units():
+        if sealed and path not in sealed:
+            findings.append(_tamper(tr("Arx's unit {path} was changed or removed", path=path),
+                                    f"unit|{path}|unsealed"))
     for path, sha in sealed.items():
         now = _sha(path)
         if sha and now != sha:
@@ -242,14 +284,32 @@ def self_check(dropin_dirs=DROPIN_DIRS) -> list[dict]:
         if extra:
             findings.append(_tamper(tr("someone added drop-ins to Arx's unit: {files}", files=", ".join(extra)),
                                     f"dropin|{d}|{','.join(extra)}"))
+    rc, unavailable = 0, False
+    inside = maintenance._in_arx_service()
     try:
-        out = subprocess.run(["dpkg", "--verify", "arx"], capture_output=True, text=True, timeout=30).stdout
-    except (OSError, subprocess.TimeoutExpired):
-        out = ""
+        result = maintenance.run(["dpkg", "--verify", "arx"], capture_output=True,
+                                 text=True, timeout=30)
+        out, rc = result.stdout or "", result.returncode
+    except maintenance.MaintenanceUnavailable:
+        out, unavailable = "", True
+    except subprocess.TimeoutExpired:
+        out, unavailable = "", True
+    except OSError:
+        # Una CLI en macOS o un host sin dpkg no declara integridad: simplemente no hace esta prueba.
+        out, unavailable = "", inside
     changed = [line.split()[-1] for line in out.splitlines() if len(line) > 2 and line[2] == "5"]
+    changed += [line.split(None, 1)[1].strip() for line in out.splitlines() if line.startswith("missing ")]
     if changed:
         findings.append(_tamper(tr("Arx's own files differ from its package: {files}", files=", ".join(changed[:3])),
                                 f"code|{','.join(changed)}"))
+    elif unavailable or rc != 0:
+        detail = (tr("Arx could not run dpkg --verify in its isolated maintenance slice; "
+                     "file integrity is unknown") if inside else
+                  tr("Arx could not run dpkg --verify; file integrity is unknown"))
+        why = (tr("without an isolated dpkg, Arx must not report a clean self-check") if inside else
+               tr("a failed verification must not be reported as clean"))
+        findings.append({"sev": "high", "kind": "self_check_unavailable", "detail": detail,
+                         "why": why, "fp_key": "self_check_unavailable|dpkg"})
     return findings
 
 
@@ -372,8 +432,8 @@ def stopped(env=None, notify_send=None) -> int:
 def uninstall() -> int:
     if not (_systemd_available() and _is_root()):
         print(tr("Requires Linux + root with systemd. On the server:"))
-        print(f"  sudo systemctl disable --now arx arx-firewall && sudo rm -f {UNIT_PATH} {EARLY_UNIT_PATH} "
-              "&& sudo systemctl daemon-reload")
+        print(f"  sudo systemctl disable --now arx arx-firewall arx-revive.timer && sudo rm -f "
+              f"{' '.join(_units())} && sudo systemctl daemon-reload")
         return 0
     try:  # la parada que viene es la de su propia desinstalación: no es un ataque
         os.makedirs(os.path.dirname(PLANNED_STOP), exist_ok=True)
@@ -381,6 +441,7 @@ def uninstall() -> int:
     except OSError:
         pass
     subprocess.run(["systemctl", "disable", "--now", "arx-revive.timer", "arx", "arx-firewall"], check=False)
+    maintenance.stop_all()
     try:  # la marca vale solo para esta parada: si Arx ya estaba parado, no puede tragarse la siguiente
         os.unlink(PLANNED_STOP)
     except OSError:
@@ -424,4 +485,6 @@ def run(action: str, exec_start: str | None = None, enforce: bool = False) -> in
         return install(exec_start, enforce)
     if action == "uninstall":
         return uninstall()
+    if action == "refresh-maintenance":
+        return refresh_maintenance()
     return status()

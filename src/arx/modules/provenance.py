@@ -25,6 +25,7 @@ import subprocess
 import time
 
 from arx.i18n import tr
+from arx.modules import maintenance
 
 DPKG_INFO = "/var/lib/dpkg/info"
 CACHE_S = 300
@@ -72,8 +73,8 @@ def clear_cache() -> None:
 def _q(argv: list[str], timeout: int = 10) -> str | None:
     """Salida de un comando del sistema, siempre en inglés (se analiza) y sin shell."""
     try:
-        r = subprocess.run(argv, capture_output=True, text=True, errors="replace", timeout=timeout,
-                           env={**os.environ, "LC_ALL": "C", "LANG": "C"})
+        r = maintenance.run(argv, capture_output=True, text=True, errors="replace", timeout=timeout,
+                            env={**os.environ, "LC_ALL": "C", "LANG": "C"})
     except (OSError, subprocess.TimeoutExpired):
         return None
     return r.stdout if r.returncode == 0 else None

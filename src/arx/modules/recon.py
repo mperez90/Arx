@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from arx.i18n import tr
+from arx.modules import maintenance
 
 TIMEOUT = 8  # segundos por comando; los colectores lentos lo suben explícitamente
 
@@ -34,7 +35,7 @@ SEV_LABEL = {"crit": tr("CRITICAL"), "high": "ALTO", "med": "MEDIO", "low": "BAJ
 def _run(args: list[str], timeout: int = TIMEOUT) -> str | None:
     """Ejecuta un comando (sin shell). Devuelve stdout o None ante cualquier fallo."""
     try:
-        r = subprocess.run(args, capture_output=True, text=True, errors="replace", timeout=timeout)
+        r = maintenance.run(args, capture_output=True, text=True, errors="replace", timeout=timeout)
     except (FileNotFoundError, subprocess.TimeoutExpired, PermissionError, OSError):
         return None
     return r.stdout.strip() if r.returncode == 0 else None

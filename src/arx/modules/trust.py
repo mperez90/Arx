@@ -39,6 +39,7 @@ from datetime import datetime, timezone
 
 from arx import config
 from arx.i18n import tr
+from arx.modules import maintenance
 
 TRUST_MIN = 0.98
 CACHE_DAYS = 7
@@ -83,8 +84,8 @@ def _cache_path():
 
 def _run(argv: list[str], timeout: int = 30) -> tuple[int, str]:
     try:
-        r = subprocess.run(argv, capture_output=True, text=True, errors="replace", timeout=timeout,
-                           env={**os.environ, "LC_ALL": "C", "LANG": "C"})
+        r = maintenance.run(argv, capture_output=True, text=True, errors="replace", timeout=timeout,
+                            env={**os.environ, "LC_ALL": "C", "LANG": "C"})
     except (OSError, subprocess.TimeoutExpired):
         return -1, ""
     return r.returncode, r.stdout
@@ -137,13 +138,30 @@ def check_signed(f: dict) -> dict:
 def check_files(f: dict) -> dict:
     """El paquete entero, no solo el binario: una librería alterada pasa por el mismo sitio."""
     rc, out = _run(["dpkg", "--verify", f["package"]], timeout=120)
-    if rc < 0:
+    if rc != 0 and not out.strip():
         return _check("files_intact", "unknown", tr("dpkg --verify did not answer"), required=True)
-    changed = [line[13:].strip() for line in out.splitlines()
-               if len(line) > 13 and line[2] == "5" and line[11] != "c"]
+    conf = _conffiles(f["package"])
+    changed, recognized, ignored = [], 0, 0
+    for line in out.splitlines():
+        if len(line) > 13 and line[2] == "5":
+            recognized += 1
+            if line[11] == "c":
+                ignored += 1
+            else:
+                changed.append(line[13:].strip())
+        elif line.startswith("missing "):
+            recognized += 1
+            rest = line[len("missing"):].strip()
+            is_conf, path = rest.startswith("c "), rest[2:] if rest.startswith("c ") else rest
+            if is_conf or path in conf:
+                ignored += 1
+            else:
+                changed.append(path)
     if changed:
         return _check("files_intact", "fail", tr("changed since installed: {files}", files=", ".join(changed[:3])),
                       required=True)
+    if rc != 0 and not (rc == 1 and recognized and recognized == ignored):
+        return _check("files_intact", "unknown", tr("dpkg --verify did not complete"), required=True)
     return _check("files_intact", "pass", tr("every file matches what dpkg installed"), required=True)
 
 
@@ -175,8 +193,8 @@ def check_repository_copy(f: dict) -> dict:
         conf, differ, compared = _conffiles(f["package"]), [], 0
         deadline = time.monotonic() + COMPARE_BUDGET_S
         try:  # en streaming: un paquete grande no puede llevar a Arx a su tope de memoria
-            proc = subprocess.Popen(["dpkg-deb", "--fsys-tarfile", deb], stdout=subprocess.PIPE,
-                                    stderr=subprocess.DEVNULL)
+            proc = maintenance.Popen(["dpkg-deb", "--fsys-tarfile", deb], stdout=subprocess.PIPE,
+                                     stderr=subprocess.DEVNULL)
         except OSError:
             return _check("matches_repository", "unknown", tr("could not open the official package"))
         try:
@@ -187,13 +205,17 @@ def check_repository_copy(f: dict) -> dict:
                     if not member.isreg():
                         continue
                     path = "/" + member.name.lstrip("./")
-                    if path in conf or not os.path.isfile(path) or os.path.islink(path):
+                    if path in conf:
+                        continue
+                    if not os.path.isfile(path) or os.path.islink(path):
+                        differ.append(path)  # falta o dejó de ser el archivo regular que firmó el paquete
                         continue
                     expected = _sha256_of(tar.extractfile(member))
                     try:
                         with open(path, "rb") as fh:
                             actual = _sha256_of(fh)
                     except OSError:
+                        differ.append(path)
                         continue
                     compared += 1
                     if actual != expected:
@@ -201,8 +223,7 @@ def check_repository_copy(f: dict) -> dict:
         except (tarfile.TarError, OSError):
             return _check("matches_repository", "unknown", tr("could not open the official package"))
         finally:
-            proc.kill()
-            proc.wait()
+            proc.close()
         if differ:
             return _check("matches_repository", "fail",
                           tr("differs from the official package: {files}", files=", ".join(differ[:3])))
@@ -251,8 +272,8 @@ def _cached_deb(f: dict) -> str | None:
 
 def _run_in(cwd: str, argv: list[str], timeout: int = 180) -> tuple[int, str]:
     try:
-        r = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, errors="replace", timeout=timeout,
-                           env={**os.environ, "LC_ALL": "C", "LANG": "C"})
+        r = maintenance.run(argv, cwd=cwd, capture_output=True, text=True, errors="replace", timeout=timeout,
+                            env={**os.environ, "LC_ALL": "C", "LANG": "C"})
     except (OSError, subprocess.TimeoutExpired):
         return -1, ""
     return r.returncode, r.stdout

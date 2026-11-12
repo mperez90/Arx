@@ -39,6 +39,18 @@ ES = {
         "instalado hace {days:.1f} días",
     "dpkg --verify did not answer":
         "dpkg --verify no respondió",
+    "refresh the maintenance slice after a package upgrade":
+        "actualizar el slice de mantenimiento tras actualizar el paquete",
+    "dpkg --verify did not complete":
+        "dpkg --verify no terminó correctamente",
+    "Arx could not run dpkg --verify; file integrity is unknown":
+        "Arx no pudo ejecutar dpkg --verify; la integridad es desconocida",
+    "a failed verification must not be reported as clean":
+        "una verificación fallida no debe informarse como limpia",
+    "Arx could not run dpkg --verify in its isolated maintenance slice; file integrity is unknown":
+        "Arx no pudo ejecutar dpkg --verify en su slice aislado de mantenimiento; la integridad es desconocida",
+    "without an isolated dpkg, Arx must not report a clean self-check":
+        "sin un dpkg aislado, Arx no debe informar de una autocomprobación limpia",
     "changed since installed: {files}":
         "cambiado desde que se instaló: {files}",
     "apt is not available":

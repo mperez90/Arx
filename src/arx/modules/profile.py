@@ -29,10 +29,12 @@ import hmac
 import ipaddress
 import json
 import os
+import queue
 import random
 import re
 import shutil
 import subprocess
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -503,19 +505,50 @@ def provenance_q(argv: list[str], timeout: int = 10) -> str | None:
 
 
 RECHECK_S = 3600  # lo que tarde el modelo en investigar se recoge en los barridos de la hora siguiente
+INVESTIGATE_QUEUE = 8
+_investigate_queue: queue.Queue = queue.Queue(maxsize=INVESTIGATE_QUEUE)
+_investigate_jobs: dict[tuple[str, str], float] = {}
+_investigate_lock = threading.Lock()
+_investigate_worker: list = []
 
 
-def _investigate_later(pkg: str, why: str, cfg: dict) -> None:
-    """El modelo investiga en segundo plano: ocho pasos de un modelo dejarían la guardia ciega minutos."""
-    import threading
+def _investigate_work() -> None:
     from arx.modules import trust
-
-    def run():
+    while True:
+        pkg, why, cfg, key = _investigate_queue.get()
         try:
             trust.investigate(pkg, why, cfg)
         except Exception:  # sin la investigación del modelo, mandan las pruebas del código
             pass
-    threading.Thread(target=run, name=f"arx-investigate-{pkg}", daemon=True).start()
+        finally:
+            with _investigate_lock:
+                _investigate_jobs.pop(key, None)
+            _investigate_queue.task_done()
+
+
+def _investigate_later(pkg: str, why: str, cfg: dict, version: str | None = None) -> bool:
+    """Un solo worker, cola finita y una investigación por paquete+versión.
+
+    Una librería cargada por muchos servicios no multiplica hilos ni comandos dpkg. Si la cola está
+    llena se pierde esta ampliación del modelo, nunca las pruebas deterministas ni la guardia.
+    """
+    key = (pkg, version or "unknown")
+    with _investigate_lock:
+        if key in _investigate_jobs:
+            return True
+        if not (_investigate_worker and _investigate_worker[0].is_alive()):
+            try:
+                worker = threading.Thread(target=_investigate_work, name="arx-investigate", daemon=True)
+                worker.start()
+            except (OSError, RuntimeError):
+                return False  # no se encola ni se deduplica un trabajo que no tiene worker
+            _investigate_worker[:] = [worker]
+        try:
+            _investigate_queue.put_nowait((pkg, why, dict(cfg), key))
+        except queue.Full:
+            return False
+        _investigate_jobs[key] = time.monotonic()
+    return True
 
 
 def _critical(unit: str) -> bool:
@@ -550,7 +583,7 @@ def _updates(subjects: dict, cfg: dict, now: datetime, check_versions: bool = Tr
             old, s["version"] = s["version"], version
             s["recheck"] = _iso(now)
             _investigate_later(pkg, tr("service {unit} was updated from {old} to {new}", unit=s["unit"],
-                                       old=old, new=version), cfg)
+                                       old=old, new=version), cfg, version=version)
         if s.get("libs") is None:
             if learned < LIBS_PER_SWEEP:  # de a pocos en cada barrido: dpkg -S por fichero cuesta
                 libs = _library_packages(s["unit"], pkg)
@@ -564,7 +597,8 @@ def _updates(subjects: dict, cfg: dict, now: datetime, check_versions: bool = Tr
                     s["recheck"] = _iso(now)
                     s["recheck_libs"] = sorted(set(s.get("recheck_libs") or []) | {lib})
                     _investigate_later(lib, tr("library package {lib}, loaded by {unit}, was updated from {old} "
-                                               "to {new}", lib=lib, unit=s["unit"], old=old, new=new), cfg)
+                                               "to {new}", lib=lib, unit=s["unit"], old=old, new=new), cfg,
+                                       version=new)
             # lo ya conocido se queda (tras actualizarse, la vieja sale como «(deleted)» hasta reiniciar)
             known = {lib: installed[lib] for lib in s["libs"] if lib in installed}
             s["libs"] = {**known, **_library_packages(s["unit"], pkg)}
