@@ -1,6 +1,21 @@
 """Arx · catálogo español. La clave es el texto fuente (inglés) tal como aparece en tr(...)."""
 
 ES = {
+    "full": "completa",
+    "partial": "parcial",
+    "degraded": "degradada",
+    "unavailable": "no disponible",
+    "off": "desactivada",
+    "  exec identity capture: {mode}":
+        "  captura de identidad de exec: {mode}",
+    "  process watch  {mode} · exec identity: {capture}":
+        "  procesos       {mode} · identidad de exec: {capture}",
+    "  capture stats  {captured} captured · {dropped} dropped · {overflow} overflow(s)":
+        "  capturas       {captured} guardadas · {dropped} descartadas · {overflow} desbordamiento(s)",
+    "  sensitive files {mode}":
+        "  ficheros sensibles {mode}",
+    "  watch status   not reported by the guard":
+        "  vigilancia     sin estado publicado por el guardián",
     "{k} appeared since the baseline was sealed":
         "{k} apareció después de sellar la línea base",
     "{k} disappeared since the baseline was sealed":
@@ -199,6 +214,10 @@ ES = {
         "en el kernel, en tiempo real",
     "each sweep (no kernel connector here)":
         "en cada barrido (aquí no hay conector del kernel)",
+    " (the process had already exited; fanotify preserved its exec identity)":
+        " (el proceso ya había terminado; fanotify conservó la identidad de su exec)",
+    "the process already exited; its exec identity was captured before FAN_ALLOW, so retroactive containment is unavailable":
+        "el proceso ya terminó; su identidad de exec se capturó antes de FAN_ALLOW, por lo que no hay contención retroactiva",
     "sshd ran a program before authentication (the xz backdoor pattern)":
         "sshd lanzó un programa antes de autenticar (el patrón de la puerta trasera de xz)",
     "{unit}: sshd, before authenticating anyone, ran {exe}":

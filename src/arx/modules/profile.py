@@ -999,6 +999,8 @@ def _exec_finding(ev: dict, why: str) -> dict:
         detail = tr("{unit} started {exe}, which it never ran while Arx observed it", unit=unit, exe=exe)
         if why == "verified":  # de un paquete verificado y no es una herramienta de ataque: avisar, sin aislar
             sev = "med"
+    if ev.get("partial"):
+        detail += tr(" (the process had already exited; fanotify preserved its exec identity)")
     return {"sev": sev, "kind": "unexpected_exec", "detail": detail, "harm": harm,
             "why": tr("a compromised program shows itself by what it starts"),
             "target": {"pid": ev["pid"], "start": ev["start"], "exe": exe, "unit": unit,
@@ -1013,7 +1015,10 @@ def _exec_finding(ev: dict, why: str) -> dict:
                                                                   "its environment: alert only, no login is blocked")}
                           if ev.get("env_injected") else {}),
                        **({"scope": ev["scope"], "scope_frozen": bool(ev.get("scope_frozen"))} if ev.get("scope") else {}),
-                       **({"alert_only": True} if why == "sshd" and ev.get("sure") is False else {})},
+                       **({"alert_only": True} if why == "sshd" and ev.get("sure") is False else {}),
+                       **({"alert_only": True, "alert_reason": tr("the process already exited; its exec identity "
+                                                                  "was captured before FAN_ALLOW, so retroactive "
+                                                                  "containment is unavailable")} if ev.get("partial") else {})},
             # con el usuario de claves, lo que se acepta es el script que corrió, nunca su intérprete suelto
             "set": "unexpected_exec", "item": f"{ev['unit']}|{ev.get('akc_learn') or exe}",
             # uno por servicio y programa (las instancias por conexión, sshd@…, cuentan como una): los procesos
@@ -1245,7 +1250,8 @@ def _read_events(subjects: dict, now: datetime, cfg: dict) -> list[dict]:
                              file=f),
                 "why": tr("a service reaching for keys or passwords it never used is what an intruder does"),
                 # el servicio entero sin salida: quien lee suele ser su proceso principal, que no se saca de su cgroup
-                "target": {"unit": s["unit"], "cgroup": ev["unit"], "pid": ev["pid"], "exe": ev["exe"]},
+                "target": {"unit": s["unit"], "cgroup": ev["unit"], "pid": ev["pid"], "start": ev.get("start"),
+                           "exe": ev["exe"]},
                 "fp_key": f"sensitive_read|{ev['unit']}|{f}"})
     return findings
 

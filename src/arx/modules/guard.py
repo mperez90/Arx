@@ -390,6 +390,23 @@ def mode_seen() -> bool | None:
     return config.read_json(_mode_seen_path(), {}).get("enforce")
 
 
+def _watch_path():
+    return config.state_dir() / "watch.json"
+
+
+def watch_status() -> dict:
+    """Última cobertura publicada por el daemon; la CLI no comparte su memoria."""
+    return config.read_json(_watch_path(), {})
+
+
+def persist_watch_status() -> dict:
+    """Solo desde el bucle del guardián: jamás escribir disco antes de un FAN_ALLOW."""
+    state = {"process": execwatch.status(), "sensitive_files": filewatch.status(),
+             "at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+    config.write_json(_watch_path(), state)
+    return state
+
+
 def _daily_report(cfg: dict, now: float | None = None) -> bool:
     """Una vez al día, lo que espera tu decisión y cómo va el ruido. Sin canales, nada."""
     if not notify.channels(cfg) or (cfg.get("notify") or {}).get("daily_report") is False:
@@ -481,10 +498,14 @@ def run(once: bool = False, interval: int = 30, chat: bool = False, enforce: boo
     slow = SlowLayer(cfg, base, enforce)
     if not once and response._is_linux_root():  # cada exec, al instante (F18.2)
         mode = execwatch.start(lambda: slow.enforce)
+        filewatch.start()
         print(tr("  process watch: {mode}", mode=tr("in the kernel, in real time") if mode == "netlink"
                  else tr("each sweep (no kernel connector here)")))
+        print(tr("  exec identity capture: {mode}", mode=tr(execwatch.status()["capture"]["mode"])))
         print(tr("  DNS watch: {mode}", mode=tr("on") if dnswatch.start() else tr("not available here")))
-        print(tr("  sensitive files: {mode}", mode=tr("on") if filewatch.start() else tr("not available here")))
+        print(tr("  sensitive files: {mode}", mode=tr(filewatch.status()["mode"])))
+    if not once:
+        _quietly(persist_watch_status, None)
     if not once and telegram.enabled(cfg):  # en un hilo: el chat nunca retrasa la defensa
         threading.Thread(target=telegram.loop, args=(cfg,), daemon=True).start()
     started_with = enforce
@@ -505,6 +526,8 @@ def run(once: bool = False, interval: int = 30, chat: bool = False, enforce: boo
         slow.base = base
         enforce = slow.enforce = telegram.effective_enforce(started_with)  # /modo desde el chat
         config.write_json(_mode_seen_path(), {"enforce": enforce})
+        if not once:
+            _quietly(persist_watch_status, None)
         _quietly(lambda: _daily_report(cfg), None)
         include_suid = time.monotonic() - last_suid >= SUID_EVERY_S
         if include_suid:

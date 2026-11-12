@@ -3891,6 +3891,132 @@ class ConsensusServerTests(unittest.TestCase):
         self.assertEqual(self.srv.network_of("nope"), "")
 
 
+class WatchStatusTests(unittest.TestCase):
+    def setUp(self):
+        _isolate()
+
+    def test_the_guard_publishes_watcher_coverage_for_another_process(self):
+        from arx import config
+        from arx.modules import execwatch, filewatch, guard
+        process = {"mode": "netlink", "lost": 0,
+                   "capture": {"mode": "partial", "captured": 4, "dropped": 1, "overflow": 2}}
+        files = {"mode": "full", "overflow": 0}
+        with mock.patch.object(execwatch, "status", return_value=process), \
+                mock.patch.object(filewatch, "status", return_value=files):
+            guard.persist_watch_status()
+        saved = config.read_json(config.state_dir() / "watch.json")
+        self.assertEqual(saved["process"], process)
+        self.assertEqual(saved["sensitive_files"], files)
+        self.assertTrue(saved["at"].endswith("+00:00"))
+        self.assertEqual(guard.watch_status(), saved)
+
+    def test_fleet_heartbeat_includes_the_published_watch_status(self):
+        from arx import config
+        from arx.modules import baseline, fleet, response, sensors
+        watch = {"process": {"mode": "netlink", "capture": {"mode": "degraded"}}}
+        config.write_json(config.state_dir() / "watch.json", watch)
+        with mock.patch.object(baseline, "load", return_value={"meta": {"sealed": True}}), \
+                mock.patch.object(response, "list_pending", return_value=[]), \
+                mock.patch.object(response, "_load_blocks", return_value={}), \
+                mock.patch.object(sensors, "available", return_value={}), \
+                mock.patch.object(fleet.lic, "effective_tier", return_value=("business", "test")):
+            self.assertEqual(fleet.status_summary()["watch"], watch)
+
+
+class ExecFanWatchTests(unittest.TestCase):
+    """B59: fanotify retiene el exec solo hasta capturar su identidad; siempre lo deja continuar."""
+
+    def setUp(self):
+        _isolate()
+        from arx.modules import execfanwatch
+        self.x = execfanwatch
+        self.old_state = dict(self.x._state)
+        self.x._snapshots.clear()
+        self.x._state.update(running=True, fd=10, captured=0, dropped=0, expired=0, superseded=0,
+                             overflow=0, late=0, errors=0, responses=0)
+        self.addCleanup(self.x._snapshots.clear)
+        self.addCleanup(self.x._state.clear)
+        self.addCleanup(self.x._state.update, self.old_state)
+
+    def test_permission_is_allowed_and_every_fd_is_closed_when_capture_fails(self):
+        import struct
+        with mock.patch.object(self.x, "_snapshot", side_effect=OSError("gone")), \
+                mock.patch.object(self.x.os, "write", return_value=8) as write, \
+                mock.patch.object(self.x.os, "close") as close:
+            self.x._permission(10, 7, 4242, "")
+        write.assert_called_once_with(10, struct.pack("=iI", 7, self.x.FAN_ALLOW))
+        close.assert_called_once_with(7)
+        self.assertEqual(self.x._state["errors"], 1)
+
+    def test_two_execs_of_one_process_are_correlated_by_the_kernel_timestamp(self):
+        first = {"pid": 4242, "start": 777, "exe": "/usr/bin/first", "_captured_ns": 100}
+        second = {"pid": 4242, "start": 777, "exe": "/usr/bin/second", "_captured_ns": 200}
+        self.x._store(first)
+        self.x._store(second)
+        self.assertEqual(self.x.recover(4242, "", 150)["exe"], "/usr/bin/first")
+        self.assertEqual(self.x.recover(4242, "", 250)["exe"], "/usr/bin/second")
+        self.assertIsNone(self.x.recover(4242, "", 300))
+
+    def test_a_live_description_retires_snapshots_it_has_already_superseded(self):
+        self.x._store({"pid": 4242, "start": 777, "exe": "/usr/bin/old", "_captured_ns": 100})
+        self.x._store({"pid": 4242, "start": 777, "exe": "/usr/bin/new", "_captured_ns": 200})
+        self.x.discard_through(4242, 777, 150)
+        self.assertEqual(self.x.recover(4242, "", 250)["exe"], "/usr/bin/new")
+
+    def test_the_snapshot_queue_has_a_hard_bound(self):
+        with mock.patch.object(self.x, "MAX_SNAPSHOTS", 2):
+            for n in range(5):
+                self.x._store({"pid": 4000 + n, "start": 1, "exe": "/bin/x", "_captured_ns": n})
+        self.assertEqual(len(self.x._snapshots), 2)
+        self.assertEqual(self.x._state["dropped"], 3)
+
+    def test_a_failed_permission_response_closes_the_whole_group_fail_open(self):
+        with mock.patch.object(self.x.os, "write", return_value=0), \
+                mock.patch.object(self.x, "_close") as close:
+            self.assertFalse(self.x._respond(10, 7))
+        close.assert_called_once_with(10)
+        self.assertEqual(self.x._state["late"], 1)
+
+    def test_an_unexpected_listener_exit_also_closes_the_group(self):
+        with mock.patch.object(self.x.select, "poll", side_effect=RuntimeError("reader died")), \
+                mock.patch.object(self.x, "_close") as close:
+            with self.assertRaises(RuntimeError):
+                self.x._listen(None, 10, "")
+        close.assert_called_once_with(10)
+
+    def test_the_parser_rejects_wrong_versions_and_truncated_events(self):
+        import struct
+        good = struct.pack("=IBBHQii", 24, 3, 0, 24, self.x.FAN_OPEN_EXEC_PERM, 7, 4242)
+        wrong = struct.pack("=IBBHQii", 24, 2, 0, 24, self.x.FAN_OPEN_EXEC_PERM, 7, 4242)
+        truncated = struct.pack("=IBBHQii", 40, 3, 0, 24, self.x.FAN_OPEN_EXEC_PERM, 7, 4242)
+        self.assertEqual(self.x.parse(good + wrong + truncated), [(self.x.FAN_OPEN_EXEC_PERM, 7, 4242)])
+
+    def test_mount_discovery_includes_executable_tmpfs_and_rejects_noexec(self):
+        text = (
+            "36 25 8:1 / / rw,relatime - ext4 /dev/sda1 rw\n"
+            "37 36 0:25 / /dev/shm rw,nosuid,nodev - tmpfs shm rw\n"
+            "38 36 0:26 / /run rw,nosuid,nodev,noexec - tmpfs run rw\n"
+            "39 36 0:27 / /proc rw,nosuid,nodev,noexec - proc proc rw\n"
+            "40 36 0:28 / /mnt/space\\040here rw,relatime - xfs /dev/sdb1 rw\n")
+        rows = self.x.discover_mounts(text)
+        self.assertEqual([r[1] for r in rows], ["/", "/dev/shm", "/mnt/space here"])
+
+    def test_a_stalled_reader_closes_the_group_and_degrades_fail_open(self):
+        self.x._state["last_progress"] = 1.0
+        with mock.patch.object(self.x.time, "monotonic", return_value=20.0), \
+                mock.patch.object(self.x, "_close") as close:
+            close.side_effect = lambda fd: self.x._state.update(running=False, fd=-1)
+            self.x._watchdog(10)
+        close.assert_called_once_with(10)
+        self.assertEqual(self.x._state["mode"], "degraded")
+
+    def test_partial_mount_coverage_is_explicit(self):
+        self.x._state.update(mode="partial", marks=["/"], failed=[{"path": "/dev/shm", "errno": 22}])
+        status = self.x.status()
+        self.assertEqual(status["mode"], "partial")
+        self.assertEqual(status["failed"][0]["path"], "/dev/shm")
+
+
 class ExecWatchTests(unittest.TestCase):
     """F18.2 (DEC#8): lo que lanzan los servicios, al instante; el patrón de xz en sshd, desde el día 1."""
 
@@ -4058,6 +4184,13 @@ class ExecWatchTests(unittest.TestCase):
         if shutil.which("python3", path=self.x._SEARCH_PATH):
             self.assertIn(os.path.realpath(shutil.which("python3", path=self.x._SEARCH_PATH)), found)
 
+    def test_a_recovered_snapshot_does_not_inherit_the_gone_interpreter_exception(self):
+        """El atajo akci exige argv de una cadena observada; un snapshot parcial no lo tiene."""
+        allowed = {"user:nobody", "akc:/usr/local/bin/akc", f"akci:{os.path.realpath('/bin/sh')}"}
+        ev = self._ev(exe=os.path.realpath("/bin/sh"), argv=[], user="nobody", gone=True, partial=True)
+        self.assertTrue(self.x.sshd_preauth(ev, allowed, sessions=True))
+        self.assertTrue(ev["akc_unknown"])
+
     def test_a_shebang_with_an_argument_or_env_is_still_the_declared_script(self):
         """Lockout: con `#!/bin/sh -e` el kernel ejecuta `sh -e /ruta`; con `#!/usr/bin/env python3`, env y luego
         python3. Un programa cualquiera con el script detrás, o `sh -c`, no."""
@@ -4215,35 +4348,53 @@ class ExecWatchTests(unittest.TestCase):
         self.assertEqual(len(self._events({}, self._ev(**web))), 1)
 
     def test_a_recent_exec_names_an_ephemeral_reader_after_it_died(self):
-        """B57: un cat del señuelo vive ms: cuando fanotify entrega el open, /proc ya no lo tiene y
-        filewatch descartaba el evento (3 lecturas, 0 incidentes en F3). El exec visto al nacer por
-        netlink lo nombra hasta 2 min después; fuera de ventana, no."""
+        """B57/B59: el respaldo exige (pid, nacimiento): reutilizar el pid no hereda otra identidad."""
         ev = {"pid": 4242, "start": 777, "exe": "/usr/bin/cat", "unit": "system.slice/web.service"}
-        self.x._remember(4242, ev)
+        self.x._remember(ev)
         self.addCleanup(self.x._recent.clear)
-        got = self.x.recent_exec(4242)
+        got = self.x.recent_exec(4242, 777)
         self.assertEqual(got["exe"], "/usr/bin/cat")
         got["file"] = "/home/u/.ssh/id_rsa"  # es una copia: no contamina el evento original
-        self.assertNotIn("file", self.x._recent[4242][1])
-        self.assertIsNone(self.x.recent_exec(9999))
-        self.x._recent[4242] = (time.monotonic() - self.x.RECENT_TTL_S - 1, ev)
-        self.assertIsNone(self.x.recent_exec(4242))
+        self.assertNotIn("file", self.x._recent[(4242, 777)][1])
+        self.assertIsNone(self.x.recent_exec(9999, 777))
+        self.assertIsNone(self.x.recent_exec(4242, 778))  # mismo pid, otro proceso: nunca
+        self.x._recent[(4242, 777)] = (time.monotonic() - self.x.RECENT_TTL_S - 1, ev)
+        self.assertIsNone(self.x.recent_exec(4242, 777))
         self.x._recent.clear()
         with mock.patch.object(self.x, "describe", lambda pid, root: self._ev()):
             self.assertIsNotNone(self.x.handle_pid(4242, "", lambda: False))
-        self.assertEqual(self.x.recent_exec(4242)["pid"], 4242)  # el listener lo deja nombrado
+        self.assertEqual(self.x.recent_exec(4242, 777)["pid"], 4242)
 
-    def test_an_exec_already_gone_before_describe_cannot_be_attributed(self):
-        """F4/B59: si /proc ya no existe al recibir el PID de netlink, no hay exe, cgroup ni nacimiento
-        que rescatar. El evento se pierde también para _recent; el test fija este límite, no una detección."""
+    def test_an_exec_already_gone_is_recovered_without_retroactive_containment(self):
+        """B59: netlink confirma el exec; fanotify guardó exe/cgroup/nacimiento antes de permitirlo.
+        Muerto antes de describe(), deja evidencia parcial, nunca una congelación retrospectiva."""
+        from arx.modules import execfanwatch
         self.x._events.clear()
         self.x._recent.clear()
         self.addCleanup(self.x._events.clear)
         self.addCleanup(self.x._recent.clear)
+        partial = self._ev(argv=[], partial=True, gone=True, exe="/tmp/short-lived",
+                           unit="system.slice/app.service", parent_exe="/usr/sbin/app", parent_user="app")
+        with mock.patch.object(self.x, "describe", lambda pid, root: None), \
+                mock.patch.object(execfanwatch, "recover", lambda pid, root, ts: dict(partial)), \
+                mock.patch.object(self.x, "_freeze") as freeze:
+            got = self.x.handle_pid(4242, "", lambda: True, ts=123)
+        self.assertTrue(got["partial"])
+        self.assertTrue(got["gone"])
+        freeze.assert_not_called()
+        self.assertEqual(list(self.x._events), [got])
+        self.assertEqual(self.x.recent_exec(4242, 777)["exe"], "/tmp/short-lived")
+        found = self._events(self._subjects(), got)
+        self.assertEqual(len(found), 1)
+        self.assertTrue(found[0]["target"]["alert_only"])
+        self.assertIn("already exited", found[0]["target"]["alert_reason"])
+
+    def test_without_a_fanotify_snapshot_an_exec_already_gone_remains_unattributed(self):
+        self.x._events.clear()
+        self.addCleanup(self.x._events.clear)
         with mock.patch.object(self.x, "describe", lambda pid, root: None):
-            self.assertIsNone(self.x.handle_pid(4242, "", lambda: False))
+            self.assertIsNone(self.x.handle_pid(987654, "", lambda: False))
         self.assertEqual(list(self.x._events), [])
-        self.assertIsNone(self.x.recent_exec(4242))
 
     def test_a_new_child_from_a_verified_package_only_alerts_unless_it_is_an_attack_tool(self):
         """Ruido: un servicio que estrena una herramienta de su paquete no se ve aislado; curl o bash, sí."""
@@ -5329,21 +5480,58 @@ class InjectedLibraryAndSensitiveFileTests(unittest.TestCase):
         self.assertTrue(self.p._suspect_lib("/opt/evil/libx.so", learned))
 
     def test_an_ephemeral_reader_of_a_sensitive_file_is_named_by_its_recent_exec(self):
-        """B57: `cat` del señuelo muere en ms: describe() ya no lo veía y el evento se descartaba
-        (3 lecturas, 0 incidentes, F3). Con el exec reciente como respaldo, la lectura cuenta."""
+        """B57/B59: el open se permite tras capturar (pid, nacimiento); el exec reciente exige ambos."""
         from arx.modules import execwatch
         ev = {"pid": 4242, "start": 1, "exe": "/usr/bin/cat", "unit": "system.slice/app.service",
               "user": "www-data"}
         self.f._events.clear()
         self.addCleanup(self.f._events.clear)
         with mock.patch.object(execwatch, "describe", lambda pid, root: None), \
-                mock.patch.object(execwatch, "recent_exec", lambda pid: dict(ev)):
-            got = self.f._record(4242, "/home/u/.ssh/id_rsa", "")
+                mock.patch.object(execwatch, "recent_exec", lambda pid, start: dict(ev)):
+            got = self.f._record(4242, 1, "/home/u/.ssh/id_rsa", "")
         self.assertEqual(got["file"], "/home/u/.ssh/id_rsa")
         self.assertIn(got, list(self.f._events))
         with mock.patch.object(execwatch, "describe", lambda pid, root: None), \
-                mock.patch.object(execwatch, "recent_exec", lambda pid: None):
-            self.assertIsNone(self.f._record(4242, "/home/u/.ssh/id_rsa", ""))  # sin respaldo: nada
+                mock.patch.object(execwatch, "recent_exec", lambda pid, start: None):
+            self.assertIsNone(self.f._record(4242, 1, "/home/u/.ssh/id_rsa", ""))
+
+    def test_a_reused_pid_cannot_inherit_the_identity_of_a_sensitive_file_reader(self):
+        from arx.modules import execwatch
+        self.f._events.clear()
+        self.addCleanup(self.f._events.clear)
+        reused = {"pid": 4242, "start": 2, "exe": "/usr/bin/cat", "unit": "system.slice/app.service"}
+        with mock.patch.object(execwatch, "describe", lambda pid, root: dict(reused)), \
+                mock.patch.object(execwatch, "recent_exec", mock.Mock(return_value=None)) as recent:
+            self.assertIsNone(self.f._record(4242, 1, "/etc/shadow", ""))
+        recent.assert_called_once_with(4242, 1)
+
+    def test_sensitive_open_is_allowed_and_closed_even_if_attribution_fails(self):
+        import struct
+        self.f._state.update(fd=10, running=True)
+        self.addCleanup(self.f._state.update, running=False, fd=-1)
+        with mock.patch.object(self.f, "_record", side_effect=OSError("gone")), \
+                mock.patch.object(self.f.os, "write", return_value=8) as write, \
+                mock.patch.object(self.f.os, "close") as close:
+            self.f._permission(10, 7, 4242, "/etc/shadow", 1, "")
+        write.assert_called_once_with(10, struct.pack("=iI", 7, self.f.FAN_ALLOW))
+        close.assert_called_once_with(7)
+
+    def test_a_failed_sensitive_open_response_closes_the_group(self):
+        self.f._state.update(fd=10, running=True)
+        self.addCleanup(self.f._state.update, running=False, fd=-1)
+        with mock.patch.object(self.f.os, "write", side_effect=OSError("closed")), \
+                mock.patch.object(self.f, "_close") as close:
+            self.assertFalse(self.f._respond(10, 7))
+        close.assert_called_once_with(10)
+
+    def test_sensitive_marks_use_permission_events_and_check_every_result(self):
+        libc = mock.Mock()
+        libc.fanotify_mark.side_effect = [0, -1]
+        with mock.patch.object(self.f, "sensitive_files", return_value=["/etc/shadow", "/etc/sudoers"]):
+            self.f._mark(libc, 10)
+        self.assertEqual(self.f._state["marks"], ["/etc/shadow"])
+        self.assertEqual(self.f._state["failed"][0]["path"], "/etc/sudoers")
+        self.assertEqual(libc.fanotify_mark.call_args.args[2], self.f.FAN_OPEN_PERM)
 
     def _subjects(self, status):
         return {"system.slice/app.service": {"unit": "app.service", "status": status, "dest": {}, "extensions": [],
@@ -5391,6 +5579,7 @@ class InjectedLibraryAndSensitiveFileTests(unittest.TestCase):
         self.assertEqual([f["item"] for f in found], ["system.slice/app.service|/etc/shadow"])
         self.assertIn("app.service opened /etc/shadow", found[0]["detail"])
         self.assertEqual(found[0]["target"]["pid"], 4242)
+        self.assertEqual(found[0]["target"]["start"], 7)
         self.assertEqual(self.r.classify(found[0])["tier"], 1)
         from arx import config
         config.write_json(self.p._state_path(), {"subjects": s})

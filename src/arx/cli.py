@@ -134,7 +134,7 @@ def _status_data() -> dict:
             "pending": [{"id": p["id"], "sev": p.get("sev"), "detail": p.get("detail")}
                         for p in response.list_pending()],
             "locked_accounts": response.locked_accounts(), "quarantine": len(response.list_quarantine()),
-            "observation": profile.summary()}
+            "observation": profile.summary(), "watch": guard.watch_status()}
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -178,6 +178,19 @@ def cmd_status(args: argparse.Namespace) -> int:
     seen = guard.mode_seen()
     print(tr("  mode           {v}",
              v=tr("has not run yet") if seen is None else tr("protect (--enforce)") if seen else tr("observe")))
+    watch = guard.watch_status()
+    if watch:
+        process = watch.get("process") or {}
+        capture = process.get("capture") or {}
+        print(tr("  process watch  {mode} · exec identity: {capture}",
+                 mode=process.get("mode") or tr("unknown"),
+                 capture=tr(capture.get("mode") or "unavailable")))
+        print(tr("  capture stats  {captured} captured · {dropped} dropped · {overflow} overflow(s)",
+                 captured=capture.get("captured", 0), dropped=capture.get("dropped", 0),
+                 overflow=capture.get("overflow", 0)))
+        print(tr("  sensitive files {mode}", mode=tr((watch.get("sensitive_files") or {}).get("mode", "unavailable"))))
+    else:
+        print(tr("  watch status   not reported by the guard"))
     print(tr("  alerts         {v}", v=', '.join(notify.channels(cfg)) or tr("none  (arx setup)")))
     print(tr("  vaccines       {n} applied", n=len(vaccines._load().get('applied') or {})))
     obs = profile.summary()

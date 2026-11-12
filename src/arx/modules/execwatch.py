@@ -53,25 +53,42 @@ _state = {"mode": None, "lost": 0}
 _allow = {"at": 0.0, "paths": set(), "sure": False}
 _declared: dict = {}  # (pid, inicio) de comandos declarados: lo que ejecuten en sí mismos sigue siendo suyo
 _seen: set = set()
-_recent: dict = {}  # pid → (monotonic, ev): un exec reciente, para quien llega cuando el proceso ya murió
+_recent: dict = {}  # (pid, inicio) → (monotonic, ev): nunca atribuir algo a un pid reutilizado
+_recent_lock = threading.Lock()
 RECENT_TTL_S = 120  # un lector efímero (cat de un señuelo) muere en ms; dos minutos sobran (B57)
+RECENT_MAX = 4096
 
 
-def _remember(pid: int, ev: dict) -> None:
-    _recent[pid] = (time.monotonic(), ev)
-    if len(_recent) > 4096:
-        cutoff = time.monotonic() - RECENT_TTL_S
-        for k in [k for k, (t, _) in _recent.items() if t < cutoff]:
-            del _recent[k]
+def _remember(ev: dict) -> None:
+    start = ev.get("start")
+    if not isinstance(start, int):
+        return
+    key, now = (ev["pid"], start), time.monotonic()
+    with _recent_lock:
+        _recent.pop(key, None)
+        cutoff = now - RECENT_TTL_S
+        for old in [k for k, (t, _) in _recent.items() if t < cutoff]:
+            _recent.pop(old, None)
+        while len(_recent) >= RECENT_MAX:
+            _recent.pop(next(iter(_recent)))
+        _recent[key] = (now, dict(ev))
 
 
-def recent_exec(pid: int) -> dict | None:
-    """El exec reciente de un pid ya muerto (un cat del señuelo vive ms: a fanotify le llega el open
-    cuando /proc ya no lo tiene — B57, prueba real F3). Copia: quien consulta añade sus campos."""
-    hit = _recent.get(pid)
-    if not hit or time.monotonic() - hit[0] > RECENT_TTL_S:
-        return None
-    return dict(hit[1])
+def recent_exec(pid: int, start: int) -> dict | None:
+    """Un exec reciente solo si coinciden pid Y nacimiento. Copia: quien consulta añade sus campos."""
+    key = (pid, start)
+    with _recent_lock:
+        hit = _recent.get(key)
+        if not hit or time.monotonic() - hit[0] > RECENT_TTL_S:
+            _recent.pop(key, None)
+            return None
+        return dict(hit[1])
+
+
+def status() -> dict:
+    from arx.modules import execfanwatch
+    return {"mode": _state.get("mode"), "lost": _state.get("lost", 0),
+            "capture": execfanwatch.status()}
 
 
 # ── el conector de procesos ──────────────────────────────────────────────────
@@ -499,7 +516,7 @@ def sshd_preauth(ev: dict, allowed: set[str] | None = None, sessions: bool | Non
         exe = ev["exe"]
         # terminó antes de leerlo entero (una cadena breve: envoltorio → real → cat): con el intérprete de su
         # comando no se puede decir más, y no se avisa de cada login
-        gone = ev.get("gone") and f"akci:{os.path.realpath(exe)}" in allowed
+        gone = ev.get("gone") and not ev.get("partial") and f"akci:{os.path.realpath(exe)}" in allowed
         # lo que el script solo nombra corre como hijo suyo: como hijo directo de sshd, solo dentro de la misma
         # cadena de exec que ya empezó como su comando (DEC#15)
         chained = key in _declared and any(f"akcn:{n}" in allowed for n in (exe, os.path.realpath(exe)))
@@ -647,21 +664,51 @@ def set_hot_verdict(fn) -> None:
     _state["hot_fn"] = fn
 
 
+def _complete_partial(ev: dict) -> dict:
+    """Resuelve nombres fuera del permiso fanotify; dentro solo se guardaron uid numéricos."""
+    import pwd
+
+    def username(uid):
+        if uid is None:
+            return ""
+        try:
+            return pwd.getpwuid(uid).pw_name
+        except KeyError:
+            return str(uid)
+
+    if "user" not in ev:
+        ev["user"] = username(ev.get("uid"))
+    if "parent_user" not in ev:
+        ev["parent_user"] = username(ev.get("parent_uid"))
+    ev["argv"] = []  # lo leído antes de terminar exec sería del programa anterior: nunca se usa
+    ev["parent_title"] = ""
+    return ev
+
+
 def handle_pid(pid: int, root: str, enforce, ts: int | None = None) -> dict | None:
+    from arx.modules import execfanwatch
     ev = describe(pid, root)
+    if ev:
+        execfanwatch.discard_through(pid, ev["start"], ts)
+    else:
+        # netlink confirma el exec; fanotify guardó su identidad antes de que pudiera terminar (B59)
+        snapshot = execfanwatch.recover(pid, root, ts)
+        ev = _complete_partial(snapshot) if snapshot else None
     if not ev:
         return None
-    _remember(pid, ev)  # nace vivo por netlink: si muere en ms, quien llegue tarde aún lo identifica
+    _remember(ev)  # identidad fuerte: un lector efímero no hereda nunca un pid reutilizado
     ev["preauth"] = sshd_preauth(ev)
     ev["sure"] = sshd_sure() if ev["preauth"] else True
     hot = None
-    if ev["preauth"] and ev["sure"] and not (ev.get("akc_unknown") or ev.get("env_injected")):
-        hot = "sshd"
-    elif not ev["preauth"] and _state.get("hot_fn"):
-        try:
-            hot = _state["hot_fn"](ev)
-        except Exception:
-            hot = None
+    # Un proceso capturado antes de salir pero ya muerto es forense: no hay contención retroactiva.
+    if not ev.get("partial"):
+        if ev["preauth"] and ev["sure"] and not (ev.get("akc_unknown") or ev.get("env_injected")):
+            hot = "sshd"
+        elif not ev["preauth"] and _state.get("hot_fn"):
+            try:
+                hot = _state["hot_fn"](ev)
+            except Exception:
+                hot = None
     if hot and enforce():
         ev["ts"] = ts
         ev["stopped"] = _freeze(ev)
@@ -685,21 +732,29 @@ def _listen(sock: socket.socket, root: str, enforce) -> None:
 
 
 def start(enforce) -> str:
-    """Arranca el hilo (una vez). `enforce`: función que dice si se puede actuar ahora."""
+    """Arranca captura y conector (una vez). `enforce`: función que dice si se puede actuar ahora."""
     if _state["mode"]:
         return _state["mode"]
-    from arx.modules import provenance
+    from arx.modules import execfanwatch, provenance
+    root = provenance.system_root()
+    execfanwatch.start(root)  # primero: ningún exec anterior al conector debe quedar sin snapshot
     try:
         sock = _subscribe()
     except (OSError, AttributeError):  # sin el conector: se mira /proc en cada barrido
+        execfanwatch.stop()  # sin confirmación de exec no se retiene al host para guardar forense suelto
         _state["mode"] = "scan"
         return "scan"
     try:  # la lista de sshd, ya leída: nunca un `sshd -T` entre un exec y su congelación
         sshd_allowed(refresh=True)
     except Exception:
         pass
-    threading.Thread(target=_listen, args=(sock, provenance.system_root(), enforce), name="arx-exec",
-                     daemon=True).start()
+    try:
+        threading.Thread(target=_listen, args=(sock, root, enforce), name="arx-exec", daemon=True).start()
+    except (OSError, RuntimeError):
+        sock.close()
+        execfanwatch.stop()
+        _state["mode"] = "scan"
+        return "scan"
     _state["mode"] = "netlink"
     return "netlink"
 
@@ -717,7 +772,7 @@ def _scan(root: str) -> list[dict]:
         if not ev or (pid, ev["start"]) in _seen:
             continue
         _seen.add((pid, ev["start"]))
-        _remember(pid, ev)  # igual que en el hilo: un efímero visto vivo en este barrido queda nombrado
+        _remember(ev)  # igual que en el hilo: un efímero visto vivo en este barrido queda nombrado
         ev["preauth"] = sshd_preauth(ev)
         ev["sure"] = sshd_sure() if ev["preauth"] else True
         out.append(ev)

@@ -64,6 +64,7 @@ def status_summary() -> dict:
         "sensors": [k for k, v in sensors.available().items() if v],
         "pending_tier2": len(response.list_pending()),
         "active_blocks": len(response._load_blocks()),
+        "watch": config.read_json(config.state_dir() / "watch.json", {}),
         "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
 
