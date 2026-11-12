@@ -192,6 +192,19 @@ class ResponseTests(unittest.TestCase):
         self.assertEqual(self.response.classify({"kind": "executables", "sev": "high"})["tier"], 1)
         self.assertEqual(self.response.classify({"kind": "executables", "sev": "low"})["tier"], 0)
 
+    def test_incident_preserves_exec_identity_and_containment_reason(self):
+        target = {"pid": 4242, "start": 987654321, "exe": "/dev/shm/arx-b59-00",
+                  "alert_only": True,
+                  "alert_reason": "process already exited; retroactive containment is unavailable"}
+        outcome = self.response.handle({"kind": "unexpected_exec", "sev": "high",
+                                        "detail": "fanotify preserved its exec identity",
+                                        "target": target}, cfg={})
+        self.assertEqual(outcome["target"], target)
+        incident = json.loads(self.response._incidents_path().read_text().splitlines()[-1])
+        self.assertEqual(incident["kind"], "incident")
+        self.assertEqual(incident["finding_kind"], "unexpected_exec")
+        self.assertEqual(incident["target"], target)
+
     def test_pending_and_authorize(self):
         self.response.handle({"kind": "integrity", "sev": "high", "detail": "passwd cambió"})
         pend = self.response.list_pending()

@@ -2586,6 +2586,9 @@ def handle(finding: dict, enforce: bool = False, authorized: bool = False,
         "remediation": plan["action"],
         "reversible": plan["reversible"],
         "finding_kind": finding.get("kind"),
+        # PID + nacimiento + ejecutable conservan la identidad del exec; también viajan las
+        # razones de alerta sin contención. `record` aplica redacción recursiva a todo el outcome.
+        "target": finding.get("target") or {},
         # el porqué viaja con el incidente: quien lee una alerta tiene que poder decidir con él
         "why": finding.get("why"),
     }
