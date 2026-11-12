@@ -66,8 +66,8 @@ v bash -c 'arx recon >/dev/null; arx learn >/dev/null; arx learn >/dev/null; arx
 v python3 -c "import json; p = '/etc/arx/config.json'; c = json.load(open(p)); c.update(profile_observe_days=0.003, profile_jitter_days=0); json.dump(c, open(p, 'w'))"
 v arx service install --enforce >/dev/null 2>&1
 check "Arx en guardia con --enforce" v systemctl is-active -q arx
-files_on() { local out; out=$(v journalctl -u arx --no-pager -n 200); grep -q "sensitive files: on" <<<"$out"; }
-check "vigila los ficheros sensibles desde el kernel (fanotify)" wait_for 20 files_on
+files_on() { local out; out=$(v journalctl -u arx --no-pager -n 200); grep -q "sensitive files: full" <<<"$out"; }
+check "cobertura fanotify completa de los ficheros sensibles" wait_for 20 files_on
 learned() { v python3 -c "import json, sys; s = json.load(open('/var/lib/arx/profiles.json'))['subjects']
 sys.exit(0 if '/etc/ssl/private/acme-lab.key' in s.get('system.slice/acme-read.service', {}).get('reads', []) else 1)"; }
 check "aprende que acme-read abre su clave TLS" wait_for 120 learned
