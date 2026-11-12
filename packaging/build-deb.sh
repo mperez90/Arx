@@ -52,12 +52,64 @@ Description: Arx - autonomous defensive security agent
  undo themselves. Human-gated for irreversible actions. Python stdlib only.
 EOF
 
+cat > "$PKG/DEBIAN/preinst" <<'EOF'
+#!/bin/sh
+set -e
+# Un zipapp no es un ELF: zipimport vuelve a abrir /usr/lib/arx/arx.pyz en cada import perezoso, así que el
+# archive no puede cambiar bajo un guardián vivo. Va en el preinst del paquete NUEVO: dpkg lo ejecuta antes de
+# unpack en toda actualización, también desde versiones cuyo prerm no paraba nada (≤ 0.0.8), y si falla la
+# actualización se aborta (un prerm fallido lo rescata «new-prerm failed-upgrade» y dpkg seguiría).
+MARK=/run/arx/package-upgrade-active
+if [ "$1" = "upgrade" ] && [ -d /run/systemd/system ]; then
+  state=$(systemctl show -p ActiveState --value arx.service 2>/dev/null) || state=""
+  case "$state" in
+    inactive|failed)
+      # Parado. Una marca superviviente solo puede venir de una operación de paquete que lo paró y no llegó a
+      # arrancarlo (el guardián la borra al arrancar): se conserva para que el postinst lo arranque.
+      ;;
+    deactivating)
+      # Alguien ya lo está parando: se espera a que termine sin cambiar su intención.
+      systemctl stop arx.service
+      ;;
+    "")
+      echo "arx: cannot read the state of arx.service; not replacing Arx under a possibly running daemon" >&2
+      exit 1
+      ;;
+    *)
+      # active, activating (también auto-restart), reloading…: parada planeada y marca para volver a arrancar.
+      mkdir -p /run/arx
+      : > "$MARK"
+      : > /run/arx/planned-stop
+      if ! systemctl stop arx.service; then
+        rm -f "$MARK" /run/arx/planned-stop
+        echo "arx: arx.service could not be stopped; not replacing Arx under a running daemon" >&2
+        exit 1
+      fi
+      # stop es síncrono: si ExecStopPost no la consumió (auto-restart), no puede tragarse una parada posterior.
+      rm -f /run/arx/planned-stop
+      ;;
+  esac
+fi
+exit 0
+EOF
+chmod 0755 "$PKG/DEBIAN/preinst"
+
 cat > "$PKG/DEBIAN/postinst" <<'EOF'
 #!/bin/sh
 set -e
-# Una actualización de un servicio ya instalado recibe el slice sin rearrancar Arx ni resellar otras units.
+MARK=/run/arx/package-upgrade-active
+# Actualiza el slice. Si el guardián corría, preinst ya lo detuvo antes de reemplazar
+# el zipapp; aquí vuelve a arrancar con un único archive coherente.
 if [ -d /run/systemd/system ] && [ -f /etc/systemd/system/arx.service ]; then
   arx service refresh-maintenance >/dev/null 2>&1 || true
+  if [ -f "$MARK" ]; then
+    # Si no arranca, la marca se queda: `dpkg --configure -a` (o la siguiente actualización) lo reintenta.
+    if ! systemctl start arx.service; then
+      echo "arx: arx.service did not start after the upgrade; fix it and run: dpkg --configure -a" >&2
+      exit 1
+    fi
+    rm -f "$MARK"
+  fi
 fi
 cat <<'MSG'
 
@@ -77,6 +129,7 @@ chmod 0755 "$PKG/DEBIAN/postinst"
 cat > "$PKG/DEBIAN/prerm" <<'EOF'
 #!/bin/sh
 set -e
+# Una actualización no se gestiona aquí sino en el preinst del paquete nuevo (lo ejecuta siempre).
 # Sin Arx no queda nada suyo: lo que confinó recupera la red, y sus units, drop-ins y tabla nft se van.
 if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
   if [ -d /run/systemd/system ]; then

@@ -470,6 +470,9 @@ def run(once: bool = False, interval: int = 30, chat: bool = False, enforce: boo
         return 1
     if chat:
         return _chat(cfg)
+    if not once:  # el servicio ya corre: ninguna operación de paquete tiene que volver a arrancarlo
+        from arx.modules import service
+        _quietly(service.clear_upgrade_mark, False)
 
     base = baseline.load()
     if not base or not base["meta"].get("sealed"):

@@ -6571,6 +6571,205 @@ class PackagingTests(unittest.TestCase):
                 self.assertNotIn("arx.cli:main", f.read(), name)
 
 
+class MaintainerScriptTests(unittest.TestCase):
+    """B63: zipimport reabre /usr/lib/arx/arx.pyz en cada import perezoso, así que el archive no puede cambiar
+    bajo un guardián vivo. Se ejecutan los scripts reales del .deb con un systemctl falso y rutas en un tmp."""
+
+    SYSTEMCTL = """#!/bin/sh
+echo "$*" >> "$FAKE/calls"
+case "$1" in
+  show) [ -f "$FAKE/show_fails" ] && exit 1; cat "$FAKE/state" ;;
+  stop)
+    [ -f "$RUN/arx/planned-stop" ] && echo "stop saw planned-stop" >> "$FAKE/calls"
+    [ -f "$FAKE/stop_fails" ] && exit 1
+    echo inactive > "$FAKE/state" ;;
+  start) [ -f "$FAKE/start_fails" ] && exit 1; echo active > "$FAKE/state" ;;
+esac
+exit 0
+"""
+
+    def setUp(self):
+        root = os.path.join(os.path.dirname(__file__), "..")
+        with open(os.path.join(root, "packaging", "build-deb.sh"), encoding="utf-8") as fh:
+            self.build = fh.read()
+        self.d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.d, True)
+        self.fake, self.bin = os.path.join(self.d, "fake"), os.path.join(self.d, "bin")
+        for sub in ("fake", "bin", "run/systemd/system", "etc/systemd/system"):
+            os.makedirs(os.path.join(self.d, sub))
+        open(os.path.join(self.d, "etc/systemd/system/arx.service"), "w").close()
+        self.mark = os.path.join(self.d, "run/arx/package-upgrade-active")
+        self.planned = os.path.join(self.d, "run/arx/planned-stop")
+        for name, text in (("systemctl", self.SYSTEMCTL),
+                           ("arx", '#!/bin/sh\necho "arx $*" >> "$FAKE/calls"\nexit 0\n')):
+            with open(os.path.join(self.bin, name), "w") as f:
+                f.write(text)
+            os.chmod(os.path.join(self.bin, name), 0o755)
+        self.state("active")
+
+    def state(self, value=None):
+        path = os.path.join(self.fake, "state")
+        if value is not None:
+            with open(path, "w") as f:
+                f.write(value + "\n")
+        with open(path) as f:
+            return f.read().strip()
+
+    def flag(self, name, on=True):
+        path = os.path.join(self.fake, name)
+        if on:
+            open(path, "w").close()
+        elif os.path.exists(path):
+            os.unlink(path)
+
+    def calls(self):
+        try:
+            with open(os.path.join(self.fake, "calls")) as f:
+                return f.read().splitlines()
+        except FileNotFoundError:
+            return []
+
+    def run_script(self, name, *args):
+        import subprocess
+        text = self.build.split(f'cat > "$PKG/DEBIAN/{name}" <<\'EOF\'\n', 1)[1].split("\nEOF", 1)[0]
+        for prefix in ("/run/", "/etc/", "/var/lib/"):  # nada fuera del tmp, ni siquiera un purge
+            text = text.replace(prefix, self.d + prefix)
+        path = os.path.join(self.d, name)
+        with open(path, "w") as f:
+            f.write(text + "\n")
+        if os.path.exists(os.path.join(self.fake, "calls")):  # cada script, sus propias llamadas
+            os.unlink(os.path.join(self.fake, "calls"))
+        env = {"PATH": f"{self.bin}:/usr/bin:/bin", "FAKE": self.fake, "RUN": os.path.join(self.d, "run")}
+        return subprocess.run(["/bin/sh", path, *args], env=env, capture_output=True, text=True)
+
+    def test_a_running_guard_is_stopped_before_unpack_and_started_again_after(self):
+        r = self.run_script("preinst", "upgrade", "0.0.8~rc5")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("stop arx.service", self.calls())
+        self.assertIn("stop saw planned-stop", self.calls())  # su ExecStopPost no avisa de un ataque
+        self.assertEqual(self.state(), "inactive")
+        self.assertTrue(os.path.exists(self.mark))
+        self.assertFalse(os.path.exists(self.planned))  # no queda para tragarse una parada posterior
+        r = self.run_script("postinst", "configure", "0.0.8~rc5")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        calls = self.calls()
+        self.assertLess(calls.index("arx service refresh-maintenance"), calls.index("start arx.service"))
+        self.assertEqual(self.state(), "active")
+        self.assertFalse(os.path.exists(self.mark))
+
+    def test_a_pending_auto_restart_counts_as_running(self):
+        self.state("activating")
+        r = self.run_script("preinst", "upgrade", "0.0.8~rc5")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("stop arx.service", self.calls())
+        self.assertTrue(os.path.exists(self.mark))
+        self.assertFalse(os.path.exists(self.planned))
+
+    def test_a_stopped_guard_stays_stopped(self):
+        for state in ("inactive", "failed"):
+            self.state(state)
+            self.assertEqual(self.run_script("preinst", "upgrade", "0.0.8~rc5").returncode, 0)
+            self.assertNotIn("stop arx.service", self.calls())
+            self.assertFalse(os.path.exists(self.mark))
+            self.assertEqual(self.run_script("postinst", "configure", "0.0.8~rc5").returncode, 0)
+            self.assertNotIn("start arx.service", self.calls())
+            self.assertEqual(self.state(), state)
+
+    def test_a_stop_in_progress_is_awaited_without_scheduling_a_start(self):
+        self.state("deactivating")
+        self.assertEqual(self.run_script("preinst", "upgrade", "0.0.8~rc5").returncode, 0)
+        self.assertIn("stop arx.service", self.calls())
+        self.assertNotIn("stop saw planned-stop", self.calls())  # el aviso de esa parada sigue su curso
+        self.assertFalse(os.path.exists(self.mark))
+        self.run_script("postinst", "configure", "0.0.8~rc5")
+        self.assertNotIn("start arx.service", self.calls())
+
+    def test_a_failed_stop_aborts_before_unpack_and_leaves_no_mark(self):
+        self.flag("stop_fails")
+        r = self.run_script("preinst", "upgrade", "0.0.8~rc5")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("could not be stopped", r.stderr)
+        self.assertFalse(os.path.exists(self.mark))
+        self.assertFalse(os.path.exists(self.planned))
+
+    def test_an_unreadable_state_aborts_instead_of_replacing_a_possibly_live_archive(self):
+        self.flag("show_fails")
+        r = self.run_script("preinst", "upgrade", "0.0.8~rc5")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertNotIn("stop arx.service", self.calls())
+        self.assertFalse(os.path.exists(self.mark))
+
+    def test_a_failed_start_keeps_the_mark_so_dpkg_configure_can_retry(self):
+        self.assertEqual(self.run_script("preinst", "upgrade", "0.0.8~rc5").returncode, 0)
+        self.flag("start_fails")
+        r = self.run_script("postinst", "configure", "0.0.8~rc5")
+        self.assertNotEqual(r.returncode, 0)  # dpkg deja el paquete a medio configurar y lo dice
+        self.assertIn("dpkg --configure -a", r.stderr)
+        self.assertTrue(os.path.exists(self.mark))
+        self.flag("start_fails", on=False)
+        self.assertEqual(self.run_script("postinst", "configure", "0.0.8~rc5").returncode, 0)
+        self.assertEqual(self.state(), "active")
+        self.assertFalse(os.path.exists(self.mark))
+
+    def test_an_interrupted_upgrade_is_completed_by_the_next_one(self):
+        """Parado por una operación de paquete que no llegó a arrancarlo: la siguiente lo arranca."""
+        self.state("inactive")
+        os.makedirs(os.path.dirname(self.mark))
+        open(self.mark, "w").close()
+        self.assertEqual(self.run_script("preinst", "upgrade", "0.0.9~rc1").returncode, 0)
+        self.assertNotIn("stop arx.service", self.calls())
+        self.assertTrue(os.path.exists(self.mark))
+        self.assertEqual(self.run_script("postinst", "configure", "0.0.9~rc1").returncode, 0)
+        self.assertEqual(self.state(), "active")
+
+    def test_without_systemd_nothing_is_stopped_or_started(self):
+        shutil.rmtree(os.path.join(self.d, "run/systemd"))
+        self.assertEqual(self.run_script("preinst", "upgrade", "0.0.8~rc5").returncode, 0)
+        self.assertEqual(self.run_script("postinst", "configure", "0.0.8~rc5").returncode, 0)
+        self.assertEqual(self.calls(), [])
+        self.assertEqual(self.state(), "active")
+
+    def test_prerm_upgrade_and_postrm_never_stop_or_start_the_guard(self):
+        self.assertEqual(self.run_script("prerm", "upgrade", "0.0.9~rc2").returncode, 0)
+        self.assertEqual(self.run_script("postrm", "upgrade", "0.0.9~rc2").returncode, 0)
+        self.assertEqual(self.run_script("postrm", "abort-upgrade", "0.0.9~rc2").returncode, 0)
+        self.assertEqual(self.calls(), [])
+        self.assertEqual(self.state(), "active")
+
+
+class UpgradeMarkTests(unittest.TestCase):
+    """La marca del paquete deja de valer en cuanto el servicio arranca, lo arranque quien lo arranque."""
+
+    def setUp(self):
+        from arx.modules import service
+        self.s = service
+        self.d = _isolate()
+        p = mock.patch.object(service, "UPGRADE_MARK", os.path.join(self.d, "package-upgrade-active"))
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_the_service_start_clears_the_mark(self):
+        open(self.s.UPGRADE_MARK, "w").close()
+        self.assertFalse(self.s.clear_upgrade_mark({}))  # un guard lanzado a mano no es el servicio
+        self.assertTrue(os.path.exists(self.s.UPGRADE_MARK))
+        self.assertTrue(self.s.clear_upgrade_mark({"INVOCATION_ID": "abc"}))
+        self.assertFalse(os.path.exists(self.s.UPGRADE_MARK))
+        self.assertFalse(self.s.clear_upgrade_mark({"INVOCATION_ID": "abc"}))
+
+    def test_the_guard_clears_it_when_it_starts_as_a_daemon(self):
+        import contextlib
+        from arx.modules import baseline, guard
+        seen = []
+        with mock.patch.object(guard.config, "load_config", lambda: {"lang": "en"}), \
+                mock.patch.object(baseline, "load", lambda: None), \
+                mock.patch.object(self.s, "clear_upgrade_mark", lambda: seen.append("cleared")), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(guard.run(once=True), 1)
+            self.assertEqual(seen, [])  # un barrido suelto no es el servicio
+            self.assertEqual(guard.run(once=False), 1)
+        self.assertEqual(seen, ["cleared"])
+
+
 class HostileHostDataTests(unittest.TestCase):
     """Quien controla un nombre de fichero controla estos datos: no pueden tumbar a Arx,
     falsear su salida ni librar a un dropper de la contención."""

@@ -248,6 +248,25 @@ def refresh_maintenance() -> int:
 # ── autoprotección (DoD-6): parar o tocar a Arx se avisa fuera del host ───────
 PLANNED_STOP = "/run/arx/planned-stop"
 PLANNED_STOP_S = 300
+# El preinst la deja al parar un Arx activo antes de reemplazar su zipapp; el postinst lo arranca si sigue.
+UPGRADE_MARK = "/run/arx/package-upgrade-active"
+
+
+def clear_upgrade_mark(env=None) -> bool:
+    """Arrancar bajo systemd deja la marca sin objeto: ya no hay arranque pendiente que reanudar.
+
+    Así, una marca que sobrevive solo puede venir de una operación de paquete que paró a Arx y no llegó a
+    arrancarlo, y nunca reanima un Arx que alguien arrancó y paró a mano después."""
+    env = os.environ if env is None else env
+    if not env.get("INVOCATION_ID"):  # un guard lanzado a mano no es el servicio
+        return False
+    try:
+        os.unlink(UPGRADE_MARK)
+    except OSError:
+        return False
+    return True
+
+
 def _units() -> tuple:
     return (UNIT_PATH, EARLY_UNIT_PATH, DOWN_UNIT_PATH, REVIVE_UNIT_PATH, REVIVE_TIMER_PATH,
             MAINTENANCE_SLICE_PATH)
