@@ -6570,6 +6570,28 @@ class PackagingTests(unittest.TestCase):
             with open(os.path.join(root, name), encoding="utf-8") as f:
                 self.assertNotIn("arx.cli:main", f.read(), name)
 
+    def test_a_release_candidate_is_published_as_prerelease_and_never_as_latest(self):
+        """install.sh descarga de releases/latest: una candidata marcada «latest» llegaría a todos."""
+        import subprocess
+        root = os.path.join(os.path.dirname(__file__), "..")
+        with open(os.path.join(root, ".github", "workflows", "ci.yml"), encoding="utf-8") as f:
+            workflow = f.read()
+        step = workflow.split("- name: GitHub Release", 1)[1].split("run: |\n", 1)[1]
+        script = "\n".join(line[10:] for line in step.splitlines() if line.startswith(" " * 10))
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        with open(os.path.join(d, "gh"), "w") as f:
+            f.write('#!/bin/sh\necho "$*"\n')
+        os.chmod(os.path.join(d, "gh"), 0o755)
+        expected = {"v0.0.9rc1": True, "v0.0.8-rc2": True, "v1.0.0a1": True, "v1.0.0b2": True,
+                    "v0.0.9": False, "v0.1.0": False}
+        for tag, candidate in expected.items():
+            out = subprocess.run(["/bin/sh", "-c", script], capture_output=True, text=True, check=True,
+                                 env={"PATH": f"{d}:/usr/bin:/bin", "GITHUB_REF_NAME": tag}).stdout
+            self.assertEqual("--prerelease" in out, candidate, (tag, out))
+            self.assertEqual("--latest=false" in out, candidate, (tag, out))
+            self.assertIn(f"release create {tag} ", out)
+
 
 class MaintainerScriptTests(unittest.TestCase):
     """B63: zipimport reabre /usr/lib/arx/arx.pyz en cada import perezoso, así que el archive no puede cambiar

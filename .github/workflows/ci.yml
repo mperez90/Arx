@@ -117,5 +117,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # Una candidata (rcN/aN/bN) es prerelease y nunca «latest»: install.sh descarga de releases/latest.
+          channel="--latest"
+          case "$GITHUB_REF_NAME" in *rc[0-9]*|*a[0-9]*|*b[0-9]*) channel="--prerelease --latest=false" ;; esac
+          # shellcheck disable=SC2086
           gh release create "$GITHUB_REF_NAME" dist/arx_all.deb dist/arx.pyz dist/SHA256SUMS \
-            --title "Arx $GITHUB_REF_NAME" --generate-notes
+            --title "Arx $GITHUB_REF_NAME" --generate-notes $channel
