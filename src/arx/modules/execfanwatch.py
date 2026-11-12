@@ -153,31 +153,43 @@ def _store(ev: dict) -> None:
 
 
 def claim(pid: int, root: str, ts: int | None = None) -> tuple[dict | None, bool]:
-    """Toma el snapshot de ESTE timestamp y avisa si ya existe otro exec posterior del mismo PID.
+    """Toma el ejecutable de ESTE timestamp y avisa si ya existe otro exec posterior del mismo PID.
 
-    El segundo valor también es cierto si solo hay un snapshot posterior: en ese caso una lectura viva
-    no puede atribuirse con seguridad al evento netlink anterior. `_captured_ns` queda en el snapshot
-    para que `has_later()` repita la comprobación después de leer `/proc`.
+    Un exec dinámico genera varios permisos antes de su único EXEC netlink: primero el binario o script
+    solicitado y después su intérprete/cargador ELF. El timestamp separa execs; dentro de esa frontera,
+    el primer snapshot es la identidad solicitada y los demás pertenecen a la misma operación. Retirar
+    el grupo completo evita tanto llamar «cargador» al exec como confundirlo con un re-exec posterior.
+
+    `_captured_ns` queda en el snapshot para que `has_later()` repita la comprobación después de leer
+    `/proc`. Sin un timestamp válido no hay una frontera fiable y se conserva el último snapshot, como
+    antes; el conector de los kernels soportados sí lo aporta.
     """
     with _lock:
         _prune_locked()
-        chosen = None
-        later = False
-        for key, ev in reversed(_snapshots.items()):
-            if ev.get("pid") != pid or ev.get("_root", "") != root.strip("/"):
+        root = root.strip("/")
+        eligible, later = [], False
+        timed = isinstance(ts, int) and ts > 0
+        for key, ev in _snapshots.items():
+            if ev.get("pid") != pid or ev.get("_root", "") != root:
                 continue
-            if isinstance(ts, int) and ts > 0 and ev.get("_captured_ns", 0) > ts:
+            if timed and ev.get("_captured_ns", 0) > ts:
                 later = True
                 continue
-            chosen = key
-            break
-        if chosen is None:
+            eligible.append((key, ev))
+        if not eligible:
             return None, later
-        ev = dict(_snapshots.pop(chosen))
+        start = eligible[-1][1].get("start")
+        # Con timestamp, todo lo ya confirmado de este nacimiento pertenece al mismo exec. Esto incluye
+        # binario/script + intérprete + cargador. Sin timestamp solo puede reclamarse el último.
+        group = [pair for pair in eligible if pair[1].get("start") == start] if timed else [eligible[-1]]
+        selected = group[0][1]
+        for key, _ in group:
+            _snapshots.pop(key, None)
+        ev = dict(selected)
         captured = ev.get("_captured_ns", 0)
-        later = later or any(other.get("pid") == pid and other.get("start") == ev.get("start")
-                             and other.get("_captured_ns", 0) > captured
-                             for other in _snapshots.values())
+        later = any(other.get("pid") == pid and other.get("start") == start
+                    and other.get("_captured_ns", 0) > captured
+                    for other in _snapshots.values())
     ev.pop("_stored_ns", None)
     ev.pop("_root", None)
     return ev, later

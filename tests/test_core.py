@@ -3970,6 +3970,22 @@ class ExecFanWatchTests(unittest.TestCase):
         self.assertEqual(self.x.recover(4242, "", 250)["exe"], "/usr/bin/second")
         self.assertIsNone(self.x.recover(4242, "", 300))
 
+    def test_the_elf_loader_belongs_to_the_exec_not_to_a_later_reexec(self):
+        """Linux abre primero el binario y después su cargador antes de emitir un solo EXEC netlink."""
+        rows = ((100, "/tmp/arx-b59-first"), (110, "/usr/lib/ld-linux.so.2"))
+        for captured, exe in rows:
+            self.x._store({"pid": 4242, "start": 777, "exe": exe, "_captured_ns": captured})
+        first, later = self.x.claim(4242, "", 150)
+        self.assertEqual(first["exe"], "/tmp/arx-b59-first")
+        self.assertFalse(later)
+        self.assertFalse(self.x.has_later(first))
+        for captured, exe in ((200, "/tmp/arx-b59-final"), (210, "/usr/lib/ld-linux.so.2")):
+            self.x._store({"pid": 4242, "start": 777, "exe": exe, "_captured_ns": captured})
+        second, later = self.x.claim(4242, "", 250)
+        self.assertEqual(second["exe"], "/tmp/arx-b59-final")
+        self.assertFalse(later)
+        self.assertEqual(len(self.x._snapshots), 0)
+
     def test_claim_marks_a_later_reexec_even_of_the_same_executable(self):
         first = {"pid": 4242, "start": 777, "exe": "/usr/bin/same", "_captured_ns": 100}
         second = {"pid": 4242, "start": 777, "exe": "/usr/bin/same", "_captured_ns": 200}
@@ -4430,6 +4446,35 @@ class ExecWatchTests(unittest.TestCase):
         with mock.patch.object(self.x, "describe", lambda pid, root: None):
             self.assertIsNone(self.x.handle_pid(987654, "", lambda: False))
         self.assertEqual(list(self.x._events), [])
+
+    def test_an_elf_loader_does_not_disable_containment_of_a_live_exec(self):
+        """El cargador pertenece al mismo EXEC: no convierte un proceso vivo en evidencia solo forense."""
+        from arx.modules import execfanwatch
+        self.x._events.clear()
+        self.x._recent.clear()
+        execfanwatch._snapshots.clear()
+        old_state = dict(execfanwatch._state)
+        execfanwatch._state.update(captured=0, dropped=0, expired=0, superseded=0)
+        self.addCleanup(self.x._events.clear)
+        self.addCleanup(self.x._recent.clear)
+        self.addCleanup(execfanwatch._snapshots.clear)
+        self.addCleanup(execfanwatch._state.clear)
+        self.addCleanup(execfanwatch._state.update, old_state)
+        base = self._ev(exe="/usr/bin/dash", unit="system.slice/web.service",
+                        parent_exe="/usr/sbin/nginx", parent_user="www-data", user="www-data")
+        for captured, exe in ((100, "/usr/bin/dash"), (110, "/usr/lib/ld-linux.so.2")):
+            execfanwatch._store({**base, "exe": exe, "uid": 33, "parent_uid": 33,
+                                 "_captured_ns": captured, "_root": ""})
+        with mock.patch.object(self.x, "describe", return_value=dict(base)), \
+                mock.patch.dict(self.x._state, {"hot_fn": lambda ev: "webshell"}), \
+                mock.patch.object(self.x, "_freeze", return_value=True) as freeze, \
+                mock.patch.object(self.x, "_hot_handle") as handled:
+            got = self.x.handle_pid(4242, "", lambda: True, ts=150)
+        self.assertEqual(got["exe"], "/usr/bin/dash")
+        self.assertFalse(got.get("partial"))
+        self.assertTrue(got["stopped"])
+        freeze.assert_called_once()
+        handled.assert_called_once()
 
     def test_a_delayed_netlink_event_cannot_inherit_the_identity_of_a_later_reexec(self):
         """El snapshot fecha CADA exec; describir el re-exec final no puede reetiquetar el evento anterior."""
