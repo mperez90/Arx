@@ -295,6 +295,41 @@ check "JSONL netlink final completo y sin errores" v python3 -c 'import json
 e = [json.loads(x) for x in open("/tmp/arx-b59/netlink.jsonl")]
 assert not any("error" in x for x in e)'
 
+step "subprocess propio: el exec no puede retener el GIL del listener"
+v python3 - <<'PY'
+from pathlib import Path
+Path("/tmp/arx-b59/spawn-probe.py").write_text(r"""import faulthandler, json, os, subprocess, sys
+from pathlib import Path
+sys.path.insert(0, "/usr/lib/arx/arx.pyz")
+from arx.modules import execfanwatch as watch
+base = Path("/tmp/arx-b59")
+before = subprocess._USE_POSIX_SPAWN
+coverage = watch.start("")
+after = subprocess._USE_POSIX_SPAWN
+faulthandler.dump_traceback_later(8)
+try:
+    assert coverage == "full", coverage
+    assert after is False, "CPython posix_spawn would hold the GIL until the intercepted exec"
+    result = subprocess.run(["/usr/bin/true"], capture_output=True, timeout=10)
+    status = watch.status()
+    assert result.returncode == 0, result.returncode
+    assert status["running"] and status["responses"] >= 1, status
+    (base / "spawn-done.json").write_text(json.dumps({
+        "coverage": coverage, "posix_spawn_before": before, "posix_spawn_after": after,
+        "returncode": result.returncode, "responses": status["responses"],
+        "watcher_mode": status["mode"], "watcher_running": status["running"]}))
+finally:
+    faulthandler.cancel_dump_traceback_later()
+    watch.stop()
+""")
+PY
+spawn_probe() {
+  v timeout --signal=KILL --kill-after=2 20 python3 /tmp/arx-b59/spawn-probe.py && \
+    v python3 -c 'import json; d = json.load(open("/tmp/arx-b59/spawn-done.json"))
+assert d["returncode"] == 0 and d["posix_spawn_after"] is False and d["responses"] >= 1, d'
+}
+check "subprocess.run termina y el listener responde sin quedar retenido por el GIL" spawn_probe
+
 step "lector bloqueado y vigilante matado: permisos realmente pendientes"
 v python3 - <<'PY'
 from pathlib import Path
@@ -459,6 +494,7 @@ from pathlib import Path
 base = Path("/tmp/arx-b59")
 evidence = json.loads((base / "evidence.json").read_text())
 evidence["reexec"] = json.loads((base / "reexec.json").read_text())
+evidence["spawn"] = json.loads((base / "spawn-done.json").read_text())
 evidence["failopen"] = {mode: json.loads((base / f"{mode}-done.json").read_text())
                         for mode in ("watchdog", "kill")}
 evidence["netlink_closed"] = (base / "netlink.stopped").exists()

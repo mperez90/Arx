@@ -17,6 +17,7 @@ import os
 import re
 import select
 import struct
+import subprocess
 import threading
 import time
 
@@ -72,6 +73,19 @@ def _libc():
     libc.fanotify_init.argtypes = [ctypes.c_uint, ctypes.c_uint]
     libc.fanotify_mark.argtypes = [ctypes.c_int, ctypes.c_uint, ctypes.c_uint64, ctypes.c_int, ctypes.c_char_p]
     return libc
+
+
+def _disable_gil_holding_spawn() -> None:
+    """Evita el ciclo posix_spawn → FAN_OPEN_EXEC_PERM → listener → GIL.
+
+    En CPython, ``os.posix_spawn`` retiene el GIL hasta que el hijo completa
+    ``exec``. Si ese exec espera el permiso de este mismo proceso, ni el listener
+    ni su watchdog pueden avanzar. La ruta ``_posixsubprocess`` sí libera el GIL
+    alrededor de ``vfork``; un ``fork`` ordinario tampoco espera al exec del hijo.
+    CPython 3.10–3.14 no ofrece un selector público: este ajuste debe preceder a
+    la primera marca y se mantiene durante la vida del guardián.
+    """
+    subprocess._USE_POSIX_SPAWN = False
 
 
 def _read(path: str, limit: int = 4096) -> str:
@@ -402,6 +416,7 @@ def start(root: str) -> str:
         _state[key] = []
     for key in ("captured", "dropped", "expired", "superseded", "overflow", "late", "errors", "responses"):
         _state[key] = 0
+    _disable_gil_holding_spawn()
     try:
         libc = _libc()
         fd = libc.fanotify_init(FAN_CLASS_CONTENT | FAN_CLOEXEC | FAN_NONBLOCK,

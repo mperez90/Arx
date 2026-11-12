@@ -3944,6 +3944,8 @@ class ExecFanWatchTests(unittest.TestCase):
         from arx.modules import execfanwatch
         self.x = execfanwatch
         self.old_state = dict(self.x._state)
+        self.old_use_posix_spawn = getattr(self.x.subprocess, "_USE_POSIX_SPAWN", False)
+        self.addCleanup(setattr, self.x.subprocess, "_USE_POSIX_SPAWN", self.old_use_posix_spawn)
         self.x._snapshots.clear()
         self.x._state.update(running=True, fd=10, captured=0, dropped=0, expired=0, superseded=0,
                              overflow=0, late=0, errors=0, responses=0)
@@ -4054,6 +4056,32 @@ class ExecFanWatchTests(unittest.TestCase):
             self.x.FAN_CLASS_CONTENT | self.x.FAN_CLOEXEC | self.x.FAN_NONBLOCK,
             os.O_RDONLY | getattr(os, "O_LARGEFILE", 0) | os.O_CLOEXEC)
         mark.assert_not_called()
+
+    def test_start_disables_gil_holding_posix_spawn_before_creating_the_group(self):
+        """Un exec propio no puede esperar al listener mientras el padre retiene su GIL."""
+        class InlineThread:
+            def __init__(self, target, args=(), name=None, daemon=None):
+                self.target, self.args = target, args
+
+            def start(self):
+                self.target(*self.args)
+
+        def listener(libc, fd, root, ready):
+            self.x._state["marks"] = ["/"]
+            ready.set()
+
+        self.x._state.update(running=False, fd=-1, mode="off")
+        libc = mock.Mock()
+        libc.fanotify_init.side_effect = lambda *args: (
+            self.assertFalse(self.x.subprocess._USE_POSIX_SPAWN) or 10)
+        with mock.patch.object(self.x.subprocess, "_USE_POSIX_SPAWN", True), \
+                mock.patch.object(self.x, "_libc", return_value=libc), \
+                mock.patch.object(self.x, "_listen", side_effect=listener), \
+                mock.patch.object(self.x, "_watchdog"), \
+                mock.patch.object(self.x.threading, "Thread", InlineThread):
+            self.assertEqual(self.x.start(""), "full")
+            self.assertFalse(self.x.subprocess._USE_POSIX_SPAWN)
+        libc.fanotify_init.assert_called_once()
 
     def test_close_invalidates_the_fd_without_holding_the_lock_in_the_kernel(self):
         with mock.patch.object(self.x.os, "close") as close:
