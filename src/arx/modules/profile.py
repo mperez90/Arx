@@ -133,49 +133,11 @@ def _nft_out(*args: str) -> str:
 # ── kernel: la pista, la lista permitida y el corte ──────────────────────────
 _KEY = ["socket", "cgroupv2", "level", "2", ".", "meta", "l4proto", "."]
 
-_STALE_SET_RE = re.compile(r"set (seen4|seen6|denied4|denied6|ok4|ok6|watched2) \{\s*\n\s*typeof "
-                           r"socket cgroupv2(?! level 2)")  # nft renderiza el viejo como «level 0» (B54)
-_LEVEL2_RETRY_S = 3600
-_L2_SUPPORT = {"supported": None, "at": 0.0, "migrated": False}
-
-
-def _level2_sets_supported() -> bool:
-    """Sonda sin reglas ni datos: nft puede aceptar «level 2» y devolver «level 0» (u24, RC4).
-    Un False queda una hora en backoff; la migración tiene además su propio freno por arranque."""
-    cached = _L2_SUPPORT.get("supported")
-    now = time.monotonic()
-    if cached is True:
-        return True
-    if cached is False and now - _L2_SUPPORT["at"] < _LEVEL2_RETRY_S:
-        return False
-    name = f"arx_l2probe_{os.getpid()}"
-    key = _KEY + ["ip", "daddr", ".", "th", "dport"]
-    try:
-        created = _nft("add", "set", "inet", "arx", name, "{", "typeof", *key, ";", "}")
-        listing = _nft_out("list", "set", "inet", "arx", name) if created else ""
-        supported = bool(re.search(r"\btypeof socket cgroupv2 level 2(?:\s|\.|$)", listing))
-    finally:
-        _nft("delete", "set", "inet", "arx", name)
-    _L2_SUPPORT.update(supported=supported, at=now)
-    return supported
-
-
-def _migrate_stale_sets(listing: str) -> bool:
-    """Un set creado por Arx ≤0.0.8rc2 lleva cgroupv2 sin «level 2»: no matchea por jerarquía (B54,
-    u24 con los sets de una versión vieja). nft no cambia el typeof de un set vivo: se tiran las
-    reglas que lo nombran y el set, y setup() los recrea ya jerárquicos. False = nada que migrar."""
-    stale = set(_STALE_SET_RE.findall(listing))
-    if not stale:
-        return False
-    chain = _nft_out("-a", "list", "chain", "inet", "arx", "output")
-    for line in chain.splitlines():
-        handle = re.search(r"handle (\d+)\s*$", line)
-        if handle and any(f"@{name}" in line for name in stale):
-            _nft("delete", "rule", "inet", "arx", "output", "handle", handle.group(1))
-    for name in sorted(stale):
-        if not _nft("delete", "set", "inet", "arx", name):
-            return False  # quedó una referencia: se reintenta en el próximo arranque
-    return True
+# B54, medido en Ubuntu 24.04 (kernel 6.8, nft 1.0.9): nft muestra el typeof de estos sets como «cgroupv2 level 0»
+# aunque se crearon con «level 2» (también los de versiones anteriores, que los creaban igual). Es solo el texto
+# que nft guarda para mostrarlos: la comparación por jerarquía la hace la regla, `socket cgroupv2 level 2 @set`,
+# y un proceso en un cgroup anidado bajo el servicio coincide igual. Borrar y recrear sets por ese texto vaciaba
+# sus elementos en bucle (RC4) y nunca hizo falta: nada se migra.
 
 
 def setup() -> bool:
@@ -184,10 +146,6 @@ def setup() -> bool:
     if not response._nft_setup():
         return False
     listing = _nft_out("list", "table", "inet", "arx")
-    if _STALE_SET_RE.search(listing) and not _L2_SUPPORT["migrated"] and _level2_sets_supported():
-        _L2_SUPPORT["migrated"] = True  # como máximo una migración destructiva por arranque (RC4)
-        if _migrate_stale_sets(listing):
-            listing = _nft_out("list", "table", "inet", "arx")
     output = response._nft_chain(listing, "output")
     cmds = []
     for fam, addr in (("4", "ip"), ("6", "ip6")):

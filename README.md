@@ -170,10 +170,10 @@ Read these before you rely on it.
   before authenticating (the xz backdoor's pattern) is frozen on the spot. Still hard: a backdoor that
   neither starts a program nor talks somewhere new.
 - **Confining needs cgroup v2, nftables that can match by cgroup, and systemd.** Without them, Arx
-  suspends instead. Tested on Ubuntu 22.04 and 24.04 VMs, across service restarts and reboots.
-  Some kernels accept `socket cgroupv2 level 2` but keep rendering `level 0`. Arx detects this with
-  a temporary, unreferenced set and leaves the active sets untouched; nested cgroup scopes do not
-  get hierarchical matching on those hosts.
+  suspends instead. Tested on Ubuntu 22.04 and 24.04 and Debian 13 VMs, across service restarts and
+  reboots. nftables 1.0.9 lists Arx's sets as `socket cgroupv2 level 0`; that is only how it prints
+  them. Matching is done by the rules (`socket cgroupv2 level 2`), and a process in a nested cgroup
+  under a confined service is still matched (measured on Ubuntu 24.04).
 - **Run Arx on the host, not inside a container that shares the host's cgroup tree.** There, proof
   of origin and confinement work, but behavior watching doesn't. LXC containers (tested unprivileged,
   with Incus) work like a machine.
