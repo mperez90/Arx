@@ -309,7 +309,10 @@ def discover_mounts(text: str) -> list[tuple[str, str, str]]:
             dev, path, options, fstype = fields[2], _unescape(fields[4]), fields[5], fields[sep + 1]
         except (ValueError, IndexError):
             continue
-        if "noexec" in options.split(",") or fstype in _IGNORED_FILESYSTEMS or dev in seen:
+        # FUSE (fuse.sshfs, fuse.glusterfs, fuseblk…): marcar o leer su evento entra en el demonio de usuario;
+        # uno colgado retendría al lector dentro de la syscall, donde el watchdog no puede soltar los permisos.
+        if "noexec" in options.split(",") or fstype in _IGNORED_FILESYSTEMS or fstype.startswith("fuse") \
+                or dev in seen:
             continue
         seen.add(dev)
         rows.append((dev, path, fstype))

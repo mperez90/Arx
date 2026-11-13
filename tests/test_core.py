@@ -4111,7 +4111,11 @@ class ExecFanWatchTests(unittest.TestCase):
             "37 36 0:25 / /dev/shm rw,nosuid,nodev - tmpfs shm rw\n"
             "38 36 0:26 / /run rw,nosuid,nodev,noexec - tmpfs run rw\n"
             "39 36 0:27 / /proc rw,nosuid,nodev,noexec - proc proc rw\n"
-            "40 36 0:28 / /mnt/space\\040here rw,relatime - xfs /dev/sdb1 rw\n")
+            "40 36 0:28 / /mnt/space\\040here rw,relatime - xfs /dev/sdb1 rw\n"
+            # FUSE: un remoto colgado retiene al lector dentro de fanotify_mark/read, donde el watchdog no llega
+            "41 36 0:46 / /mnt/remote rw,nosuid,nodev - fuse.sshfs host:/ rw,user_id=0\n"
+            "42 36 0:47 / /mnt/gluster rw,relatime - fuse.glusterfs gl:/vol rw\n"
+            "43 36 0:48 / /mnt/ntfs rw,relatime - fuseblk /dev/sdc1 rw\n")
         rows = self.x.discover_mounts(text)
         self.assertEqual([r[1] for r in rows], ["/", "/dev/shm", "/mnt/space here"])
 
