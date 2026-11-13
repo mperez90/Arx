@@ -1,0 +1,5 @@
+# /etc/cron.d/arx-collector — daily digest by email and 13-month retention.
+SHELL=/bin/sh
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+17 6 * * * root flock -n /tmp/arx-collector-digest.lock docker exec arx-collector python /app/collector.py digest >> /volume2/docker/services/arx-collector/digest.log 2>&1
+40 5 1 * * root find /volume2/docker/volumes/arx-collector/reports -name '*.jsonl' -mtime +396 -delete

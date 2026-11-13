@@ -9945,6 +9945,19 @@ class TelemetryCollectorTests(unittest.TestCase):
         names = [part.get_filename() for part in msg.iter_attachments()]
         self.assertEqual(names, [f"arx-reports-{day.isoformat()}.jsonl.gz"])
 
+    def test_the_container_kit_publishes_nothing_and_runs_unprivileged(self):
+        kit = os.path.join(os.path.dirname(__file__), "..", "tools", "telemetry-collector", "nas")
+        with open(os.path.join(kit, "docker-compose.yml"), encoding="utf-8") as f:
+            compose = f.read()
+        self.assertNotIn("ports:", compose)
+        for line in ('user: "10001:10001"', "read_only: true", "cap_drop: [ALL]", "no-new-privileges:true",
+                     "./collector.py:/app/collector.py:ro", "ARX_COLLECTOR_BIND: 0.0.0.0"):
+            self.assertIn(line, compose)
+        with open(os.path.join(kit, "arx-collector.cron"), encoding="utf-8") as f:
+            cron = f.read()
+        self.assertIn("collector.py digest", cron)
+        self.assertIn("-mtime +396 -delete", cron)  # 13 meses, como dice docs/telemetry.md
+
     def test_digest_needs_a_recipient_unless_it_is_a_dry_run(self):
         with mock.patch.dict(os.environ, {"ARX_COLLECTOR_DATA": self.d}, clear=False):
             os.environ.pop("ARX_COLLECTOR_MAIL_TO", None)

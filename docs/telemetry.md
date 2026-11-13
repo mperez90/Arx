@@ -77,8 +77,8 @@ filter again on arrival.
 
 - Only over HTTPS, to `https://telemetry.adsyslabs.com/v1/report`, a collector operated by ASL
   (Advanced Systems Laboratories), the maker of Arx.
-- The collector does not record source IP addresses, and stores the reception time rounded to the
-  hour.
+- Requests reach the collector through Cloudflare, which provides the HTTPS front. The collector
+  does not record source IP addresses, and stores the reception time rounded to the hour.
 - The first report leaves one day after you join; then every 7 days. The collector can propose
   another interval between 1 and 30 days. It cannot change what is sent: that only changes with a
   new Arx version, and `arx telemetry show` always shows it.

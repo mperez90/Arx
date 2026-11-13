@@ -42,6 +42,9 @@ curl -s http://127.0.0.1:8787/healthz        # {"ok": true}
 Put HTTPS in front of it. With Caddy, `Caddyfile.example` is enough: Caddy obtains the
 certificate on its own. Keep the proxy's access log off.
 
+On a Docker host that already publishes its sites through a Cloudflare Tunnel, use the container
+kit in [`nas/`](nas/README.md) instead.
+
 The Arx client only reports over `https://`, to the URL fixed in `src/arx/telemetry.py`
 (`ENDPOINT`). If the collector runs somewhere else, change that constant before the release.
 
