@@ -5556,6 +5556,11 @@ class SelfProtectionTests(unittest.TestCase):
         open(self.early, "w").write(service.early_unit_text("/usr/bin/arx"))
         open(service.MAINTENANCE_SLICE_PATH, "w").write(service.maintenance_slice_text())
         service._seal_units()
+        # Estas pruebas ejercen la verificación con dpkg de la copia instalada (/usr/lib/arx/arx.pyz).
+        self.real_runs_from_package = service._runs_from_package
+        p = mock.patch.object(service, "_runs_from_package", return_value=True)
+        p.start()
+        self.addCleanup(p.stop)
 
     def _check(self, dpkg="", dropins=(), rc=0):
         class R:
@@ -5645,10 +5650,15 @@ class SelfProtectionTests(unittest.TestCase):
 
     def test_dpkg_only_verifies_the_copy_dpkg_installed(self):
         """Revisión independiente: instalado por snap, dpkg --verify arx fallaba en cada vuelta."""
-        with mock.patch.object(self.s.sys, "argv", ["/snap/arx/12/arx.pyz", "guard"]), \
-                mock.patch.object(self.s.maintenance, "run") as run:
-            self.assertEqual(self.s.self_check(dropin_dirs=()), [])
-        run.assert_not_called()
+        real = mock.patch.object(self.s, "_runs_from_package", self.real_runs_from_package)
+        real.start()  # aquí se mide la función real, sin el doble del setUp
+        self.addCleanup(real.stop)
+        for argv in (["/snap/arx/12/arx.pyz", "guard"], ["/usr/lib/python3/dist-packages/arx/cli.py", "guard"],
+                     ["-m", "guard"]):
+            with mock.patch.object(self.s.sys, "argv", argv), \
+                    mock.patch.object(self.s.maintenance, "run") as run:
+                self.assertEqual(self.s.self_check(dropin_dirs=()), [], argv)
+            run.assert_not_called()
         with mock.patch.object(self.s.sys, "argv", ["/usr/lib/arx/arx.pyz", "guard"]), \
                 mock.patch.object(self.s.os.path, "realpath", side_effect=lambda p: p):
             self.assertTrue(self.s._runs_from_package())

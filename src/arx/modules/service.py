@@ -347,9 +347,10 @@ PACKAGED_PYZ = "/usr/lib/arx/arx.pyz"
 
 
 def _runs_from_package() -> bool:
-    """¿Corre la copia que instaló dpkg? Solo entonces `dpkg --verify arx` dice algo de este proceso."""
+    """¿Corre la copia que instaló dpkg? Solo entonces `dpkg --verify arx` dice algo de este proceso: un snap,
+    el código fuente o un host donde dpkg no conoce `arx` darían un «no se pudo verificar» falso en cada vuelta."""
     argv0 = sys.argv[0] if sys.argv and sys.argv[0] else ""
-    return not argv0.endswith(".pyz") or os.path.realpath(argv0) == PACKAGED_PYZ
+    return bool(argv0) and os.path.realpath(argv0) == PACKAGED_PYZ
 
 
 def _tamper(detail: str, key: str) -> dict:
