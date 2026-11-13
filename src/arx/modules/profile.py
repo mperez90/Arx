@@ -546,6 +546,17 @@ def _updates(subjects: dict, cfg: dict, now: datetime, check_versions: bool = Tr
     learned = 0
     for path, s in subjects.items():
         if not s.get("package"):
+            # Visto sin paquete (una unit suelta, o justo mientras se instalaba o desinstalaba): si dpkg cambió,
+            # puede que ahora lo sea. Sin esto, un servicio instalado después nunca tenía vigiladas sus
+            # actualizaciones ni sus librerías (lab Debian, supply-chain).
+            if check_versions:
+                try:
+                    pkg, version = _package_version(s["unit"])
+                except NoAnswer:
+                    incomplete.append(s["unit"])
+                    continue
+                if pkg:
+                    s["package"], s["version"] = pkg, version
             continue
         try:
             pkg, version = (s["package"], s.get("version")) if not check_versions else _package_version(s["unit"])

@@ -5677,6 +5677,18 @@ class NoAnswerIsNeverAVerdictTests(unittest.TestCase):
             found = self.p._library_events(subjects, datetime.now(timezone.utc), {})
         self.assertEqual([x["kind"] for x in found], ["injected_library"])
 
+    def test_a_service_first_seen_without_a_package_gets_it_when_dpkg_changes(self):
+        """Lab Debian: un perfil creado sin paquete (unit suelta, o vista mientras se desinstalaba) no volvía a
+        resolverlo; instalado después por un paquete, Arx no vigilaba sus actualizaciones ni sus librerías."""
+        s = {"unit": "acme-relay.service", "package": None, "version": None, "libs": None}
+        subjects = {"system.slice/acme-relay.service": s}
+        with mock.patch.object(self.p, "_installed_versions", return_value={"acme-relay": "1.0"}), \
+                mock.patch.object(self.p, "_package_version", return_value=("acme-relay", "1.0")), \
+                mock.patch.object(self.p, "_library_packages", return_value={}):
+            self.assertEqual(self.p._updates(subjects, {}, datetime.now(timezone.utc), check_versions=True), [])
+        self.assertEqual((s["package"], s["version"]), ("acme-relay", "1.0"))
+        self.assertNotIn("updates", s)  # verlo por primera vez con paquete no es una actualización
+
     def test_unanswered_versions_leave_the_dpkg_change_unseen(self):
         incomplete = []
         subjects = {"system.slice/web.service": {"unit": "web.service", "package": "nginx", "version": "1"}}
