@@ -34,7 +34,7 @@ v bash -c 'systemctl disable --now arx arx-firewall arx-revive.timer 2>/dev/null
   rm -rf /etc/arx /var/lib/arx /tmp/arxsrc /tmp/xz-lab-ran /tmp/xz-fork-ran /etc/systemd/system/*.service.d/9[01]-arx-*.conf /etc/systemd/system/arx*.service /etc/systemd/system/arx*.timer
   grep -lsE "inet:arx:|inet arx confined" /etc/systemd/system.control/*.service.d/*.conf | xargs -r rm -f
   nft delete table inet arx 2>/dev/null; systemctl daemon-reload
-  export DEBIAN_FRONTEND=noninteractive; apt-get -o DPkg::Lock::Timeout=300 install -y -qq gcc libc6-dev >/dev/null'
+  export DEBIAN_FRONTEND=noninteractive; apt-get -o DPkg::Lock::Timeout=300 install -y -qq gcc libc6-dev auditd >/dev/null'
 v bash -s <<'C'
 cat > /tmp/xz-lab.c <<'EOF'
 #include <fcntl.h>

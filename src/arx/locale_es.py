@@ -1553,8 +1553,8 @@ ES = {
         "  modelo bloquea {v} · desde {llm_lock_min_confidence}% de confianza",
     "yes, with --enforce":
         "sí, con --enforce",
-    "  license        {license_tier}\n":
-        "  licencia       {license_tier}\n",
+    "  license        {license_tier}":
+        "  licencia       {license_tier}",
     "\n═ Arx · configuration ═":
         "\n═ Arx · configuración ═",
     "\n1) LLM providers  (Enter on the key = skip that provider)":
@@ -1885,4 +1885,96 @@ ES = {
         "cuenta",
     "id":
         "id",
+    # consola interactiva (arx shell)
+    "Arx commands (type them without «arx»; «<command> --help» for details):":
+        "Comandos de Arx (escríbelos sin «arx»; «<comando> --help» para los detalles):",
+    "Console:":
+        "Consola:",
+    "  cd <dir>     change directory (shown in green in the prompt)":
+        "  cd <dir>     cambia de directorio (se ve en verde en el prompt)",
+    "  pwd · history · clear · help · exit":
+        "  pwd · history · clear · help · exit",
+    "You are already in the Arx console.":
+        "Ya estás en la consola de Arx.",
+    "Arx {v} console · «help» lists the commands · «exit» or Ctrl+D to leave":
+        "Consola de Arx {v} · «help» lista los comandos · «exit» o Ctrl+D para salir",
+    "⚠ the command failed ({name}: {e})":
+        "⚠ el comando falló ({name}: {e})",
+    "⚠ cannot read that line: {e}":
+        "⚠ no se puede leer esa línea: {e}",
+    "⚠ cd: {e}":
+        "⚠ cd: {e}",
+    "interactive Arx console (colored prompt, history, Tab completion)":
+        "consola interactiva de Arx (prompt en color, historial, completado con Tab)",
+    # programa de mejora (arx telemetry)
+    "never":
+        "nunca",
+    "  Arx would send an anonymous report every few days: its version, the system (distribution,\n  kernel, architecture), how its watchers are doing and how much noise it makes. Never host\n  names, IPs, paths, users, commands, findings or secrets. See it exactly:  arx telemetry show":
+        "  Arx enviaría un informe anónimo cada pocos días: su versión, el sistema (distribución,\n  núcleo, arquitectura), cómo van sus vigilantes y cuánto ruido hace. Nunca nombres de host,\n  IPs, rutas, usuarios, comandos, hallazgos ni secretos. Míralo tal cual:  arx telemetry show",
+    "\n▸ Arx improvement program (optional)":
+        "\n▸ Programa de mejora de Arx (opcional)",
+    "\n▸ Arx: improvement program":
+        "\n▸ Arx: programa de mejora",
+    "  joined         {v}":
+        "  participa      {v}",
+    "  reports to     {url}":
+        "  informes a     {url}",
+    "  every          {n} days":
+        "  cada           {n} días",
+    "  See exactly what would be sent:  arx telemetry show\n":
+        "  Mira exactamente lo que se enviaría:  arx telemetry show\n",
+    "  ✓ Thank you. Leave whenever you want:  arx telemetry disable":
+        "  ✓ Gracias. Sal cuando quieras:  arx telemetry disable",
+    "  Nothing will be sent. Join later with:  arx telemetry enable":
+        "  No se enviará nada. Únete más adelante con:  arx telemetry enable",
+    "  last report    {when}  {result}":
+        "  último informe {when}  {result}",
+    "  ⚠ ARX_TELEMETRY=off or DO_NOT_TRACK is set: nothing is sent.":
+        "  ⚠ ARX_TELEMETRY=off o DO_NOT_TRACK está puesto: no se envía nada.",
+    "✓ Joined. Arx will send an anonymous report every {n} days (installation id {id}…).":
+        "✓ Te has unido. Arx enviará un informe anónimo cada {n} días (id de instalación {id}…).",
+    "  See it:  arx telemetry show   ·   leave:  arx telemetry disable":
+        "  Míralo:  arx telemetry show   ·   salir:  arx telemetry disable",
+    "✓ Done: nothing else will be sent, and the installation id was deleted.":
+        "✓ Hecho: no se enviará nada más y se borró el id de instalación.",
+    "(not sent: you have not joined the improvement program)":
+        "(no se envía: no te has unido al programa de mejora)",
+    "Nothing sent: you have not joined. Join with:  arx telemetry enable":
+        "No se envió nada: no te has unido. Únete con:  arx telemetry enable",
+    "not decided (nothing is sent)":
+        "sin decidir (no se envía nada)",
+    "  Join? (y/N): ":
+        "  ¿Te unes? (s/N): ",
+    "  improvement    {v}":
+        "  mejora         {v}",
+    "  improvement    {v}\n":
+        "  mejora         {v}\n",
+    "improvement program: anonymous usage reports, only with your permission":
+        "programa de mejora: informes de uso anónimos, solo con tu permiso",
+    "show whether reports are sent, and when":
+        "muestra si se envían informes, y cuándo",
+    "print exactly the report that would be sent":
+        "imprime exactamente el informe que se enviaría",
+    "join the program (reports are anonymous)":
+        "únete al programa (los informes son anónimos)",
+    "leave the program: nothing else is sent":
+        "sal del programa: no se envía nada más",
+    "send a report now (only if you joined)":
+        "envía un informe ahora (solo si te has unido)",
+    "ask once whether to join (the installer runs it)":
+        "pregunta una vez si quieres unirte (lo ejecuta el instalador)",
+    "joined (arx telemetry show)":
+        "participa (arx telemetry show)",
+    "not joined (arx telemetry)":
+        "no participa (arx telemetry)",
+    "joined":
+        "participa",
+    "not joined":
+        "no participa",
+    "\n8) Improvement program  (optional · nothing is sent unless you say yes)":
+        "\n8) Programa de mejora  (opcional · no se envía nada si no dices que sí)",
+    "   Arx can send an anonymous usage report every few days: version, system, how its watchers\n   are doing and how much noise it makes. Never host names, IPs, paths, users, commands or\n   secrets. See it exactly:  arx telemetry show":
+        "   Arx puede enviar un informe de uso anónimo cada pocos días: versión, sistema, cómo van sus\n   vigilantes y cuánto ruido hace. Nunca nombres de host, IPs, rutas, usuarios, comandos ni\n   secretos. Míralo tal cual:  arx telemetry show",
+    "   Join? (y/n)":
+        "   ¿Te unes? (s/n)",
 }

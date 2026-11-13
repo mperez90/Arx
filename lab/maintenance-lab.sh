@@ -81,6 +81,7 @@ echo "  build: $(git rev-parse --short HEAD)$(git diff --quiet HEAD -- src packa
 
 step "construir la RC y la v0.0.8rc5 publicada (desde su tag)"
 clean_victim
+v bash -c 'export DEBIAN_FRONTEND=noninteractive; apt-get -o DPkg::Lock::Timeout=300 install -y -qq auditd >/dev/null'  # dependencia desde 0.0.9rc2
 v bash -c "rm -rf /tmp/arxsrc && mkdir -p /tmp/arxsrc && cp -r $PWD/src $PWD/packaging /tmp/arxsrc/ && cd /tmp/arxsrc && packaging/build-deb.sh >/dev/null 2>&1"
 check "el .deb de la RC está construido" v test -s /tmp/arxsrc/dist/arx_all.deb
 git archive --format=tar v0.0.8rc5 src packaging | v bash -c 'rm -rf /tmp/arxold && mkdir -p /tmp/arxold && tar -x -C /tmp/arxold && cd /tmp/arxold && packaging/build-deb.sh >/dev/null 2>&1'
@@ -97,7 +98,8 @@ check "la v0.0.8rc5 terminó de arrancar" wait_for 45 old_on_guard
 sleep 5  # sus hilos ya importan de forma perezosa desde el archive viejo
 INC_OLD=$(incidents_count)
 check "la actualización a la RC termina" v dpkg -i /tmp/arxsrc/dist/arx_all.deb
-check "versión instalada 0.0.9~rc1" v sh -c 'dpkg-query -W -f="\${Version}" arx | grep -qx "0.0.9~rc1"'
+RC_DEB=$(sed -nE 's/^__version__ = "(.*)"/\1/p' src/arx/__init__.py | sed -E 's/(a|b|rc)([0-9])/~\1\2/')
+check "versión instalada $RC_DEB" v sh -c "dpkg-query -W -f='\${Version}' arx | grep -qx '$RC_DEB'"
 check "Arx vuelve a estar activo" wait_for 30 v systemctl is-active -q arx
 INV_NEW=$(inv)
 check "el guardián viejo no siguió vivo con el archive nuevo" test -n "$INV_NEW" -a "$INV_NEW" != "$INV_OLD"

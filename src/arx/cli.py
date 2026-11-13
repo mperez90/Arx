@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import argparse
 
-from arx import __version__
+from arx import __version__, term
 from arx.i18n import tr
 
 
@@ -113,7 +113,7 @@ def _status_data() -> dict:
     """Lo mismo que `arx status`, para quien quiera construir algo encima (sin UI propia)."""
     import subprocess
 
-    from arx import config, notify
+    from arx import config, notify, telemetry
     from arx import license as lic
     from arx.modules import baseline, canaries, guard, profile, proposals, response, service, vaccines
 
@@ -134,7 +134,8 @@ def _status_data() -> dict:
             "pending": [{"id": p["id"], "sev": p.get("sev"), "detail": p.get("detail")}
                         for p in response.list_pending()],
             "locked_accounts": response.locked_accounts(), "quarantine": len(response.list_quarantine()),
-            "observation": profile.summary(), "watch": guard.watch_status()}
+            "observation": profile.summary(), "watch": guard.watch_status(),
+            "telemetry": telemetry.consent(cfg)}
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -193,6 +194,9 @@ def cmd_status(args: argparse.Namespace) -> int:
         print(tr("  watch status   not reported by the guard"))
     print(tr("  alerts         {v}", v=', '.join(notify.channels(cfg)) or tr("none  (arx setup)")))
     print(tr("  vaccines       {n} applied", n=len(vaccines._load().get('applied') or {})))
+    from arx import telemetry
+    print(tr("  improvement    {v}", v=tr("joined (arx telemetry show)") if telemetry.enabled(cfg)
+             else tr("not joined (arx telemetry)")))
     obs = profile.summary()
     print(tr("  observation    {observing} services being learned · {watching} watched",
              observing=obs["observing"], watching=obs["watching"]))
@@ -206,7 +210,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     locked = response.locked_accounts()
     if locked:
         print(tr("  locked accts   {v}   ⚠ your call: arx unlock",
-                 v=', '.join(a['user'] for a in locked)))
+                 v=', '.join(term.user(a['user']) for a in locked)))
     inc = config.state_dir() / "incidents.jsonl"
     try:
         lines = inc.read_text().splitlines()[-5:]
@@ -304,7 +308,7 @@ def cmd_unlock(args: argparse.Namespace) -> int:
         print(tr("Accounts locked by Arx (they do not unlock on their own):"))
         for a in locked:
             print(tr("  {user}  since {v} UTC  ·  {detail}",
-                     user=a['user'], v=str(a['since'])[:16], detail=a['detail']))
+                     user=term.user(a['user']), v=str(a['since'])[:16], detail=a['detail']))
         print(tr("\nUnlock one with:  arx unlock <account>"))
         return 0
     if not any(a["user"] == args.user for a in locked):
@@ -322,7 +326,7 @@ def cmd_unlock(args: argparse.Namespace) -> int:
     if response.revert_failed(done):
         print(tr("⚠ {done}. The account stays locked.", done=done))
         return 1
-    print(tr("✓ Account '{user}' unlocked: {done}", user=args.user, done=done))
+    print(tr("✓ Account '{user}' unlocked: {done}", user=term.user(args.user), done=done))
     print(tr("  If this was legitimate access, to stop further alerts:  arx accept"))
     return 0
 
@@ -454,7 +458,17 @@ def cmd_license(args: argparse.Namespace) -> int:
     return 0
 
 
-def main(argv: list[str] | None = None) -> int:
+def cmd_shell(args: argparse.Namespace) -> int:
+    from arx import shell
+    return shell.run()
+
+
+def cmd_telemetry(args: argparse.Namespace) -> int:
+    from arx import telemetry
+    return telemetry.run(args.taction or "status")
+
+
+def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="arx", description=tr("Arx: active and reactive defense"))
     p.add_argument("--version", action="version", version=f"Arx {__version__}")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -561,6 +575,16 @@ def main(argv: list[str] | None = None) -> int:
     lsub.add_parser("status", help=tr("show status and effective tier"))
     lsub.add_parser("deactivate", help=tr("release the local activation (when reinstalling the "
                                           "server)"))
+    sub.add_parser("shell", help=tr("interactive Arx console (colored prompt, history, Tab completion)"))
+    p_tel = sub.add_parser("telemetry", help=tr("improvement program: anonymous usage reports, only with "
+                                                "your permission"))
+    tsub = p_tel.add_subparsers(dest="taction")
+    tsub.add_parser("status", help=tr("show whether reports are sent, and when"))
+    tsub.add_parser("show", help=tr("print exactly the report that would be sent"))
+    tsub.add_parser("enable", help=tr("join the program (reports are anonymous)"))
+    tsub.add_parser("disable", help=tr("leave the program: nothing else is sent"))
+    tsub.add_parser("send", help=tr("send a report now (only if you joined)"))
+    tsub.add_parser("ask", help=tr("ask once whether to join (the installer runs it)"))
     # Puerta 5 de D2: el arsenal vive en un paquete privado fuera del repo Core.
     # Este gancho solo lo DESCUBRE si está instalado; no contiene nada suyo.
     try:
@@ -569,7 +593,13 @@ def main(argv: list[str] | None = None) -> int:
         _arsenal_cli = None
     if _arsenal_cli is not None:
         _arsenal_cli.register(sub)
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = build_parser()
     args = p.parse_args(argv)
+    term.install(term.grammar(p))  # solo si stdout es una terminal: usuarios, comandos y rutas en color
     handlers = {"setup": cmd_setup, "recon": cmd_recon, "learn": cmd_learn,
                 "guard": cmd_guard, "status": cmd_status, "authorize": cmd_authorize, "unlock": cmd_unlock,
                 "unblock": cmd_unblock,
@@ -577,7 +607,8 @@ def main(argv: list[str] | None = None) -> int:
                 "proposals": cmd_proposals,
                 "canaries": cmd_canaries, "scan": cmd_scan, "forensics": cmd_forensics,
                 "service": cmd_service, "fleet": cmd_fleet, "license": cmd_license,
-                "accept": cmd_accept, "notify": cmd_notify}
+                "accept": cmd_accept, "notify": cmd_notify, "shell": cmd_shell,
+                "telemetry": cmd_telemetry}
     if args.cmd not in handlers:
         # Puerta 5 de D2: el arsenal vive en un paquete privado fuera del repo Core.
         # Este gancho solo lo DESCUBRE si está instalado; no contiene nada suyo.

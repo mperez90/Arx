@@ -25,7 +25,7 @@ import threading
 import time
 from datetime import datetime, timezone
 
-from arx import config, consensus, engine, notify, redact
+from arx import config, consensus, engine, notify, redact, telemetry
 from arx import license as lic
 from arx.i18n import lang, tr
 from arx.modules import (baseline, canaries, dnswatch, execwatch, filewatch, fleet, profile, provenance, recon, response, sandbox,
@@ -584,6 +584,8 @@ def run(once: bool = False, interval: int = 30, chat: bool = False, enforce: boo
             threading.Thread(target=vaccines.update_safely, daemon=True).start()
         if not once and _quietly(lambda: consensus.due(cfg), False):  # Pro/Business con servidor
             threading.Thread(target=consensus.participate_safely, args=(cfg,), daemon=True).start()
+        if not once and _quietly(telemetry.due, False):  # solo con el «sí» del dueño; lee la config viva
+            threading.Thread(target=telemetry.send_safely, daemon=True).start()
         expired = response.expire_blocks()  # auto-expira bloqueos Tier 1 vencidos
         if expired:
             print(tr("  ⏱ {n} Tier 1 block(s) expired and were reverted.", n=len(expired)))

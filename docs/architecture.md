@@ -86,7 +86,9 @@ you (the attacking IP is often another victim).
 
 - **On the customer's host (Core):** engine, wizard, recon, baseline, sensors, response, canaries,
   console chat. Customers bring their **own** model keys → zero inference cost, and their telemetry
-  doesn't leave the machine beyond the model they choose.
+  doesn't leave the machine beyond the model they choose. The one exception is opt-in: an owner who
+  joins the improvement program sends an anonymous report of counters every few days
+  ([telemetry.md](telemetry.md)).
 - **On the service side (higher tiers):** managed intelligence, licensing and the fleet console.
 - **Vaccine consensus** (Pro and Business vote, every tier receives): a proposal goes out on its own
   only with more than two thirds of the paid organizations that vote, from several networks, and only

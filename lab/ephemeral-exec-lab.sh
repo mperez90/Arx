@@ -27,7 +27,7 @@ v bash -c 'systemctl disable --now arx arx-firewall arx-revive.timer arx-b59-run
     /etc/systemd/system/*.service.d/9[01]-arx-*.conf
   grep -lsE "inet:arx:|inet arx confined" /etc/systemd/system.control/*.service.d/*.conf 2>/dev/null | xargs -r rm -f
   nft delete table inet arx 2>/dev/null; systemctl daemon-reload
-  export DEBIAN_FRONTEND=noninteractive; apt-get -o DPkg::Lock::Timeout=300 install -y -qq nftables python3 >/dev/null'
+  export DEBIAN_FRONTEND=noninteractive; apt-get -o DPkg::Lock::Timeout=300 install -y -qq nftables python3 auditd >/dev/null'
 v bash -s -- "$PWD" <<'REMOTE'
 set -e
 root=$1

@@ -31,7 +31,7 @@ v bash -c 'systemctl disable --now arx arx-firewall 2>/dev/null; pkill -9 -f "[a
   rm -rf /etc/arx /var/lib/arx /tmp/arxsrc /etc/systemd/system/*.service.d/9[01]-arx-*.conf /etc/systemd/system/arx*.service
   grep -lsE "inet:arx:|inet arx confined" /etc/systemd/system.control/*.service.d/*.conf | xargs -r rm -f
   nft delete table inet arx 2>/dev/null; systemctl daemon-reload
-  export DEBIAN_FRONTEND=noninteractive; apt-get -o DPkg::Lock::Timeout=300 install -y -qq nftables netcat-openbsd >/dev/null'
+  export DEBIAN_FRONTEND=noninteractive; apt-get -o DPkg::Lock::Timeout=300 install -y -qq nftables netcat-openbsd auditd >/dev/null'
 v bash -c "mkdir -p /tmp/arxsrc && cp -r $PWD/src $PWD/packaging /tmp/arxsrc/ && cd /tmp/arxsrc && packaging/build-deb.sh >/dev/null 2>&1 && dpkg -i ./dist/arx_all.deb >/dev/null 2>&1"
 check "Arx instalado" v arx --version
 printf '%s\n' "en" "" "" "" "$WORD" "$WORD" "" "" "1" "" "core" "" "" "high" "block" | v arx setup >/dev/null 2>&1

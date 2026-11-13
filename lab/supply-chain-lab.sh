@@ -72,7 +72,7 @@ v bash -c 'systemctl disable --now arx arx-firewall acme-agent acme-relay 2>/dev
   grep -lsE "inet:arx:|inet arx confined" /etc/systemd/system.control/*.service.d/*.conf | xargs -r rm -f
   sed -i "/acme-lab/d" /root/.ssh/authorized_keys 2>/dev/null; nft delete table inet arx 2>/dev/null; systemctl daemon-reload
   export DEBIAN_FRONTEND=noninteractive; apt-get -o DPkg::Lock::Timeout=300 update -qq >/dev/null
-  apt-get -o DPkg::Lock::Timeout=300 install -y -qq socat nftables dpkg-dev apt-utils gnupg netcat-openbsd >/dev/null'
+  apt-get -o DPkg::Lock::Timeout=300 install -y -qq socat nftables dpkg-dev apt-utils gnupg netcat-openbsd auditd >/dev/null'
 v bash -c "mkdir -p /tmp/arxsrc && cp -r $PWD/src $PWD/packaging /tmp/arxsrc/ && cd /tmp/arxsrc && packaging/build-deb.sh >/dev/null 2>&1 && dpkg -i ./dist/arx_all.deb >/dev/null 2>&1"
 check "Arx instalado" v arx --version
 # clave del proveedor y paquetes: build_pkg <versión> <postinst> <ExecStart>

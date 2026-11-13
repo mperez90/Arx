@@ -1,0 +1,30 @@
+[Unit]
+Description=Arx improvement-program collector
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 /opt/arx-collector/collector.py serve
+EnvironmentFile=/etc/arx-collector.env
+DynamicUser=yes
+StateDirectory=arx-collector
+StateDirectoryMode=0750
+Environment=ARX_COLLECTOR_DATA=/var/lib/arx-collector
+Restart=on-failure
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target

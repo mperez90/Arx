@@ -50,12 +50,22 @@ else
 fi
 
 echo "Installing…"
-# dpkg -i puede fallar por la dependencia python3; apt la resuelve.
+# dpkg -i falla si faltan sus dependencias (python3, auditd); apt las resuelve e instala.
 # Silenciamos su salida (el postinst) para no duplicar el mensaje de pasos de abajo.
 if ! dpkg -i "$DEB" >/dev/null 2>&1; then
   apt-get update -qq
   apt-get install -f -y
 fi
+
+# auditd viene siempre con Arx: sin él no hay avisos de ficheros de identidad, señuelos ni lecturas
+# denegadas. En un contenedor el núcleo no deja arrancarlo; se avisa, no se aborta.
+if [ -d /run/systemd/system ] && ! systemctl is-active --quiet auditd 2>/dev/null; then
+  systemctl enable --now auditd >/dev/null 2>&1 || \
+    echo "⚠ auditd is installed but not running (systemctl status auditd): Arx's identity-file, honeytoken and denied-open alerts stay off until it runs."
+fi
+
+# Programa de mejora: se pregunta una sola vez y solo con una terminal delante. Sin respuesta, no se envía nada.
+arx telemetry ask || true
 
 cat <<'MSG'
 
@@ -66,4 +76,7 @@ cat <<'MSG'
   sudo arx learn --seal     # seal the baseline
   sudo arx service install  # 24/7 defense in observe mode (systemd)
   sudo arx notify test      # check that alerts reach you
+
+  sudo arx shell            # interactive console (colored prompt, history, Tab)
+  man arx                   # the full manual
 MSG

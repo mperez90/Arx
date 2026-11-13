@@ -23,6 +23,10 @@ docs/*
 !docs/tiers.md
 !docs/runbook.md
 !docs/release-v0.0.9rc1.md
+!docs/release-v0.0.9rc2.md
+!docs/manual.md
+!docs/manual.es.md
+!docs/telemetry.md
 !docs/assets/
 
 # Tooling de negocio y tiers cerrados — NUNCA en el Core (source-available)

@@ -95,7 +95,7 @@ v bash -c 'systemctl disable --now arx arx-firewall agent sidedoor evild obs qui
   rm -rf /etc/arx /var/lib/arx /opt/agent /root/.cache/.x /etc/systemd/system/agent.service /etc/systemd/system/arx.service /etc/systemd/system/arx-firewall.service /etc/systemd/system.control \
     /etc/systemd/system/sidedoor.service /tmp/arxsrc /tmp/evil*
   nft delete table inet arx 2>/dev/null; systemctl daemon-reload
-  export DEBIAN_FRONTEND=noninteractive; apt-get -o DPkg::Lock::Timeout=300 update -qq >/dev/null; apt-get -o DPkg::Lock::Timeout=300 install -y -qq socat nftables dpkg-dev curl iproute2 python3 netcat-openbsd >/dev/null'
+  export DEBIAN_FRONTEND=noninteractive; apt-get -o DPkg::Lock::Timeout=300 update -qq >/dev/null; apt-get -o DPkg::Lock::Timeout=300 install -y -qq socat nftables dpkg-dev curl iproute2 python3 auditd netcat-openbsd >/dev/null'
 # dpkg -i reinstala siempre: `apt-get install` de la misma versión no hace nada y probaría el paquete viejo
 if [ -n "$LXC" ]; then
   limactl shell "$VM" sudo bash -c "rm -rf /tmp/arxsrc && mkdir -p /tmp/arxsrc && cp -r $PWD/src $PWD/packaging /tmp/arxsrc/ && cd /tmp/arxsrc && packaging/build-deb.sh >/dev/null 2>&1 && incus file push /tmp/arxsrc/dist/arx_all.deb $LXC/tmp/arx_all.deb >/dev/null 2>&1"

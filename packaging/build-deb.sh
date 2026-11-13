@@ -27,8 +27,9 @@ trap 'rm -rf "$STAGE"' EXIT
 python3 -m zipapp "$ROOT/src" -m "arx.cli:entry" -o "$STAGE/arx.pyz" -p "/usr/bin/env python3"
 
 # 2) árbol del paquete
-mkdir -p "$PKG/DEBIAN" "$PKG/usr/lib/arx" "$PKG/usr/bin"
+mkdir -p "$PKG/DEBIAN" "$PKG/usr/lib/arx" "$PKG/usr/bin" "$PKG/usr/share/man/man1"
 cp "$STAGE/arx.pyz" "$PKG/usr/lib/arx/arx.pyz"
+gzip -9n -c "$ROOT/packaging/arx.1" > "$PKG/usr/share/man/man1/arx.1.gz"  # `man arx`
 
 cat > "$PKG/usr/bin/arx" <<'EOF'
 #!/bin/sh
@@ -43,9 +44,8 @@ Version: $VERSION
 Section: admin
 Priority: optional
 Architecture: all
-Depends: python3 (>= 3.10)
+Depends: python3 (>= 3.10), auditd
 Recommends: nftables
-Suggests: auditd
 Maintainer: $MAINTAINER
 Installed-Size: $INSTALLED_KB
 Description: Arx - autonomous defensive security agent

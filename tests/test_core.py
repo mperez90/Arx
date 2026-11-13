@@ -9389,5 +9389,643 @@ class ArxDropinRecognitionTests(unittest.TestCase):
         self.assertFalse(self.v._is_arx_dropin(path, old.replace(".nft", ".sh")))
 
 
+
+class TerminalColorTests(unittest.TestCase):
+    """Usuarios en azul, comandos en amarillo, rutas en verde: solo hacia una terminal, nunca en los datos."""
+
+    class _Tty(io.StringIO):
+        def isatty(self):
+            return True
+
+    def setUp(self):
+        from arx import cli, term
+        self.term = term
+        self.gram = term.grammar(cli.build_parser())
+        for k in ("ARX_COLOR", "NO_COLOR"):
+            self.addCleanup(os.environ.__setitem__, k, os.environ[k]) if k in os.environ else \
+                self.addCleanup(os.environ.pop, k, None)
+            os.environ.pop(k, None)
+
+    def y(self, text):
+        return f"\x1b[33m{text}\x1b[0m"
+
+    def test_only_a_terminal_gets_colors_and_the_user_can_force_either_way(self):
+        tty = self._Tty()
+        self.assertFalse(self.term.enabled(io.StringIO()))
+        with mock.patch.dict(os.environ, {"TERM": "xterm"}):
+            self.assertTrue(self.term.enabled(tty))
+        with mock.patch.dict(os.environ, {"TERM": "dumb"}):
+            self.assertFalse(self.term.enabled(tty))
+        with mock.patch.dict(os.environ, {"ARX_COLOR": "always"}):
+            self.assertTrue(self.term.enabled(io.StringIO()))
+        with mock.patch.dict(os.environ, {"ARX_COLOR": "never", "TERM": "xterm"}):
+            self.assertFalse(self.term.enabled(tty))
+        with mock.patch.dict(os.environ, {"ARX_COLOR": "always", "NO_COLOR": "1"}):
+            self.assertFalse(self.term.enabled(tty))
+
+    def test_a_command_is_painted_by_the_real_grammar_not_to_the_end_of_the_sentence(self):
+        h = lambda t: self.term.highlight(t, self.gram)  # noqa: E731
+        self.assertEqual(h("Accept one with:  arx accept <id>"), "Accept one with:  " + self.y("arx accept <id>"))
+        self.assertEqual(h("(arx learn several times and then arx learn --seal)"),
+                         f"({self.y('arx learn')} several times and then {self.y('arx learn --seal')})")
+        self.assertEqual(h("retry:  arx license activate <KEY>"), "retry:  " + self.y("arx license activate <KEY>"))
+        self.assertEqual(h("Your call:  arx unlock bob   ·   then:  arx accept"),
+                         f"Your call:  {self.y('arx unlock bob')}   ·   then:  {self.y('arx accept')}")
+        self.assertEqual(h("  arx metrics --days 7 --json"), "  " + self.y("arx metrics --days 7 --json"))
+        self.assertEqual(h("  configured     no  (arx setup)"), "  configured     no  (" + self.y("arx setup") + ")")
+        self.assertEqual(h("Check:  systemctl status arx"), "Check:  " + self.y("systemctl status arx"))
+        self.assertEqual(h("the arx team"), "the arx team")  # «team» no es un subcomando
+
+    def test_paths_are_green_but_fractions_urls_and_separators_are_not(self):
+        g = lambda t: f"\x1b[32m{t}\x1b[0m"  # noqa: E731
+        self.assertEqual(self.term.highlight("denied (/usr/bin/cat, pid 12) reading /etc/shadow.", self.gram),
+                         f"denied ({g('/usr/bin/cat')}, pid 12) reading {g('/etc/shadow')}.")
+        plain = "Tier 0/1 · Telegram / webhook · https://api.telegram.org/bot · MiB/s"
+        self.assertEqual(self.term.highlight(plain, self.gram), plain)
+
+    def test_users_in_unambiguous_context_and_after_as_only_if_the_account_exists(self):
+        b = lambda t: f"\x1b[34m{t}\x1b[0m"  # noqa: E731
+        with mock.patch.object(self.term, "_is_local_user", lambda name: name == "root"):
+            self.assertEqual(self.term.highlight("account 'bob' locked", self.gram), f"account '{b('bob')}' locked")
+            self.assertEqual(self.term.highlight("(most tried user: admin)", self.gram), f"(most tried user: {b('admin')})")
+            self.assertEqual(self.term.highlight("started as root", self.gram), f"started as {b('root')}")
+            self.assertEqual(self.term.highlight("accept it as normal", self.gram), "accept it as normal")
+
+    def test_existing_colors_are_respected(self):
+        line = "\x1b[31mcrit /etc/passwd\x1b[0m and /tmp/x"
+        self.assertEqual(self.term.highlight(line, self.gram), "\x1b[31mcrit /etc/passwd\x1b[0m and \x1b[32m/tmp/x\x1b[0m")
+
+    def test_the_painter_paints_whole_lines_and_flushes_a_prompt(self):
+        raw = self._Tty()
+        p = self.term.Painter(raw, self.gram)
+        p.write("Run:  arx ")
+        self.assertEqual(raw.getvalue(), "")
+        p.write("setup\nsecond /tmp/x\npartial")
+        self.assertEqual(raw.getvalue(), "Run:  " + self.y("arx setup") + "\nsecond \x1b[32m/tmp/x\x1b[0m\n")
+        p.flush()
+        self.assertTrue(raw.getvalue().endswith("partial"))
+        self.assertTrue(p.isatty())
+
+    def test_the_painter_keeps_input_on_readline(self):
+        """input() solo usa readline si stdout tiene encoding y errors de texto: sin `errors`, la consola
+        perdía Tab, el historial y mostraba los marcadores del prompt (visto en Ubuntu 24.04 y macOS)."""
+        raw = io.TextIOWrapper(io.BytesIO(), encoding="utf-8", errors="strict")
+        p = self.term.Painter(raw, self.gram)
+        self.assertEqual(p.encoding, "utf-8")
+        self.assertEqual(p.errors, "strict")
+        self.assertIsInstance(p.errors, str)
+
+    def test_outside_a_terminal_the_output_is_clean_and_forcing_paints_it(self):
+        import subprocess
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        env = {"PATH": os.environ.get("PATH", ""), "PYTHONPATH": os.path.join(os.path.dirname(__file__), "..", "src"),
+               "ARX_CONFIG_DIR": os.path.join(d, "c"), "ARX_STATE_DIR": os.path.join(d, "s"), "ARX_LANG": "en"}
+        plain = subprocess.run([sys.executable, "-m", "arx.cli", "status"], env=env, capture_output=True, text=True)
+        self.assertNotIn("\x1b[", plain.stdout)
+        forced = subprocess.run([sys.executable, "-m", "arx.cli", "status"], env={**env, "ARX_COLOR": "always"},
+                                capture_output=True, text=True)
+        self.assertIn(self.y("arx setup"), forced.stdout)
+        self.assertEqual(self.term._ANSI.sub("", forced.stdout), plain.stdout)
+
+    def test_explicit_user_marking_is_plain_when_there_is_no_terminal(self):
+        self.assertEqual(self.term.user("deploy", io.StringIO()), "deploy")
+        with mock.patch.dict(os.environ, {"ARX_COLOR": "always"}):
+            self.assertEqual(self.term.user("deploy"), "\x1b[34mdeploy\x1b[0m")
+
+
+class ArxConsoleTests(unittest.TestCase):
+    """`arx shell`: un error o un --help nunca cierran la consola; los colores solo dentro de ella."""
+
+    def setUp(self):
+        _isolate()
+        from arx import cli, shell, term
+        self.shell, self.parser = shell, cli.build_parser()
+        self.gram = term.grammar(self.parser)
+        self.cwd = os.getcwd()
+        self.addCleanup(os.chdir, self.cwd)
+
+    def run_line(self, line):
+        out = io.StringIO()
+        with mock.patch("sys.stdout", new=out):
+            code = self.shell.handle(line, self.parser)
+        return code, out.getvalue()
+
+    def test_exit_quit_and_blank_lines(self):
+        self.assertIsNone(self.run_line("exit")[0])
+        self.assertIsNone(self.run_line("quit")[0])
+        self.assertEqual(self.run_line("   ")[0], 0)
+        self.assertEqual(self.run_line("# comment")[0], 0)
+        self.assertEqual(self.run_line("arx")[0], 0)
+
+    def test_arx_commands_run_with_or_without_the_prefix(self):
+        for line in ("status", "arx status"):
+            code, out = self.run_line(line)
+            self.assertEqual(code, 0)
+            self.assertIn("configurado", out)
+
+    def test_help_version_errors_and_crashes_never_close_the_console(self):
+        self.assertEqual(self.run_line("status --help")[0], 0)
+        code, _ = self.run_line("does-not-exist")
+        self.assertEqual(code, 2)
+        with mock.patch("arx.cli.cmd_status", side_effect=RuntimeError("boom")):
+            code, out = self.run_line("status")
+        self.assertEqual(code, 1)
+        self.assertIn("el comando falló (RuntimeError: boom)", out)
+        self.assertEqual(self.run_line('scan "unclosed')[0], 2)
+
+    def test_console_builtins(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        self.assertEqual(self.run_line(f"cd {d}")[0], 0)
+        self.assertEqual(os.path.realpath(os.getcwd()), os.path.realpath(d))
+        self.assertEqual(self.run_line("cd /does/not/exist")[0], 1)
+        self.assertIn(os.path.realpath(d), os.path.realpath(self.run_line("pwd")[1].strip()))
+        self.assertIn("Ya estás en la consola de Arx.", self.run_line("shell")[1])
+        code, out = self.run_line("help")
+        self.assertEqual(code, 0)
+        self.assertIn("status", out)
+        self.assertNotIn("  shell ", out)
+
+    def test_the_prompt_colors_user_blue_path_green_and_typing_yellow(self):
+        self.assertTrue(self.shell.prompt(False, False).endswith(" arx› "))
+        self.assertNotIn("\x1b", self.shell.prompt(False, True))
+        colored = self.shell.prompt(True, True)
+        self.assertTrue(colored.startswith("\001\x1b[34m\002"))
+        self.assertIn("\001\x1b[32m\002", colored)
+        self.assertTrue(colored.endswith("arx› \001\x1b[33m\002"))
+        self.assertNotIn("\001", self.shell.prompt(True, False))
+
+    def test_the_prompt_shows_home_as_tilde(self):
+        home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, home, True)
+        os.makedirs(os.path.join(home, "sub"))
+        with mock.patch.dict(os.environ, {"HOME": home}):
+            os.chdir(os.path.join(home, "sub"))
+            self.assertEqual(self.shell._where().replace(os.path.realpath(home), "~"), "~/sub")
+
+    def test_tab_completes_commands_actions_flags_and_directories(self):
+        c = self.shell.complete_options
+        self.assertIn("status", c([], "", self.gram))
+        self.assertIn("exit", c([], "", self.gram))
+        self.assertEqual(c(["license"], "a", self.gram), ["activate"])
+        self.assertEqual(c(["arx", "metrics"], "--", self.gram), ["--days", "--json"])
+        self.assertEqual(c(["telemetry"], "s", self.gram), ["send", "show", "status"])
+        self.assertEqual(c(["telemetry"], "a", self.gram), ["ask"])
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        os.makedirs(os.path.join(d, "dir"))
+        open(os.path.join(d, "file"), "w").close()
+        self.assertEqual(c(["cd"], d + "/", self.gram), [d + "/dir/"])
+        self.assertEqual(sorted(c(["scan"], d + "/", self.gram)), [d + "/dir/", d + "/file"])
+
+    @unittest.skipUnless(sys.platform.startswith("linux") or sys.platform == "darwin", "needs a pty")
+    def test_in_a_real_terminal_tab_completes_and_the_prompt_hides_its_markers(self):
+        """De extremo a extremo, en una pseudo-terminal: lo que el operador ve de verdad."""
+        try:
+            import readline
+        except ImportError:
+            self.skipTest("Python without readline")
+        gnu = not self.shell._libedit(readline)  # libedit (macOS) no respeta los marcadores: prompt sin color
+        import fcntl
+        import select
+        import struct
+        import subprocess
+        import termios
+        env = {**os.environ, "PYTHONPATH": os.path.join(os.path.dirname(__file__), "..", "src"),
+               "TERM": "xterm", "ARX_LANG": "en", "HOME": tempfile.mkdtemp()}
+        env.pop("NO_COLOR", None)
+        env.pop("ARX_COLOR", None)
+        fd, slave = os.openpty()  # sin fork en Python: la suite tiene hilos vivos
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
+        proc = subprocess.Popen([sys.executable, "-m", "arx.cli", "shell"], stdin=slave, stdout=slave,
+                                stderr=slave, env=env, start_new_session=True)
+        os.close(slave)
+        out = b""
+
+        def read_until(marker, timeout=15.0):
+            nonlocal out
+            end = time.time() + timeout
+            while marker not in out and time.time() < end:
+                if select.select([fd], [], [], 0.1)[0]:
+                    try:
+                        out += os.read(fd, 65536)
+                    except OSError:
+                        break
+            return marker in out
+        try:
+            self.assertTrue(read_until("arx› ".encode()), out)
+            os.write(fd, b"lic\t")
+            self.assertTrue(read_until(b"license "), out)  # completa y deja el espacio para seguir
+        finally:
+            # Ctrl+U borra la línea; luego exit. Si la consola no sale, se mata: un fallo nunca cuelga la suite
+            try:
+                os.write(fd, b"\x15exit\r")
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            read_until(b"\x00", 0.2)
+            os.close(fd)
+        self.assertNotIn(b"\x01", out)
+        self.assertNotIn(b"\x02", out)
+        if gnu:
+            self.assertIn(b"\x1b[34m", out)  # el usuario, en azul
+
+    def test_without_a_terminal_it_reads_commands_from_stdin(self):
+        out = io.StringIO()
+        with mock.patch("sys.stdin", new=io.StringIO("status\nlicense status\n")), mock.patch("sys.stdout", new=out):
+            self.assertEqual(self.shell.run(), 0)
+        self.assertIn("configurado", out.getvalue())
+        self.assertNotIn("arx›", out.getvalue())
+
+
+class TelemetryTests(unittest.TestCase):
+    """Programa de mejora: nada sale sin un «sí»; lo que sale no identifica al host."""
+
+    def setUp(self):
+        self.d = _isolate()
+        from arx import config, telemetry
+        self.t, self.config = telemetry, config
+        for k in ("ARX_TELEMETRY", "DO_NOT_TRACK"):
+            self.addCleanup(os.environ.__setitem__, k, os.environ[k]) if k in os.environ else \
+                self.addCleanup(os.environ.pop, k, None)
+            os.environ.pop(k, None)
+        self.sent = []
+
+    def post(self, url, body):
+        self.sent.append((url, body))
+        return {"ok": True, "interval_days": 7}
+
+    def join(self):
+        with mock.patch("sys.stdout", new=io.StringIO()):
+            return self.t.set_consent(True)
+
+    def test_without_an_answer_nothing_is_sent_or_written(self):
+        self.assertIsNone(self.t.consent())
+        self.assertFalse(self.t.enabled())
+        self.assertFalse(self.t.due())
+        self.assertEqual(self.t.send(post=self.post), "disabled")
+        self.assertEqual(self.sent, [])
+        self.assertFalse(self.t._state_path().exists())
+
+    def test_yes_creates_a_random_id_and_no_forgets_it(self):
+        rec = self.join()
+        self.assertRegex(rec["install_id"], r"^[0-9a-f]{32}$")
+        self.assertEqual(self.config.load_config()["telemetry"]["consent"], "yes")
+        self.assertTrue(self.t.enabled())
+        self.config.write_json(self.t._state_path(), {"since": 1})
+        self.t.set_consent(False)
+        self.assertNotIn("install_id", self.config.load_config()["telemetry"])
+        self.assertFalse(self.t._state_path().exists())
+        self.assertNotEqual(self.join()["install_id"], rec["install_id"])
+
+    def test_the_owner_environment_switch_wins_over_consent(self):
+        self.join()
+        for env in ({"ARX_TELEMETRY": "off"}, {"DO_NOT_TRACK": "1"}):
+            with mock.patch.dict(os.environ, env):
+                self.assertFalse(self.t.enabled())
+                self.assertEqual(self.t.send(post=self.post), "disabled")
+        self.assertEqual(self.sent, [])
+
+    def test_the_report_never_carries_host_names_ips_paths_users_or_secrets(self):
+        self.join()
+        cfg = self.config.load_config()
+        cfg.update({"providers": {"openai": "gpt"}, "notify": {"webhook_url": "https://hooks.example/T0SECRET",
+                                                                "telegram_chat_id": "987654321"}})
+        self.config.save_config(cfg)
+        self.config.save_secrets({"openai": "sk-live-SECRETKEY", "telegram_bot_token": "123:AAA-SECRET"})
+        state = self.config.state_dir()
+        now = datetime.now(timezone.utc)
+        with open(state / "incidents.jsonl", "w") as f:
+            for e in ({"kind": "incident", "new": True, "sev": "high", "finding_kind": "new_listen_port",
+                       "detail": "secret-host-01 10.0.0.3 /etc/shadow deploy", "at": now.isoformat()},
+                      {"kind": "self_down", "restart_state": "scheduled", "at": now.isoformat()},
+                      {"kind": "notify_result", "results": {"telegram": "ok", "webhook": "error: 10.0.0.3"},
+                       "at": now.isoformat()}):
+                f.write(json.dumps(e) + "\n")
+        self.config.write_json(state / "watch.json", {"process": {"mode": "netlink", "capture": {
+            "mode": "full", "marks": ["/", "/srv/secret-host-01"], "failed": ["/mnt/data"], "captured": 9}},
+            "sensitive_files": {"mode": "partial", "marks": ["/etc/shadow"], "overflow": 1}})
+        with mock.patch.object(self.t.socket, "gethostname", lambda: "secret-host-01"):
+            report = self.t.build()
+        text = json.dumps(report)
+        for leak in ("secret-host-01", "10.0.0.3", "/etc", "/srv", "/mnt", "deploy", "hooks.example", "T0SECRET",
+                     "987654321", "sk-live", "SECRET", "gpt"):
+            self.assertNotIn(leak, text)
+        self.assertEqual(report["watch"]["exec_marks"], 2)
+        self.assertEqual(report["watch"]["exec_marks_failed"], 1)
+        self.assertEqual(report["watch"]["files"], "partial")
+        self.assertEqual(report["noise"]["high_by_kind"], {"new_listen_port": 1})
+        self.assertEqual(report["health"]["restart_state"], {"scheduled": 1})
+        self.assertEqual(report["health"]["alert_delivery"], {"telegram": {"ok": 1, "failed": 0},
+                                                             "webhook": {"ok": 0, "failed": 1}})
+        self.assertEqual(report["setup"]["llm_providers"], 1)
+        self.assertTrue(report["setup"]["webhook"])
+
+        def strings(o):
+            if isinstance(o, dict):
+                for k, v in o.items():
+                    yield k
+                    yield from strings(v)
+            elif isinstance(o, str):
+                yield o
+        for value in strings(report):
+            self.assertRegex(value, r"^[A-Za-z0-9._+:-]{0,40}$")
+
+    def test_sanitize_drops_whatever_is_not_a_short_identifier(self):
+        hosts = {"web01"}
+        dirty = {"ok": "ubuntu", "ip4": "192.168.1.10", "ip6": "fe80::1", "host": "WEB01", "path": "/etc/x",
+                 "long": "x" * 41, "nan": float("nan"), "Bad-Key": 1, "deep": {"a": {"b": {"c": {"d": 1}}}},
+                 "web01": 1, "list": [1, 2], "n": 3, "f": 0.12345, "b": True, "none": None}
+        self.assertEqual(self.t.sanitize(dirty, hosts=hosts),
+                         {"ok": "ubuntu", "nan": None, "deep": {"a": {"b": {}}}, "n": 3, "f": 0.123, "b": True, "none": None})
+
+    def test_cadence_first_after_a_day_then_every_interval_and_retries_spaced(self):
+        self.join()
+        t0 = 1_000_000.0
+        self.assertFalse(self.t.due(now=t0))  # fija «since»
+        self.assertFalse(self.t.due(now=t0 + 3600))
+        self.assertTrue(self.t.due(now=t0 + 86400))
+        self.assertEqual(self.t.send(now=t0 + 86400, post=self.post), "ok")
+        self.assertFalse(self.t.due(now=t0 + 86400 * 7))
+        self.assertTrue(self.t.due(now=t0 + 86400 * 8))
+
+        def down(url, body):
+            raise OSError("unreachable")
+        self.assertEqual(self.t.send(now=t0 + 86400 * 8, post=down), "error: OSError")
+        self.assertFalse(self.t.due(now=t0 + 86400 * 8 + 3600))
+        self.assertTrue(self.t.due(now=t0 + 86400 * 8 + 6 * 3600))
+
+    def test_the_collector_proposes_the_cadence_within_bounds(self):
+        self.join()
+        for proposed, kept in ((99, 30), (0, 1), (3, 3), (True, 3), ("5", 3)):
+            self.t.send(post=lambda u, b, p=proposed: {"interval_days": p})
+            self.assertEqual(self.config.read_json(self.t._state_path())["interval_days"], kept, proposed)
+
+    def test_send_posts_the_built_report_to_the_fixed_https_endpoint(self):
+        self.join()
+        self.assertEqual(self.t.send(post=self.post), "ok")
+        url, body = self.sent[0]
+        self.assertEqual(url, self.t.ENDPOINT)
+        self.assertTrue(url.startswith("https://"))
+        self.assertEqual(body["schema"], 1)
+        self.assertEqual(body["install_id"], self.config.load_config()["telemetry"]["install_id"])
+        with self.assertRaises(ValueError):
+            self.t._post("http://plain.example/v1/report", {})
+
+    def test_one_send_at_a_time(self):
+        self.join()
+        self.t._lock.acquire()
+        try:
+            self.assertEqual(self.t.send(post=self.post), "busy")
+        finally:
+            self.t._lock.release()
+
+    def test_cli_show_enable_disable_send(self):
+        from arx import cli
+        out = io.StringIO()
+        with mock.patch("sys.stdout", new=out), mock.patch("sys.stderr", new=io.StringIO()):
+            self.assertEqual(cli.main(["telemetry", "show"]), 0)
+        self.assertEqual(json.loads(out.getvalue())["schema"], 1)
+        out = io.StringIO()
+        with mock.patch("sys.stdout", new=out):
+            self.assertEqual(cli.main(["telemetry", "send"]), 1)
+            self.assertEqual(cli.main(["telemetry", "enable"]), 0)
+            self.assertEqual(cli.main(["telemetry"]), 0)
+            self.assertEqual(cli.main(["telemetry", "disable"]), 0)
+        text = out.getvalue()
+        self.assertIn("No se envió nada: no te has unido", text)
+        self.assertIn("Te has unido", text)
+        self.assertIn("participa      sí", text)
+        self.assertIn("se borró el id de instalación", text)
+        self.assertEqual(self.t.consent(), "no")
+
+    def test_the_installer_question_only_with_a_terminal_and_only_once(self):
+        with mock.patch("sys.stdin.isatty", lambda: False):
+            self.assertEqual(self.t.ask(), 0)
+        self.assertIsNone(self.t.consent())
+        tty = mock.patch.multiple("sys", stdin=mock.Mock(isatty=lambda: True), stdout=mock.Mock(isatty=lambda: True))
+        with tty, mock.patch("builtins.input", side_effect=EOFError):
+            self.t.ask()
+        self.assertIsNone(self.t.consent())
+        with tty, mock.patch("builtins.input", return_value="s"):
+            self.t.ask()
+        self.assertEqual(self.t.consent(), "yes")
+        with tty, mock.patch("builtins.input", side_effect=AssertionError("asked twice")):
+            self.t.ask()
+        _isolate()
+        with tty, mock.patch("builtins.input", return_value=""):
+            self.t.ask()
+        self.assertEqual(self.t.consent(), "no")
+
+    def test_setup_asks_and_defaults_to_no(self):
+        from arx.modules import setup
+        for answer, expected in ((None, "no"), ("s", "yes")):
+            _isolate()
+
+            def ask(p, d=None, a=answer):
+                return a if a and ("¿Te unes?" in p or "Join?" in p) else (d or "")
+            with mock.patch.object(setup, "_ask", ask), mock.patch.object(setup, "_ask_secret", lambda p: "palabra"), \
+                    mock.patch("sys.stdout", new=io.StringIO()):
+                setup.run()
+            self.assertEqual(self.t.consent(), expected)
+            self.assertEqual("install_id" in self.config.load_config()["telemetry"], expected == "yes")
+
+    def test_setup_answers_by_pipe_that_run_out_keep_the_defaults(self):
+        """Los labs le pasan las respuestas por tubería: un paso nuevo no puede romper la configuración."""
+        from arx.modules import setup
+        with mock.patch("builtins.input", side_effect=EOFError), mock.patch("sys.stdout", new=io.StringIO()):
+            self.assertEqual(setup._ask("Pregunta", "n"), "n")
+            self.assertEqual(setup._ask("Pregunta"), "")
+
+    def test_status_reports_participation(self):
+        from arx import cli
+        out = io.StringIO()
+        with mock.patch("sys.stdout", new=out):
+            cli.main(["status"])
+        self.assertIn("mejora         no participa", out.getvalue())
+
+
+class TelemetryCollectorTests(unittest.TestCase):
+    """El recolector: valida y sanea como el cliente, no guarda IPs y resume para el correo diario."""
+
+    def setUp(self):
+        import importlib.util
+        path = os.path.join(os.path.dirname(__file__), "..", "tools", "telemetry-collector", "collector.py")
+        spec = importlib.util.spec_from_file_location("arx_collector", path)
+        self.c = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.c)
+        self.d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.d, True)
+        _isolate()
+        from arx import config, telemetry
+        self.t = telemetry
+        with mock.patch("sys.stdout", new=io.StringIO()):
+            telemetry.set_consent(True)
+        self.report = telemetry.build()
+        self.config = config
+
+    def test_a_real_client_report_passes_unchanged(self):
+        self.assertEqual(self.c.validate(json.dumps(self.report).encode()), self.report)
+
+    def test_validation_rejects_the_wrong_shape_and_sanitizes_the_rest(self):
+        for raw, reason in ((b"not json", "not json"), (b"[]", "not an object"),
+                            (json.dumps({**self.report, "schema": 2}).encode(), "unknown schema"),
+                            (json.dumps({**self.report, "install_id": "x"}).encode(), "bad install_id"),
+                            (b"x" * (self.c.MAX_BODY + 1), "too large")):
+            with self.assertRaises(ValueError) as cm:
+                self.c.validate(raw)
+            self.assertEqual(str(cm.exception), reason)
+        dirty = {**self.report, "extra": {"ip": "203.0.113.9", "path": "/root/.ssh", "ok": 1}}
+        self.assertEqual(self.c.validate(json.dumps(dirty).encode())["extra"], {"ok": 1})
+
+    def test_limits_per_installation_and_global(self):
+        store = self.c.Store(pathlib_path(self.d), min_gap_s=3600, max_per_min=2)
+        self.assertIsNone(store.admit("a" * 32, 1000))
+        self.assertEqual(store.admit("a" * 32, 1010), "too soon")
+        self.assertIsNone(store.admit("b" * 32, 1010))
+        self.assertEqual(store.admit("c" * 32, 1011), "busy")
+        self.assertIsNone(store.admit("c" * 32, 1100))
+        self.assertEqual(store.admit("a" * 32, 1100), "too soon")
+        self.assertIsNone(store.admit("a" * 32, 4601))
+
+    def test_http_round_trip_stores_hour_precision_and_no_address(self):
+        import threading
+        import urllib.error
+        import urllib.request
+        from http.server import ThreadingHTTPServer
+        store = self.c.Store(pathlib_path(self.d), min_gap_s=3600, max_per_min=100)
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), self.c.handler_for(store, 9))
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+
+        def post(body):
+            req = urllib.request.Request(base + "/v1/report", data=json.dumps(body).encode(), method="POST",
+                                         headers={"Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(req, timeout=5) as r:
+                    return r.status, json.loads(r.read())
+            except urllib.error.HTTPError as e:
+                return e.code, json.loads(e.read())
+        self.assertEqual(post(self.report), (200, {"ok": True, "interval_days": 9}))
+        self.assertEqual(post(self.report)[0], 429)
+        with urllib.request.urlopen(base + "/healthz", timeout=5) as r:
+            self.assertEqual(json.loads(r.read()), {"ok": True})
+        files = os.listdir(os.path.join(self.d, "reports"))
+        self.assertEqual(len(files), 1)
+        with open(os.path.join(self.d, "reports", files[0])) as f:
+            stored = [json.loads(line) for line in f]
+        self.assertEqual(len(stored), 1)
+        self.assertRegex(stored[0]["received"], r"^\d{4}-\d\d-\d\dT\d\d:00Z$")
+        self.assertEqual(stored[0]["report"], self.report)
+        self.assertNotIn("127.0.0.1", json.dumps(stored))
+
+    def test_the_daily_digest_summarizes_and_attaches_the_raw_day(self):
+        store = self.c.Store(pathlib_path(self.d), min_gap_s=0, max_per_min=100)
+        now = time.time()
+        self.report["watch"].update(exec_capture="full", files="full")
+        degraded = json.loads(json.dumps(self.report))
+        degraded["install_id"] = "f" * 32
+        degraded["watch"]["exec_capture"] = "partial"
+        store.save(self.report, now)
+        store.save(degraded, now)
+        day = datetime.fromtimestamp(now, timezone.utc).date()
+        msg = self.c.build_digest(pathlib_path(self.d), day, "ops@example.com", "")
+        body = msg.get_body(("plain",)).get_content()
+        self.assertIn("Reports received: 2 · distinct installations: 2", body)
+        self.assertIn("exec capture not full: 1", body)
+        self.assertIn(self.report["arx"], body)
+        self.assertEqual(msg["To"], "ops@example.com")
+        names = [part.get_filename() for part in msg.iter_attachments()]
+        self.assertEqual(names, [f"arx-reports-{day.isoformat()}.jsonl.gz"])
+
+    def test_digest_needs_a_recipient_unless_it_is_a_dry_run(self):
+        with mock.patch.dict(os.environ, {"ARX_COLLECTOR_DATA": self.d}, clear=False):
+            os.environ.pop("ARX_COLLECTOR_MAIL_TO", None)
+            with self.assertRaises(SystemExit):
+                self.c.digest(None, dry_run=False)
+            with mock.patch("sys.stdout", new=io.StringIO()) as out:
+                self.assertEqual(self.c.digest("2026-11-20", dry_run=True), 0)
+            self.assertIn("Reports received: 0", out.getvalue())
+
+
+def pathlib_path(p):
+    from pathlib import Path
+    return Path(p)
+
+
+class AuditdAlwaysInstalledTests(unittest.TestCase):
+    """auditd va siempre con Arx: identidad, señuelos y lecturas denegadas dependen de él."""
+
+    ROOT = os.path.join(os.path.dirname(__file__), "..")
+
+    def read(self, name):
+        with open(os.path.join(self.ROOT, name), encoding="utf-8") as f:
+            return f.read()
+
+    def test_the_package_depends_on_auditd(self):
+        control = self.read("packaging/build-deb.sh").split("cat > \"$PKG/DEBIAN/control\"", 1)[1].split("EOF", 2)[1]
+        self.assertIn("Depends: python3 (>= 3.10), auditd\n", control)
+        self.assertNotIn("Suggests: auditd", control)
+
+    def test_the_installer_resolves_it_and_asks_about_the_program_once(self):
+        import subprocess
+        text = self.read("packaging/install.sh")
+        self.assertIn("apt-get install -f -y", text)
+        self.assertIn("systemctl enable --now auditd", text)
+        self.assertIn("arx telemetry ask || true", text)
+        self.assertEqual(subprocess.run(["sh", "-n", os.path.join(self.ROOT, "packaging/install.sh")]).returncode, 0)
+
+    def test_every_lab_that_installs_the_package_provisions_auditd(self):
+        import glob
+        for path in glob.glob(os.path.join(self.ROOT, "lab", "*.sh")):
+            text = open(path, encoding="utf-8").read()
+            if "dist/arx_all.deb" in text and "dpkg -i" in text:
+                self.assertIn("auditd", text, os.path.basename(path))
+        self.assertIn("auditd", self.read("lab/systemd/Dockerfile"))
+
+
+
+class ManualTests(unittest.TestCase):
+    """El manual y `man arx` cubren cada comando; el paquete instala la página."""
+
+    ROOT = os.path.join(os.path.dirname(__file__), "..")
+
+    def read(self, name):
+        with open(os.path.join(self.ROOT, name), encoding="utf-8") as f:
+            return f.read()
+
+    def test_every_command_is_documented_in_both_manuals_and_the_man_page(self):
+        from arx import cli, term
+        commands = term.grammar(cli.build_parser())
+        docs = {name: self.read(name) for name in ("docs/manual.md", "docs/manual.es.md")}
+        man = self.read("packaging/arx.1")
+        for cmd, spec in commands.items():
+            for name, text in docs.items():
+                self.assertIn(f"arx {cmd}", text, (name, cmd))
+            self.assertRegex(man, rf"(?m)^\.(TP\n\.)?(B|BR|BI) \"?{cmd}\b", cmd)
+            for action in spec["actions"]:
+                if action in ("stopped", "down", "refresh-maintenance", "restore", "ask"):
+                    continue  # los ejecutan systemd, el paquete o el instalador
+                for name, text in docs.items():
+                    self.assertIn(action, text, (name, cmd, action))
+
+    def test_the_package_installs_the_man_page(self):
+        build = self.read("packaging/build-deb.sh")
+        self.assertIn('gzip -9n -c "$ROOT/packaging/arx.1" > "$PKG/usr/share/man/man1/arx.1.gz"', build)
+        self.assertTrue(self.read("packaging/arx.1").startswith(".TH ARX 1 "))
+
+    def test_the_docs_are_published_with_the_core(self):
+        ignore = self.read(".gitignore")
+        for doc in ("manual.md", "manual.es.md", "telemetry.md"):
+            self.assertIn(f"!docs/{doc}", ignore)
+
+
 if __name__ == "__main__":
     unittest.main()

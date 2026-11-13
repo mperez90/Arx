@@ -1,0 +1,13 @@
+# HTTPS in front of the collector. Caddy obtains the certificate on its own.
+# Keep access logging off: the collector never stores source IPs, the proxy should not either.
+telemetry.example.com {
+	handle /v1/report {
+		reverse_proxy 127.0.0.1:8787
+	}
+	handle /healthz {
+		reverse_proxy 127.0.0.1:8787
+	}
+	handle {
+		respond 404
+	}
+}

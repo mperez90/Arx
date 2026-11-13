@@ -10,7 +10,7 @@ intended, not what you can buy now. Every paid ✅ must exist and be tested befo
 | Initial reconnaissance + inventory | ✅ | ✅ | ✅ |
 | Baseline (executables · ports · services · users + gauges) | ✅ | ✅ | ✅ |
 | Canaries / honeytokens | ✅ | ✅ | ✅ |
-| Sensors (osquery · auditd · Falco, if installed) | ✅ | ✅ | ✅ |
+| Sensors (auditd, installed with Arx · osquery · Falco, if installed) | ✅ | ✅ | ✅ |
 | Tier 0/1 response (automatic and reversible) | ✅ | ✅ | ✅ |
 | Tier 2 response (human + word) | ✅ | ✅ | ✅ |
 | Proof of origin for new software; confinement without network for what can't prove it | ✅ | ✅ | ✅ |

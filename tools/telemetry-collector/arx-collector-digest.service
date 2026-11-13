@@ -1,0 +1,16 @@
+[Unit]
+Description=Arx improvement-program daily digest (email)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/arx-collector/collector.py digest
+EnvironmentFile=/etc/arx-collector.env
+DynamicUser=yes
+StateDirectory=arx-collector
+Environment=ARX_COLLECTOR_DATA=/var/lib/arx-collector
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes

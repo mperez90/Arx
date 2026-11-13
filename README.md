@@ -8,7 +8,7 @@ actions it can undo. Anything irreversible waits for you.
 
 <sub>Real output of [`lab/demo.sh`](lab/demo.sh), with long waits shortened.</sub>
 
-> **Status:** v0.0.9rc1 (Core release candidate), early public testing. **Arx Core is free and available now.** The paid
+> **Status:** v0.0.9rc2 (Core release candidate), early public testing. **Arx Core is free and available now.** The paid
 > tiers open after Core completes its public testing phase, **Pro first, Business last**.
 > Founding pricing (half price, first 500 purchases of each plan) is reserved for that
 > opening: [get notified](https://github.com/mperez90/Arx/discussions/1).
@@ -49,7 +49,7 @@ From v0.0.7 each release also carries signed build provenance:
 **What observe mode does change on your system:** its config and state (`/etc/arx`,
 `/var/lib/arx`), a backup of your critical files in its vault when you seal the baseline,
 its own `inet arx` nftables table (a passive SYN tracker and empty block sets), and auditd
-watch rules if auditd is installed.
+watch rules. auditd is installed with Arx.
 
 ## What it does against real attacks
 
@@ -91,7 +91,8 @@ a real kernel (cgroups, a reboot) runs on two VMs, the second one as the attacke
 ## Everything from the console
 
 There is no web UI, on purpose. An agent that defends a server shouldn't add another login page to
-it. These are the ones you'll use most; `arx --help` lists them all:
+it. The [manual](docs/manual.md) ([en español](docs/manual.es.md), and `man arx` once installed)
+covers every command. These are the ones you'll use most; `arx --help` lists them all:
 
 | Command | What it's for |
 |---|---|
@@ -105,12 +106,20 @@ it. These are the ones you'll use most; `arx --help` lists them all:
 | `arx scan <file>` | Static verdict on a file, without ever running it |
 | `arx forensics` | A sealed report of what happened |
 | `arx vaccines` | Signed updates with what other Arx hosts learned (the channel isn't open yet) |
+| `arx shell` | An interactive console: colored prompt, history, Tab completion |
+| `arx telemetry` | The opt-in improvement program. `arx telemetry show` prints exactly what would be sent |
 
 If you want to hear from it, or decide from your phone, give it your own Telegram bot in `arx setup`.
 Acting from the chat takes a one-time code from an authenticator app: your authorization word never
 travels through a chat. It only makes outbound connections and opens no port.
 
-Output is in English; Arx also speaks Spanish. Pick it in `arx setup` or with `ARX_LANG=es`.
+Output is in English; Arx also speaks Spanish. Pick it in `arx setup` or with `ARX_LANG=es`. On a
+terminal, user names are blue, commands yellow and paths green; `NO_COLOR=1` turns that off.
+
+**Improvement program.** Arx can send an anonymous usage report every few days, only if you say yes
+(during installation, in `arx setup` or with `arx telemetry enable`). Nothing is sent by default.
+Reports hold numbers only, never host names, IPs, paths, users or secrets:
+[docs/telemetry.md](docs/telemetry.md).
 
 ## The doctrine: relentless, but reversible
 
@@ -189,10 +198,10 @@ Read these before you rely on it.
 - **Root can blind Arx.** Stopping or crashing the service sends an alert through your channels, but an
   attacker who is already root can suppress it: freeze the process, override its unit at runtime, or cut
   its network first. A silent Arx isn't proof of a quiet server.
-- **Denied reads of sensitive files need `auditd`.** A successful open is seen in the kernel. A read the
-  kernel denies (a web user trying `/etc/shadow`) is reported only when `auditd` is installed; without it
-  the attempt leaves no trace. Attempts from a login session don't count, and one that fails earlier, at a
-  private home directory, never reaches the watched file.
+- **Denied reads of sensitive files come from `auditd`.** A successful open is seen in the kernel. A read
+  the kernel denies (a web user trying `/etc/shadow`) is reported through `auditd`, which is installed with
+  Arx; where it can't run (inside a container), the attempt leaves no trace. Attempts from a login session
+  don't count, and one that fails earlier, at a private home directory, never reaches the watched file.
 - **New SUID binaries are found hourly.** The walk covers every local filesystem where the bit gives
   privileges (mounted without `nosuid`), not container layers or snaps. When Arx starts covering a
   filesystem it didn't cover before, what is already there is taken as known and listed for you to review.
@@ -218,8 +227,8 @@ telemetry marked as untrusted with secrets redacted, and has one narrow, validat
 exception above. Everything in the table works without any API key: without a model, those
 decisions wait for you.
 
-Python standard library only, no pip dependencies. It uses osquery, auditd and Falco if you
-already have them, and falls back to `/proc` if you don't. The lifecycle is four words:
+Python standard library only, no pip dependencies. auditd is installed with it; it also uses
+osquery and Falco if you already have them, and falls back to `/proc` for what they would see. The lifecycle is four words:
 
 ```
 setup  →  recon  →  learn  →  guard
@@ -241,7 +250,8 @@ sudo apt purge arx           # also deletes /etc/arx and /var/lib/arx (its evide
 Removing the package gives the network back to everything Arx confined and takes its units, drop-ins
 and nftables table with it (`apt remove` keeps the configuration and state).
 
-Its auditd watch rules, if any, disappear on reboot.
+Its auditd watch rules disappear on reboot. auditd itself stays installed; `sudo apt autoremove`
+takes it away if nothing else needs it.
 
 ## Editions
 

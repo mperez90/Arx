@@ -1,0 +1,204 @@
+.TH ARX 1 2026-11-13 "Arx 0.0.9rc2" "Arx manual"
+.SH NAME
+arx \- autonomous defensive security agent for Linux servers
+.SH SYNOPSIS
+.B arx
+.I command
+.RI [ options ]
+.br
+.B arx shell
+.br
+.B arx \-\-help
+|
+.B arx
+.I command
+.B \-\-help
+|
+.B arx \-\-version
+.SH DESCRIPTION
+Arx learns what is normal on a server, notices what does not belong and contains it on its own,
+with actions it can undo. Anything irreversible waits for the owner's authorization word.
+.PP
+Arx starts in observe mode: it reports what it would do and changes nothing outside its own files.
+Automatic responses need
+.BR \-\-enforce .
+.PP
+Life cycle:
+.B setup
+\(->
+.B recon
+\(->
+.B learn
+\(->
+.BR guard .
+Most commands need root.
+.SH COMMANDS
+.SS Setting up
+.TP
+.BR "setup " [ \-\-show ]
+Configuration wizard: language, model providers (optional), authorization word, scope, baseline
+window, license, alerts, automatic response, improvement program.
+.B \-\-show
+prints the configuration with secrets redacted.
+.TP
+.BR "recon " [ "\-\-json \fIpath\fP" ] " " [ \-\-no\-save ]
+Read-only map of the host: hardware, packages, services, ports, users, SUID, cron, network.
+Saves the inventory as JSON unless
+.BR \-\-no\-save .
+.TP
+.BR "learn " [ "\-\-samples \fIn\fP" ] " " [ "\-\-interval \fIs\fP" ] " " [ \-\-seal ] " " [ \-\-status ]
+Take snapshots of normal behavior and merge them into the baseline. Repeat over a few days, then
+.B \-\-seal
+to close it (also backs up critical files and loads Arx's nftables table).
+.TP
+.BR "guard " [ \-\-enforce ] " " [ "\-\-interval \fIs\fP" ] " " [ \-\-once ] " " [ \-\-verbose ] " " [ \-\-chat ]
+Watch, detect and respond in the foreground. Sweeps every 30 seconds by default.
+.B \-\-enforce
+applies automatic, reversible Tier 1 actions.
+.B \-\-chat
+talks to the configured model; it cannot act.
+.TP
+.BR "service install " [ \-\-enforce ] " " [ "\-\-exec \fIpath\fP" ] | " uninstall" | " status"
+Run Arx 24/7 under systemd (arx.service, arx-firewall.service, arx-down.service,
+arx-revive.timer, arx-maintenance.slice).
+.SS Day to day
+.TP
+.BR "status " [ \-\-json ]
+How things stand: baseline, mode, watchers, blocks, findings, pending actions, recent incidents.
+.TP
+.BR "accept " [ \fIid\fP ] " " [ \-\-dir | \-\-children ]
+Without an id, list findings that can be accepted. With one, add it to the baseline and lift what
+contained it.
+.B \-\-dir
+accepts a service's program directory;
+.B \-\-children
+also what that program starts.
+.TP
+.BR "authorize " [ \fIid\fP ]
+List pending Tier 2 actions, or carry one out after asking for the authorization word.
+.TP
+.BR "unblock " [ \fIip\fP | \fIid\fP ]
+List temporary blocks, or lift one now (word).
+.TP
+.BR "unlock " [ \fIaccount\fP ]
+List accounts Arx locked, or unlock one (word). Locked accounts never unlock on their own.
+.TP
+.BR "restore " [ \fIid\fP ]
+List quarantined files, or put one back (word).
+.SS Tools
+.TP
+.BR "canaries plant " [ "\-\-in \fIdir\fP" "]... | " list " | " check
+Plant, list or check decoy files. Default locations: each user's home and /root.
+.TP
+.BI "scan " path
+Static analysis of a file; it is never run. Exit status 0 means no rule matched.
+.TP
+.BR "forensics " [ "\-\-since \fIiso\fP" ] " " [ "\-\-verify \fIpath\fP" ] " " [ \-\-indicators ]
+Sealed incident report, saved in /var/lib/arx/forensics/.
+.B \-\-indicators
+prints only public IPs, hashes and attack types.
+.TP
+.BR "vaccines " [ list " | " update " | " "remove \fIid\fP" ]
+Signed vaccines learned by other Arx hosts, validated locally before they apply.
+.TP
+.BR "proposals " [ list " | " "apply \fIid\fP" " | " "revert \fIid\fP" ]
+Changes Arx suggests. Nothing applies without the word.
+.TP
+.BR "metrics " [ "\-\-days \fIn\fP" ] " " [ \-\-json ]
+Noise on this host: high alerts, false positives, unreviewed alerts.
+.B \-\-json
+holds only numbers.
+.TP
+.B notify test
+Send a test message through every configured alert channel.
+.TP
+.BR "telemetry " [ status " | " show " | " enable " | " disable " | " send ]
+Improvement program: anonymous usage reports, sent only after the owner says yes.
+.B show
+prints exactly what would be sent.
+.TP
+.BR "license activate \fIKEY\fP" " | " status " | " deactivate
+Pro/Business license. Core needs none.
+.TP
+.BR "fleet enroll \-\-console \fIURL\fP \-\-token \fITOKEN\fP" " | " status " | " sync
+Fleet console (Business).
+.TP
+.B shell
+Interactive console (see below).
+.SH CONSOLE
+.B arx shell
+opens a prompt
+.IR user @ host : dir " arx\[u203A]"
+where the user is blue, the directory green and typed text yellow. Arx commands are typed without
+the leading
+.BR arx .
+Tab completes commands, actions, options and paths. History is kept in
+.IR ~/.arx_history .
+Built-ins:
+.BR help ", " cd ", " pwd ", " history ", " clear ", " exit .
+A failing command never closes the console. Without a terminal it reads one command per line from
+standard input.
+.SH COLORS
+On a terminal Arx colors user names blue, commands yellow and paths green. Only its own output, and
+never when writing to a pipe, a file, the journal, Telegram or a webhook. The shell's configuration
+is not touched.
+.SH ENVIRONMENT
+.TP
+.B ARX_LANG
+Output language,
+.B en
+or
+.BR es .
+.TP
+.B ARX_COLOR
+.B always
+or
+.BR never .
+Default: colors only on a terminal.
+.TP
+.B NO_COLOR
+If set and not empty, no colors.
+.TP
+.BR ARX_TELEMETRY=off ", " DO_NOT_TRACK=1
+Switch the improvement program off whatever the configuration says.
+.TP
+.BR ARX_OPENAI_API_KEY ", " ARX_ANTHROPIC_API_KEY ", " ARX_KIMI_API_KEY
+Model keys, without writing them to disk.
+.TP
+.BR ARX_CONFIG_DIR ", " ARX_STATE_DIR
+Other configuration and state directories.
+.SH FILES
+.TP
+.I /etc/arx/
+Configuration and secrets (root, 0600).
+.TP
+.I /var/lib/arx/
+State: baseline, incidents.jsonl, findings, vault, forensics, watch.json.
+.TP
+.I /usr/lib/arx/arx.pyz
+The program.
+.TP
+.I ~/.arx_history
+Console history.
+.SH EXIT STATUS
+0 when the command did what was asked; 1 when it could not or the answer is negative (wrong word,
+file not clean, nothing sent); 2 on a usage error.
+.SH EXAMPLES
+.nf
+sudo arx setup
+sudo arx recon
+sudo arx learn            # repeat over a few days
+sudo arx learn \-\-seal
+sudo arx service install  # observe mode, 24/7
+sudo arx status
+sudo arx accept           # list what can be accepted
+sudo arx shell
+.fi
+.SH SEE ALSO
+.BR systemctl (1),
+.BR journalctl (1),
+.BR auditd (8),
+.BR nft (8)
+.PP
+Full manual: https://github.com/mperez90/Arx/blob/f1-core-mvp/docs/manual.md
+(Spanish: docs/manual.es.md).

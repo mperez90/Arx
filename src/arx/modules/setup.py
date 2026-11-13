@@ -7,7 +7,8 @@ Configura, en orden:
   4) ventana de baseline y presupuesto del motor LLM,
   5) licencia (core/pro/business),
   6) alertas salientes (Telegram / webhook),
-  7) respuesta automática (qué hacer con un escaneo; si el modelo puede bloquear cuentas).
+  7) respuesta automática (qué hacer con un escaneo; si el modelo puede bloquear cuentas),
+  8) programa de mejora (informes de uso anónimos, solo con un «sí»).
 
 Escribe config.json + secrets.json (0600) en el dir de Arx. `arx setup --show`
 muestra la configuración actual con los secretos redactados.
@@ -17,7 +18,7 @@ from __future__ import annotations
 import getpass
 import socket
 
-from arx import config, totp
+from arx import config, telemetry, totp
 from arx.i18n import SUPPORTED, lang, set_lang, tr
 from arx.modules import telegram
 
@@ -31,7 +32,11 @@ PROVIDERS = [
 
 def _ask(prompt: str, default: str | None = None) -> str:
     d = f" [{default}]" if default else ""
-    return input(f"{prompt}{d}: ").strip() or (default or "")
+    try:
+        return input(f"{prompt}{d}: ").strip() or (default or "")
+    except EOFError:  # entrada cerrada (respuestas por tubería que no llegan a este paso): el valor por defecto
+        print()
+        return default or ""
 
 
 def _ask_secret(prompt: str) -> str:
@@ -68,7 +73,8 @@ def show() -> int:
     print(tr("  model locks    {v} · from {llm_lock_min_confidence}% confidence",
              v='no' if cfg.get('llm_identity_actions') is False else tr("yes, with --enforce"),
              llm_lock_min_confidence=cfg.get('llm_lock_min_confidence', 70)))
-    print(tr("  license        {license_tier}\n", license_tier=cfg.get('license_tier', 'core')))
+    print(tr("  license        {license_tier}", license_tier=cfg.get('license_tier', 'core')))
+    print(tr("  improvement    {v}\n", v=tr("joined") if telemetry.consent(cfg) == "yes" else tr("not joined")))
     return 0
 
 
@@ -192,8 +198,18 @@ def run(show_only: bool = False) -> int:
                  "context. It never touches root,\n   system accounts or the last admin account."))
         llm_acts = _ask(tr("   Allow it? (y/n)"), "n" if cfg.get("llm_identity_actions") is False else tr("y")).lower() != "n"
 
+    print(tr("\n8) Improvement program  (optional · nothing is sent unless you say yes)"))
+    print(tr("   Arx can send an anonymous usage report every few days: version, system, how its "
+             "watchers\n   are doing and how much noise it makes. Never host names, IPs, paths, "
+             "users, commands or\n   secrets. See it exactly:  arx telemetry show"))
+    joined = (cfg.get("telemetry") or {}).get("consent") == "yes"
+    join = _ask(tr("   Join? (y/n)"), tr("y") if joined else "n").lower() in ("y", "s")
+    if not join:
+        telemetry.forget_state()
+
     cfg.update(
         {
+            "telemetry": telemetry.decide(join, cfg.get("telemetry")),
             "lang": lang(),
             "ip_response": ip_response if ip_response in ("block", "tarpit") else "block",
             "llm_identity_actions": llm_acts,
