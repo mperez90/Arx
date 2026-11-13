@@ -86,7 +86,9 @@ docker exec -d "$ATT" sshpass -p clave-bob ssh -o StrictHostKeyChecking=no bob@v
 closed() { ! docker exec "$ATT" pgrep -f "ssh.*bob@victim" >/dev/null; }
 if wait_for 70 closed; then pass "el servicio cerró solo la sesión sin terminal"; else fail "el servicio cerró solo la sesión sin terminal"; fi
 check "la cuenta queda bloqueada" bash -c "docker exec $VIC arx status | grep -q 'locked accts.*bob'"
-check "el dueño lo lee en el journal, con el contexto" bash -c "docker exec $VIC journalctl -u arx --no-pager -q | grep -q 'Model verdict: threat'"
+# journald puede escribir la línea un instante después de que la cuenta ya esté bloqueada
+journal_verdict() { docker exec "$VIC" journalctl -u arx --no-pager -q | grep -q 'Model verdict: threat'; }
+check "el dueño lo lee en el journal, con el contexto" wait_for 15 journal_verdict
 word unlock bob | sed 's/^/  /'
 v bash -c 'rm -f /etc/systemd/system/arx.service.d/stub.conf; systemctl daemon-reload; systemctl restart arx'
 slate
