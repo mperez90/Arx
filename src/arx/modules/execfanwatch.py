@@ -18,6 +18,7 @@ import re
 import select
 import struct
 import subprocess
+import sys
 import threading
 import time
 
@@ -81,11 +82,15 @@ def _disable_gil_holding_spawn() -> None:
     En CPython, ``os.posix_spawn`` retiene el GIL hasta que el hijo completa
     ``exec``. Si ese exec espera el permiso de este mismo proceso, ni el listener
     ni su watchdog pueden avanzar. La ruta ``_posixsubprocess`` sí libera el GIL
-    alrededor de ``vfork``; un ``fork`` ordinario tampoco espera al exec del hijo.
-    CPython 3.10–3.14 no ofrece un selector público: este ajuste debe preceder a
-    la primera marca y se mantiene durante la vida del guardián.
+    alrededor de ``vfork`` desde 3.12 (gh-104372); 3.10 y 3.11 llaman a ``vfork``
+    con el GIL retenido, el mismo ciclo, así que ahí se usa ``fork``: el padre
+    espera el resultado del exec leyendo un pipe sin el GIL. CPython 3.10–3.14 no
+    ofrece un selector público: este ajuste debe preceder a la primera marca y se
+    mantiene durante la vida del guardián.
     """
     subprocess._USE_POSIX_SPAWN = False
+    if sys.version_info < (3, 12):
+        subprocess._USE_VFORK = False  # Ubuntu 22.04 (3.10) y Debian 12 (3.11) son plataformas soportadas
 
 
 def _read(path: str, limit: int = 4096) -> str:

@@ -3946,6 +3946,8 @@ class ExecFanWatchTests(unittest.TestCase):
         self.old_state = dict(self.x._state)
         self.old_use_posix_spawn = getattr(self.x.subprocess, "_USE_POSIX_SPAWN", False)
         self.addCleanup(setattr, self.x.subprocess, "_USE_POSIX_SPAWN", self.old_use_posix_spawn)
+        self.old_use_vfork = getattr(self.x.subprocess, "_USE_VFORK", True)
+        self.addCleanup(setattr, self.x.subprocess, "_USE_VFORK", self.old_use_vfork)
         self.x._snapshots.clear()
         self.x._state.update(running=True, fd=10, captured=0, dropped=0, expired=0, superseded=0,
                              overflow=0, late=0, errors=0, responses=0)
@@ -4072,9 +4074,14 @@ class ExecFanWatchTests(unittest.TestCase):
 
         self.x._state.update(running=False, fd=-1, mode="off")
         libc = mock.Mock()
+        # 3.10/3.11 llaman a vfork() con el GIL retenido (gh-104372, sin backport a 3.10): el mismo ciclo
+        # que posix_spawn. Desde 3.12 vfork suelta el GIL y no hace falta renunciar a él.
+        vfork_ok = sys.version_info >= (3, 12)
         libc.fanotify_init.side_effect = lambda *args: (
-            self.assertFalse(self.x.subprocess._USE_POSIX_SPAWN) or 10)
+            self.assertFalse(self.x.subprocess._USE_POSIX_SPAWN)
+            or self.assertEqual(self.x.subprocess._USE_VFORK, vfork_ok) or 10)
         with mock.patch.object(self.x.subprocess, "_USE_POSIX_SPAWN", True), \
+                mock.patch.object(self.x.subprocess, "_USE_VFORK", True, create=True), \
                 mock.patch.object(self.x, "_libc", return_value=libc), \
                 mock.patch.object(self.x, "_listen", side_effect=listener), \
                 mock.patch.object(self.x, "_watchdog"), \
