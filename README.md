@@ -189,14 +189,13 @@ Read these before you rely on it.
 - **Root can blind Arx.** Stopping or crashing the service sends an alert through your channels, but an
   attacker who is already root can suppress it: freeze the process, override its unit at runtime, or cut
   its network first. A silent Arx isn't proof of a quiet server.
-- **Sensitive files: only successful opens are seen.** A read that the kernel denies (a web user trying
-  `/etc/shadow`) never reaches Arx, so the attempt leaves no trace; seeing attempts would need audit rules.
-- **New SUID binaries are found hourly, on the root filesystem only.** Other filesystems mounted without
-  `nosuid` (a separate `/home`, `/var` or `/opt`) aren't walked. `/tmp` as tmpfs is normally `nosuid`,
-  where the bit has no effect.
-- **A suspended reverse shell must still be the same program.** The channel is cut in the kernel by IP and
-  port either way; but if the shell already replaced itself with another program, that process isn't
-  suspended.
+- **Denied reads of sensitive files need `auditd`.** A successful open is seen in the kernel. A read the
+  kernel denies (a web user trying `/etc/shadow`) is reported only when `auditd` is installed; without it
+  the attempt leaves no trace. Attempts from a login session don't count, and one that fails earlier, at a
+  private home directory, never reaches the watched file.
+- **New SUID binaries are found hourly.** The walk covers every local filesystem where the bit gives
+  privileges (mounted without `nosuid`), not container layers or snaps. When Arx starts covering a
+  filesystem it didn't cover before, what is already there is taken as known and listed for you to review.
 - **Ransomware is only seen through its decoys.** Plant them with `arx canaries plant`. Arx doesn't
   recognize mass encryption itself, and doesn't prevent it.
 - **Locking an account ends everything running under it,** services included, and lists it for you.

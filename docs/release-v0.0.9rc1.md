@@ -17,6 +17,11 @@ Core release candidate. This release strengthens hot-path acceptance, alert evid
 - Files that dpkg deliberately did not install (its `path-exclude` filters) and missing documentation no longer count as tampering. A missing binary or library, or a symlink where the package installed a regular file, still does.
 - A live script is now attributed to the interpreter that runs it, as `/proc` reports, so a web shell's shell is frozen again. A failed exec attempt cannot lend its identity to the next exec of the same process.
 - The comparison against a fresh copy of the official package passes only if `dpkg-deb` read it to the end. A helper killed mid-stream yields `unknown`, never `pass`.
+- With `auditd` installed, a denied attempt by a service to open a sensitive file (`/etc/shadow`, `sudoers`, host keys, TLS private keys…) is reported, with user, executable and process. Fanotify cannot see these: the kernel checks permissions before the event.
+- The hourly SUID walk covers every local filesystem where the bit gives privileges (mounted without `nosuid`), not only the root filesystem. Container layers, snaps, network and FUSE filesystems are left out. When a filesystem enters the walk for the first time, its existing SUID binaries are taken as known and listed for review; any later one is critical.
+- A reverse shell that replaced itself with another program while keeping the socket is still suspended: the response follows the process birth, and resuming it requires the same birth.
+- If an upgrade fails while unpacking after Arx was stopped, the package's `postrm` starts it again. Measured: at that point the files on disk are still the previous version.
+- nftables 1.0.9 lists Arx's sets as `socket cgroupv2 level 0`. That is only how it prints them: matching is done by the rules (`level 2`), and nested cgroups are matched (measured on Ubuntu 24.04). The destructive "migration" of those sets is gone.
 
 ## Known limitations
 
@@ -27,8 +32,7 @@ Core release candidate. This release strengthens hot-path acceptance, alert evid
 - Script and interpreter chains can produce more fanotify events than netlink confirmations. Captures are promoted to incidents only after kernel exec confirmation.
 - The maintenance slice is capped at 384 MiB `MemoryHigh` and 512 MiB `MemoryMax`. Measured on Debian 13 with helpers serialized, the largest real helper (`apt-get download` of a kernel package, page cache included) peaked at 52 MiB. On Ubuntu 24.04 the largest measured helper peaked at 42 MiB. Hosts with much larger APT caches have not been measured. A helper that exceeds the cap is killed inside its own scope (Debian 13), or throttled under `MemoryHigh` until its timeout stops the scope (Ubuntu 24.04's kernel); either way the guardian is untouched and that check reports `unknown`.
 - A notification result of `ok` does not prove delivery by the external provider, receipt, or that a person read the alert. In this candidate, per-channel results, partial failures, the delivery budget, and redaction were validated against local fake Telegram and webhook endpoints; delivery through the real providers was not re-validated.
-- Upgrading from v0.0.8rc5 or earlier: if dpkg fails to unpack after Arx was stopped, the old package's abort path does not start it again. Arx stays stopped until the next package operation or a manual start.
-- Sensitive-file watching sees successful opens only; reads denied by the kernel leave no trace. New SUID binaries are found by an hourly walk of the root filesystem only. A reverse-shell process is suspended only while it is still the same program; its channel is cut regardless.
+- Denied reads of sensitive files are reported only with `auditd` installed (`Suggests: auditd`), and only when the denial happens on the watched file itself, not at a private parent directory. Attempts from login sessions are ignored, as for successful reads.
 - Root can suppress Arx's stop alerts (freeze it, override its unit at runtime, or cut its network first).
 - Existing cgroup and nftables limitations still apply; see the README for platform-specific behavior.
 
