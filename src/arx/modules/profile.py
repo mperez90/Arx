@@ -40,6 +40,7 @@ from datetime import datetime, timedelta, timezone
 
 from arx import config
 from arx.i18n import tr
+from arx.modules.maintenance import NoAnswer
 
 OBSERVE_DAYS = 40
 JITTER_DAYS = 15
@@ -261,10 +262,10 @@ def running_services() -> list[str]:
 def _package_version(unit: str) -> tuple[str | None, str | None]:
     from arx.modules import provenance
     frag, _ = provenance._unit_files(unit)
-    pkg = provenance.package_of(frag) if frag else None
+    pkg = provenance.package_of(frag) if frag else None  # NoAnswer sube: no es «sin paquete»
     if not pkg:
         return None, None
-    out = provenance._q(["dpkg-query", "-W", "-f=${Version}", pkg])
+    out = provenance._q(["dpkg-query", "-W", "-f=${Version}", pkg], strict=True, ok=(0, 1))
     return pkg, (out or "").strip() or None
 
 
@@ -295,12 +296,15 @@ def _share(unit: str, what: str) -> float:
     return int.from_bytes(digest[:8], "big") / 2**64
 
 
-def _new_subject(path: str, now: datetime, cfg: dict) -> dict:
+def _new_subject(path: str, now: datetime, cfg: dict) -> dict | None:
     unit = path.rsplit("/", 1)[-1]
     days = float(cfg.get("profile_observe_days", OBSERVE_DAYS))
     jitter = float(cfg.get("profile_jitter_days", JITTER_DAYS))
     span = timedelta(days=days) + timedelta(seconds=_share(unit, "window") * jitter * 86400)
-    pkg, version = _package_version(unit)
+    try:
+        pkg, version = _package_version(unit)
+    except NoAnswer:  # sin paquete conocido quedaría sin vigilancia de actualizaciones: otro barrido
+        return None
     return {"unit": unit, "first_seen": _iso(now), "observe_until": _iso(now + span),
             "status": "observing", "dest": {}, "package": pkg, "version": version, "extensions": []}
 
@@ -488,8 +492,11 @@ def _library_packages(unit: str, own: str | None) -> dict[str, str]:
 
 
 def _installed_versions() -> dict[str, str]:
-    """Versión de cada paquete instalado (`libc6:arm64` también como `libc6`), de una sola consulta."""
-    out = provenance_q(["dpkg-query", "-W", "-f=${Package}:${Architecture}\t${Version}\n"], timeout=30) or ""
+    """Versión de cada paquete instalado (`libc6:arm64` también como `libc6`), de una sola consulta.
+    Sin respuesta de dpkg lanza NoAnswer: un {} se leería como «nada cambió»."""
+    from arx.modules import provenance
+    out = provenance._q(["dpkg-query", "-W", "-f=${Package}:${Architecture}\t${Version}\n"], timeout=30,
+                        strict=True) or ""
     versions = {}
     for line in out.splitlines():
         name, _, version = line.partition("\t")
@@ -565,19 +572,28 @@ def _alert_only(unit: str) -> bool:
 
 
 def _updates(subjects: dict, cfg: dict, now: datetime, check_versions: bool = True,
-             enforce: bool = False) -> list[dict]:
+             enforce: bool = False, incomplete: list | None = None) -> list[dict]:
     """Una actualización es justo cuando llegaría una versión firmada con código malicioso: se evalúa con
     todas las capas, el modelo investiga si lo hay, y lo que no llegue a la confianza mínima queda
     confinado sin red (sigue atendiendo) hasta que una persona decida. Cuenta igual una actualización
     de las librerías que el servicio carga."""
     from arx.modules import response, trust
     findings, radius, announced = [], {}, set()
-    installed = _installed_versions() if check_versions else {}
+    incomplete = [] if incomplete is None else incomplete
+    try:
+        installed = _installed_versions() if check_versions else {}
+    except NoAnswer:  # sin versiones no se decide nada: el barrido siguiente vuelve a mirar
+        incomplete.append("installed versions")
+        return findings
     learned = 0
     for path, s in subjects.items():
         if not s.get("package"):
             continue
-        pkg, version = (s["package"], s.get("version")) if not check_versions else _package_version(s["unit"])
+        try:
+            pkg, version = (s["package"], s.get("version")) if not check_versions else _package_version(s["unit"])
+        except NoAnswer:
+            incomplete.append(s["unit"])
+            continue
         if check_versions and version and s.get("version") and version != s["version"]:
             s.setdefault("updates", []).append({"at": _iso(now), "from": s["version"], "to": version})
             old, s["version"] = s["version"], version
@@ -586,7 +602,10 @@ def _updates(subjects: dict, cfg: dict, now: datetime, check_versions: bool = Tr
                                        old=old, new=version), cfg, version=version)
         if s.get("libs") is None:
             if learned < LIBS_PER_SWEEP:  # de a pocos en cada barrido: dpkg -S por fichero cuesta
-                libs = _library_packages(s["unit"], pkg)
+                try:
+                    libs = _library_packages(s["unit"], pkg)
+                except NoAnswer:
+                    libs = {}  # se reintenta en otro barrido
                 if libs:  # un servicio parado no carga nada todavía: se reintenta
                     s["libs"], learned = libs, learned + 1
         elif check_versions:
@@ -601,7 +620,10 @@ def _updates(subjects: dict, cfg: dict, now: datetime, check_versions: bool = Tr
                                        version=new)
             # lo ya conocido se queda (tras actualizarse, la vieja sale como «(deleted)» hasta reiniciar)
             known = {lib: installed[lib] for lib in s["libs"] if lib in installed}
-            s["libs"] = {**known, **_library_packages(s["unit"], pkg)}
+            try:
+                s["libs"] = {**known, **_library_packages(s["unit"], pkg)}
+            except NoAnswer:
+                s["libs"] = {**s["libs"], **known}
         since = _parse(s.get("recheck"))
         if not since:
             continue
@@ -776,9 +798,15 @@ def sweep(enforce: bool = False, cfg: dict | None = None, now: datetime | None =
         reported = st.setdefault("reported", {})
         for path in running_services():
             if path not in subjects and path not in confined and _PATH_RE.match(path):
-                subjects[path] = _new_subject(path, now, cfg)
+                subject = _new_subject(path, now, cfg)
+                if subject:
+                    subjects[path] = subject
         # versiones solo si dpkg cambió; lo ya actualizado se re-evalúa una hora (el modelo llega después)
-        findings += _updates(subjects, cfg, now, check_versions=_dpkg_changed(st), enforce=enforce)
+        incomplete: list = []
+        findings += _updates(subjects, cfg, now, check_versions=_dpkg_changed(st), enforce=enforce,
+                             incomplete=incomplete)
+        if incomplete:  # dpkg no contestó a todo: el cambio no se da por visto y el barrido siguiente lo repite
+            st.pop("dpkg_mtime", None)
         findings += _exec_events(subjects, now, cfg, st)
         findings += _dns_events(subjects, now, cfg)
         findings += _library_events(subjects, now, cfg)
@@ -1211,8 +1239,14 @@ def _library_events(subjects: dict, now: datetime, cfg: dict) -> list[dict]:
                 continue
             if phase != "watch":
                 continue
-            bad = [lib for lib in new if _suspect_lib(lib, learned)]
-            s["maps"] = sorted(learned | {lib for lib in new if lib not in bad})[:MAX_MAPS]  # lo de paquete, sin ruido
+            bad, unanswered = [], set()
+            for lib in new:
+                try:
+                    if _suspect_lib(lib, learned):
+                        bad.append(lib)
+                except NoAnswer:  # dpkg no contestó: ni se acusa ni se aprende; otro barrido la mira
+                    unanswered.add(lib)
+            s["maps"] = sorted(learned | {lib for lib in new if lib not in bad and lib not in unanswered})[:MAX_MAPS]
             if pre and pre not in preloads:
                 bad.append(f"LD_PRELOAD={pre}")
             for lib in bad[:3]:

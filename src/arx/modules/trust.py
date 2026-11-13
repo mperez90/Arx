@@ -86,6 +86,8 @@ def _run(argv: list[str], timeout: int = 30) -> tuple[int, str]:
     try:
         r = maintenance.run(argv, capture_output=True, text=True, errors="replace", timeout=timeout,
                             env={**os.environ, "LC_ALL": "C", "LANG": "C"})
+    except maintenance.MaintenanceUnavailable as e:  # sin respuesta no es un resultado: nada se cachea
+        raise maintenance.NoAnswer(f"{os.path.basename(argv[0])}: {e}") from e
     except (OSError, subprocess.TimeoutExpired):
         return -1, ""
     return r.returncode, r.stdout
@@ -195,6 +197,8 @@ def check_repository_copy(f: dict) -> dict:
         try:  # en streaming: un paquete grande no puede llevar a Arx a su tope de memoria
             proc = maintenance.Popen(["dpkg-deb", "--fsys-tarfile", deb], stdout=subprocess.PIPE,
                                      stderr=subprocess.DEVNULL)
+        except maintenance.MaintenanceUnavailable as e:
+            raise maintenance.NoAnswer(f"dpkg-deb: {e}") from e
         except OSError:
             return _check("matches_repository", "unknown", tr("could not open the official package"))
         try:
@@ -285,6 +289,8 @@ def _run_in(cwd: str, argv: list[str], timeout: int = 180) -> tuple[int, str]:
     try:
         r = maintenance.run(argv, cwd=cwd, capture_output=True, text=True, errors="replace", timeout=timeout,
                             env={**os.environ, "LC_ALL": "C", "LANG": "C"})
+    except maintenance.MaintenanceUnavailable as e:
+        raise maintenance.NoAnswer(f"{os.path.basename(argv[0])}: {e}") from e
     except (OSError, subprocess.TimeoutExpired):
         return -1, ""
     return r.returncode, r.stdout
@@ -473,10 +479,13 @@ def cached(pkg: str, deep: bool = False) -> dict | None:
 def assess_async(pkg: str, deep: bool = True, urgent: bool = False) -> dict:
     """Como `assess`, sin esperar: {"state": "done", ...} con el veredicto, {"state": "pending"} mientras un
     hilo prueba (una vez por versión), o "timeout"/"full" — sin veredicto a tiempo: no es de fiar."""
-    done = cached(pkg, deep)
+    try:
+        done = cached(pkg, deep)
+        f = (package_facts(pkg) or {}) if done is None else {}
+    except maintenance.NoAnswer:  # dpkg/apt no contestaron ahora: ni veredicto ni caché, el barrido repite
+        return {"state": "pending"}
     if done is not None:
         return {"state": "done", **done}
-    f = package_facts(pkg) or {}
     key = f"{f.get('package')}={f.get('version')}|{'deep' if deep else 'quick'}"
     with _jobs_lock:
         since = _jobs.get(key)

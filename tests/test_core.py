@@ -5134,11 +5134,65 @@ class MaintenanceIsolationTests(unittest.TestCase):
                     mock.patch.object(self.m, "LOCK_WAIT_S", 0.01), \
                     mock.patch.object(self.m.shutil, "which", lambda name: "/usr/bin/" + name), \
                     mock.patch.object(self.m.subprocess, "Popen") as popen:
-                with self.assertRaises(self.m.MaintenanceUnavailable):
-                    self.m.run(["dpkg-query", "-W", "nginx"], timeout=30)
+                with self.assertRaises(self.m.SlotBusy):
+                    self.m.run(["dpkg", "--verify", "nginx"], timeout=30)
             popen.assert_not_called()
         finally:
             lock.release()
+
+    def test_a_short_query_never_waits_behind_a_long_verification_or_download(self):
+        """Revisión independiente: con la ranura única, un dpkg-query del barrido esperaba 5 s detrás de un
+        dpkg --verify del worker y se convertía en «no es de ningún paquete»."""
+        import threading
+        heavy, query, calls = threading.Lock(), threading.Lock(), []
+
+        class Proc:
+            def __init__(self, argv, **kwargs):
+                calls.append(argv[-3:])
+                self.returncode = 0
+
+            def communicate(self, input=None, timeout=None):
+                return "nginx: /usr/sbin/nginx\n", ""
+
+        heavy.acquire()
+        try:
+            with mock.patch.object(self.m, "_in_arx_service", lambda: True), \
+                    mock.patch.object(self.m, "_heavy_lock", heavy), mock.patch.object(self.m, "_query_lock", query), \
+                    mock.patch.object(self.m, "LOCK_WAIT_S", 0.01), \
+                    mock.patch.object(self.m.shutil, "which", lambda name: "/usr/bin/" + name), \
+                    mock.patch.object(self.m.subprocess, "Popen", Proc):
+                for argv in (["dpkg-query", "-S", "/usr/sbin/nginx"], ["apt-cache", "policy", "nginx"],
+                             ["dpkg", "-L", "nginx"]):
+                    self.assertEqual(self.m.run(argv, capture_output=True, text=True).returncode, 0)
+                for argv in (["dpkg", "--verify", "nginx"], ["apt-get", "download", "nginx"],
+                             ["dpkg-deb", "--fsys-tarfile", "/tmp/a.deb"]):
+                    with self.assertRaises(self.m.SlotBusy):
+                        self.m.run(argv, capture_output=True, text=True)
+        finally:
+            heavy.release()
+        self.assertEqual(len(calls), 3)
+        self.assertFalse(query.locked())
+
+    def test_a_scope_systemd_run_could_not_create_is_no_answer_not_an_exit_code(self):
+        """systemd-run sale con 1 sin ejecutar nada: el mismo 1 de «dpkg-query -S: de ningún paquete»."""
+        outcome = {}
+
+        class Proc:
+            def __init__(self, argv, **kwargs):
+                self.returncode = 1
+
+            def communicate(self, input=None, timeout=None):
+                return "", outcome["stderr"]
+
+        with mock.patch.object(self.m, "_in_arx_service", lambda: True), \
+                mock.patch.object(self.m.shutil, "which", lambda name: "/usr/bin/" + name), \
+                mock.patch.object(self.m.subprocess, "Popen", Proc):
+            outcome["stderr"] = "Failed to start transient scope unit: Connection timed out\n"
+            with self.assertRaises(self.m.MaintenanceUnavailable):
+                self.m.run(["dpkg-query", "-S", "/x"], capture_output=True, text=True)
+            outcome["stderr"] = "dpkg-query: no path found matching pattern /x\n"
+            self.assertEqual(self.m.run(["dpkg-query", "-S", "/x"], capture_output=True, text=True).returncode, 1)
+
 
     def test_a_pipe_error_closes_the_process_and_releases_the_lock(self):
         import threading
@@ -5260,7 +5314,7 @@ class MaintenanceIsolationTests(unittest.TestCase):
                 mock.patch.object(self.m.subprocess, "Popen", Proc), \
                 mock.patch.object(self.m.subprocess, "run", side_effect=lambda a, **k: stopped.append(a)), \
                 mock.patch.object(self.m, "_heavy_lock", threading.Lock()):
-            first = threading.Thread(target=self.m.run, args=(["apt-cache", "policy", "nginx"],))
+            first = threading.Thread(target=self.m.run, args=(["apt-get", "download", "nginx"],))
             first.start()
             self.assertTrue(entered.wait(1))
             second = threading.Thread(target=self.m.run, args=(["dpkg", "--verify", "nginx"],))
@@ -5327,6 +5381,89 @@ class InvestigationQueueTests(unittest.TestCase):
             self.assertFalse(profile._investigate_later("libssl3", "updated", {}, version="3.0"))
         self.assertTrue(q.empty())
         self.assertEqual(jobs, {})
+
+
+class NoAnswerIsNeverAVerdictTests(unittest.TestCase):
+    """Revisión independiente: un dpkg/apt que no contesta no puede volverse «sin paquete», «apt no lo conoce»
+    ni «no fiable», ni quedarse en caché; el hallazgo se aplaza y, si sigue sin respuesta, se decide como antes."""
+
+    def setUp(self):
+        _isolate()
+        from arx.modules import guard, maintenance, profile, provenance, trust
+        self.g, self.m, self.p, self.v, self.t = guard, maintenance, profile, provenance, trust
+        self.v.clear_cache()
+        self.addCleanup(self.v.clear_cache)
+        busy = mock.patch.object(maintenance, "run", side_effect=maintenance.SlotBusy("slot busy"))
+        self.busy = busy
+
+    def test_provenance_raises_and_caches_nothing(self):
+        with self.busy:
+            with self.assertRaises(self.v.NoAnswer):
+                self.v.package_of("/usr/sbin/nginx")
+            with self.assertRaises(self.v.NoAnswer):
+                self.v.signed_origin("nginx")
+        self.assertEqual(self.v._cache, {})
+
+        class R:
+            returncode, stdout = 1, ""
+        with mock.patch.object(self.m, "run", return_value=R()):
+            self.assertIsNone(self.v.package_of("/opt/loose/server"))  # un «no» de dpkg sí es respuesta
+        self.assertIn(("pkg", "/opt/loose/server"), self.v._cache)
+
+    def test_trust_stays_pending_and_writes_no_verdict(self):
+        with self.busy:
+            self.assertEqual(self.t.assess_async("nginx", deep=True), {"state": "pending"})
+            with self.assertRaises(self.m.NoAnswer):
+                self.t.assess("nginx")
+        self.assertEqual(self.t.config.read_json(self.t._cache_path(), {}) or {}, {})
+
+    def test_an_unanswered_proof_postpones_the_finding_then_decides_without_it(self):
+        f = {"sev": "med", "kind": "executables", "detail": "new: /usr/sbin/nginx", "fp_key": "exe|/usr/sbin/nginx",
+             "target": {"exe": "/usr/sbin/nginx"}}
+        with mock.patch.object(self.g.provenance, "enrich", side_effect=self.v.NoAnswer("busy")), \
+                mock.patch.object(self.g.sandbox, "enrich_finding", side_effect=lambda x: x):
+            prepared = self.g._prepare(dict(f))
+        self.assertTrue(prepared["postponed"])
+        self.g._postponed.clear()
+        self.addCleanup(self.g._postponed.clear)
+        for _ in range(self.g.POSTPONE_SWEEPS):
+            self.assertEqual(self.g._ready([dict(prepared)]), [])  # sin registrar: vuelve como nuevo
+        decided = self.g._ready([dict(prepared)])
+        self.assertEqual(len(decided), 1)
+        self.assertNotIn("provenance", decided[0])  # sin prueba, response contiene como siempre
+        self.assertEqual(self.g._postponed, {})
+
+    def test_an_unanswered_library_is_neither_accused_nor_learned(self):
+        s = {"unit": "web.service", "maps": ["/usr/lib/libc.so.6"], "preload": []}
+        subjects = {"system.slice/web.service": s}
+        lib = "/opt/vendor/libnew.so.1"  # fuera de todo árbol aprendido
+        common = [mock.patch.object(self.p, "_cgroup_pids", return_value=[123]),
+                  mock.patch.object(self.p, "_mapped_libs", return_value=({lib, "/usr/lib/libc.so.6"}, None)),
+                  mock.patch.object(self.p, "_phase", return_value="watch")]
+        for p in common:
+            p.start()
+            self.addCleanup(p.stop)
+        with self.busy:
+            self.assertEqual(self.p._library_events(subjects, datetime.now(timezone.utc), {}), [])
+        self.assertNotIn(lib, s["maps"])  # se vuelve a mirar en el próximo turno
+
+        class R:
+            returncode, stdout = 1, ""
+        self.v.clear_cache()
+        with mock.patch.object(self.m, "run", return_value=R()):
+            found = self.p._library_events(subjects, datetime.now(timezone.utc), {})
+        self.assertEqual([x["kind"] for x in found], ["injected_library"])
+
+    def test_unanswered_versions_leave_the_dpkg_change_unseen(self):
+        incomplete = []
+        subjects = {"system.slice/web.service": {"unit": "web.service", "package": "nginx", "version": "1"}}
+        with self.busy, mock.patch.object(self.v, "_unit_files",
+                                          return_value=("/usr/lib/systemd/system/web.service", [])):
+            self.assertEqual(self.p._updates(subjects, {}, datetime.now(timezone.utc), check_versions=True,
+                                             incomplete=incomplete), [])
+            self.assertIsNone(self.p._new_subject("system.slice/web.service", datetime.now(timezone.utc), {}))
+        self.assertTrue(incomplete)
+        self.assertEqual(subjects["system.slice/web.service"]["version"], "1")
 
 
 class SelfProtectionTests(unittest.TestCase):
@@ -5430,6 +5567,25 @@ class SelfProtectionTests(unittest.TestCase):
 
     def test_an_untouched_arx_says_nothing(self):
         self.assertEqual(self._check(), [])
+
+    def test_a_busy_slot_postpones_the_self_check_instead_of_raising_an_alarm(self):
+        with mock.patch.object(self.s.maintenance, "run", side_effect=self.s.maintenance.SlotBusy("busy")):
+            self.assertEqual(self.s.self_check(dropin_dirs=()), [])
+        with mock.patch.object(self.s.maintenance, "run",
+                               side_effect=self.s.maintenance.MaintenanceUnavailable("no systemd-run")), \
+                mock.patch.object(self.s.maintenance, "_in_arx_service", return_value=True):
+            kinds = [f["kind"] for f in self.s.self_check(dropin_dirs=())]
+        self.assertEqual(kinds, ["self_check_unavailable"])  # sin aislamiento sí se dice
+
+    def test_dpkg_only_verifies_the_copy_dpkg_installed(self):
+        """Revisión independiente: instalado por snap, dpkg --verify arx fallaba en cada vuelta."""
+        with mock.patch.object(self.s.sys, "argv", ["/snap/arx/12/arx.pyz", "guard"]), \
+                mock.patch.object(self.s.maintenance, "run") as run:
+            self.assertEqual(self.s.self_check(dropin_dirs=()), [])
+        run.assert_not_called()
+        with mock.patch.object(self.s.sys, "argv", ["/usr/lib/arx/arx.pyz", "guard"]), \
+                mock.patch.object(self.s.os.path, "realpath", side_effect=lambda p: p):
+            self.assertTrue(self.s._runs_from_package())
 
     def test_the_maintenance_slice_is_sealed_and_bounded_separately(self):
         text = self.s.maintenance_slice_text()
@@ -7178,7 +7334,7 @@ class ProvenanceTests(unittest.TestCase):
     def test_package_owner_ignores_diversions_and_needs_the_exact_path(self):
         out = {"/usr/sbin/nginx": "diversion by x from: /usr/sbin/nginx\nnginx-core: /usr/sbin/nginx\n",
                "/usr/bin/socat": "socat: /usr/bin/socat1\n"}
-        self._patch(self.p, "_q", lambda argv, timeout=10: out.get(argv[-1]))
+        self._patch(self.p, "_q", lambda argv, timeout=10, **kw: out.get(argv[-1]))
         self.assertEqual(self.p.package_of("/usr/sbin/nginx"), "nginx-core")
         self.assertIsNone(self.p.package_of("/usr/bin/socat"))  # otro fichero que empieza igual
 
@@ -7223,13 +7379,13 @@ class ProvenanceTests(unittest.TestCase):
 """
 
     def test_origin_from_a_signed_repository(self):
-        self._patch(self.p, "_q", lambda argv, timeout=10: self.POLICY)
+        self._patch(self.p, "_q", lambda argv, timeout=10, **kw: self.POLICY)
         self._patch(self.p, "_trusted_yes_urls", lambda: [])
         self.assertEqual(self.p.signed_origin("nginx"), (True, "http://ports.ubuntu.com/ubuntu-ports"))
 
     def test_a_local_deb_is_not_signed(self):
         """Medido en Ubuntu: un .deb suelto solo aparece en /var/lib/dpkg/status."""
-        self._patch(self.p, "_q", lambda argv, timeout=10: self.LOCAL)
+        self._patch(self.p, "_q", lambda argv, timeout=10, **kw: self.LOCAL)
         ok, why = self.p.signed_origin("evild")
         self.assertFalse(ok)
         self.assertIn("local", why)
@@ -7248,19 +7404,19 @@ class ProvenanceTests(unittest.TestCase):
         """B43 (F2): tras `apt update`, la versión instalada de openssh-server salió de las listas →
         «paquete suelto» 0,00 eterno y ssh confinado con sesiones de administración expulsadas. Es el
         estado normal de un host con una actualización pendiente: la firma la verificó apt al instalarla."""
-        self._patch(self.p, "_q", lambda argv, timeout=10: self.STALE)
+        self._patch(self.p, "_q", lambda argv, timeout=10, **kw: self.STALE)
         self._patch(self.p, "_trusted_yes_urls", lambda: [])
         ok, why = self.p.signed_origin("openssh-server")
         self.assertTrue(ok)
         self.assertIn("no longer listed", why)
 
     def test_a_stale_version_from_a_trusted_yes_repo_is_still_not_signed(self):
-        self._patch(self.p, "_q", lambda argv, timeout=10: self.STALE)
+        self._patch(self.p, "_q", lambda argv, timeout=10, **kw: self.STALE)
         self._patch(self.p, "_trusted_yes_urls", lambda: ["http://archive.ubuntu.com/ubuntu"])
         self.assertFalse(self.p.signed_origin("openssh-server")[0])
 
     def test_a_trusted_yes_repository_is_not_signed(self):
-        self._patch(self.p, "_q", lambda argv, timeout=10: self.POLICY)
+        self._patch(self.p, "_q", lambda argv, timeout=10, **kw: self.POLICY)
         self._patch(self.p, "_trusted_yes_urls", lambda: ["http://ports.ubuntu.com/ubuntu-ports"])
         self.assertFalse(self.p.signed_origin("nginx")[0])
 

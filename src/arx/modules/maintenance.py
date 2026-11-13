@@ -33,11 +33,26 @@ _ENV_KEYS = {
     "APT_CONFIG", "DPKG_ADMINDIR", "DPKG_ROOT",
 }
 _heavy_lock = threading.Lock()
+# Las consultas cortas de solo lectura tienen su propia ranura: no esperan detrás de un dpkg --verify, una
+# descarga o una comparación de minutos. Como mucho dos auxiliares a la vez en el slice (en d13, veinte).
+_query_lock = threading.Lock()
+_QUERY_DPKG = {"-S", "--search", "-L", "--listfiles", "-s", "--status", "-l", "--list", "-W", "--show"}
 _counter = itertools.count()
 
 
 class MaintenanceUnavailable(OSError):
     """El daemon no pudo crear el entorno aislado; el auxiliar no se ejecutó."""
+
+
+class SlotBusy(MaintenanceUnavailable):
+    """Otro auxiliar ocupaba su ranura: transitorio. Nunca es una respuesta del sistema de paquetes."""
+
+
+class NoAnswer(Exception):
+    """El sistema de paquetes no contestó (ranura ocupada, sin aislamiento, sin tiempo o con error).
+
+    No es un «no»: quien decide la confianza no puede convertirlo en «no es de ningún paquete» ni en «apt no
+    lo conoce», ni guardarlo en caché. No hereda de OSError para que ningún `except OSError` se lo trague."""
 
 
 def _in_arx_service() -> bool:
@@ -57,6 +72,13 @@ def _in_arx_service() -> bool:
 
 def _is_heavy(argv: list[str]) -> bool:
     return bool(argv) and os.path.basename(str(argv[0])) in _HEAVY
+
+
+def _slot(argv: list[str]) -> threading.Lock:
+    name = os.path.basename(str(argv[0]))
+    if name in ("dpkg-query", "apt-cache") or (name == "dpkg" and len(argv) > 1 and argv[1] in _QUERY_DPKG):
+        return _query_lock
+    return _heavy_lock
 
 
 def _scope_launch(argv: list[str], cwd: str | None, env: dict | None) -> tuple[list[str], str]:
@@ -98,11 +120,12 @@ class MaintenanceProcess:
     """Popen con identidad del scope y limpieza del árbol completo en salidas anómalas."""
 
     def __init__(self, raw, argv: list[str], scope: str | None = None,
-                 serialized: bool = False):
+                 serialized: bool = False, lock: threading.Lock | None = None):
         self._raw = raw
         self._argv = argv
         self._scope = scope
         self._serialized = serialized
+        self._lock = lock or _heavy_lock
         self._released = not serialized
         self._scope_stopped = False
         self._closed = False
@@ -121,7 +144,7 @@ class MaintenanceProcess:
     def _release(self) -> None:
         if not self._released:
             self._released = True
-            _heavy_lock.release()
+            self._lock.release()
 
     def _stop_scope(self) -> bool:
         if not self._scope:
@@ -233,19 +256,20 @@ def Popen(argv: list[str], cwd: str | None = None, env: dict | None = None,
         raise ValueError("maintenance helpers never use a shell")
     isolated = _in_arx_service() and _is_heavy(argv)
     launch, scope = _scope_launch(argv, cwd, env) if isolated else (list(argv), None)
+    lock = _slot(argv)
     if isolated:
-        if not _heavy_lock.acquire(timeout=LOCK_WAIT_S):
-            raise MaintenanceUnavailable("another APT/dpkg helper still owns the maintenance slot")
+        if not lock.acquire(timeout=LOCK_WAIT_S):
+            raise SlotBusy("another APT/dpkg helper still owns the maintenance slot")
     try:
         raw = subprocess.Popen(launch, cwd=None if isolated else cwd,
                                env=None if isolated else env, **kwargs)
     except BaseException as exc:
         if isolated:
-            _heavy_lock.release()
+            lock.release()
             if isinstance(exc, OSError):
                 raise MaintenanceUnavailable(f"could not create {scope}: {exc}") from exc
         raise
-    return MaintenanceProcess(raw, list(argv), scope=scope, serialized=isolated)
+    return MaintenanceProcess(raw, list(argv), scope=scope, serialized=isolated, lock=lock)
 
 
 def run(argv: list[str], input=None, capture_output: bool = False,
@@ -275,9 +299,24 @@ def run(argv: list[str], input=None, capture_output: bool = False,
     except BaseException:
         proc.close()
         raise
+    if proc._scope and proc.returncode == 1 and _scope_not_created(stderr):
+        # systemd-run sale con 1 sin ejecutar nada si no pudo crear el scope: el mismo 1 que un
+        # «dpkg-query -S: no es de ningún paquete». Una respuesta negativa tiene que venir del auxiliar.
+        raise MaintenanceUnavailable(f"could not create {proc._scope}: {_first_line(stderr)}")
     if check and proc.returncode:
         raise subprocess.CalledProcessError(proc.returncode, argv, output=stdout, stderr=stderr)
     return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
+
+
+def _first_line(text) -> str:
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", "replace")
+    return (text or "").strip().splitlines()[0][:200] if (text or "").strip() else ""
+
+
+def _scope_not_created(stderr) -> bool:
+    """Los errores de systemd-run empiezan por «Failed to»; los de dpkg/apt, por «dpkg…:», «E:» o «W:»."""
+    return _first_line(stderr).startswith("Failed to ")
 
 
 def stop_all() -> list[str]:

@@ -70,14 +70,27 @@ def clear_cache() -> None:
     _cache.clear()
 
 
-def _q(argv: list[str], timeout: int = 10) -> str | None:
-    """Salida de un comando del sistema, siempre en inglés (se analiza) y sin shell."""
+NoAnswer = maintenance.NoAnswer  # ver maintenance.NoAnswer
+
+
+def _q(argv: list[str], timeout: int = 10, strict: bool = False, ok: tuple = (0,)) -> str | None:
+    """Salida de un comando del sistema, siempre en inglés (se analiza) y sin shell.
+
+    Con `strict`, un código fuera de `ok` o la falta de respuesta lanzan NoAnswer en vez de devolver None."""
     try:
         r = maintenance.run(argv, capture_output=True, text=True, errors="replace", timeout=timeout,
                             env={**os.environ, "LC_ALL": "C", "LANG": "C"})
-    except (OSError, subprocess.TimeoutExpired):
+    except (maintenance.MaintenanceUnavailable, subprocess.TimeoutExpired) as e:
+        if strict:
+            raise NoAnswer(f"{os.path.basename(argv[0])}: {e}") from e
         return None
-    return r.stdout if r.returncode == 0 else None
+    except OSError:
+        return None
+    if r.returncode in ok:
+        return r.stdout or ""
+    if strict:
+        raise NoAnswer(f"{os.path.basename(argv[0])} exited {r.returncode}")
+    return None
 
 
 def available() -> bool:
@@ -104,7 +117,7 @@ def package_of(path: str) -> str | None:
     """Paquete dueño de un fichero (`nginx`, o `libc6:arm64` en multiarch). None si no es de nadie."""
     def look():
         for p in _variants(path):
-            out = _q(["dpkg-query", "-S", p])
+            out = _q(["dpkg-query", "-S", p], strict=True, ok=(0, 1))  # 1: de ningún paquete
             for line in (out or "").splitlines():
                 if line.startswith(("diversion by", "local diversion")):
                     continue
@@ -182,7 +195,7 @@ def signed_origin(pkg: str) -> tuple[bool, str]:
     openssh-server quedó en «suelto» 0,00 para siempre tras un `apt update`, y su confinamiento expulsó
     sesiones de administración). Suelto es lo que ningún repositorio firmado sirve en ninguna versión."""
     def look():
-        out = _q(["apt-cache", "policy", pkg.partition(":")[0]])
+        out = _q(["apt-cache", "policy", pkg.partition(":")[0]], strict=True)
         if not out:
             return False, tr("apt does not know this package")
         installed_src, any_src, inside = [], [], False
@@ -214,7 +227,7 @@ def signed_origin(pkg: str) -> tuple[bool, str]:
 
 
 def source_package(pkg: str) -> str:
-    out = _q(["dpkg-query", "-W", "-f=${source:Package}", pkg])
+    out = _q(["dpkg-query", "-W", "-f=${source:Package}", pkg], strict=True, ok=(0, 1))
     return (out or "").strip() or pkg.partition(":")[0]
 
 

@@ -309,12 +309,17 @@ def self_check(dropin_dirs=DROPIN_DIRS) -> list[dict]:
         if extra:
             findings.append(_tamper(tr("someone added drop-ins to Arx's unit: {files}", files=", ".join(extra)),
                                     f"dropin|{d}|{','.join(extra)}"))
+    if not _runs_from_package():
+        # Instalado de otra forma (snap): dpkg verificaría unos ficheros que no son los que corren.
+        return findings
     rc, unavailable = 0, False
     inside = maintenance._in_arx_service()
     try:
         result = maintenance.run(["dpkg", "--verify", "arx"], capture_output=True,
                                  text=True, timeout=30)
         out, rc = result.stdout or "", result.returncode
+    except maintenance.SlotBusy:
+        return findings  # otro auxiliar ocupaba la ranura: la prueba se repite en la próxima vuelta
     except maintenance.MaintenanceUnavailable:
         out, unavailable = "", True
     except subprocess.TimeoutExpired:
@@ -336,6 +341,15 @@ def self_check(dropin_dirs=DROPIN_DIRS) -> list[dict]:
         findings.append({"sev": "high", "kind": "self_check_unavailable", "detail": detail,
                          "why": why, "fp_key": "self_check_unavailable|dpkg"})
     return findings
+
+
+PACKAGED_PYZ = "/usr/lib/arx/arx.pyz"
+
+
+def _runs_from_package() -> bool:
+    """¿Corre la copia que instaló dpkg? Solo entonces `dpkg --verify arx` dice algo de este proceso."""
+    argv0 = sys.argv[0] if sys.argv and sys.argv[0] else ""
+    return not argv0.endswith(".pyz") or os.path.realpath(argv0) == PACKAGED_PYZ
 
 
 def _tamper(detail: str, key: str) -> dict:

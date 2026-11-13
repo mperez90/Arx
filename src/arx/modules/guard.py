@@ -168,7 +168,7 @@ def sweep(base: dict, enforce: bool = False, include_suid: bool = True,
         findings.append(reset)
     findings = _new_logins_only(findings, base)
     deadline = time.monotonic() + ENRICH_SWEEP_BUDGET_S
-    findings = [_prepare(f, enrich=time.monotonic() < deadline) for f in findings]
+    findings = _ready([_prepare(f, enrich=time.monotonic() < deadline) for f in findings])
     findings.sort(key=lambda f: _SEV_RANK.get(f["sev"], 9))
     outcomes = []
     for f in findings:
@@ -236,8 +236,38 @@ def _prepare(finding: dict, enrich: bool = True) -> dict:
         pass
     try:  # después del estático: sus señales cuentan para decidir entre suspender y confinar
         return provenance.enrich(f)
+    except provenance.NoAnswer:  # dpkg/apt no contestaron: no es «sin paquete»; se decide en otro barrido
+        f["postponed"] = True
+        return f
     except Exception:  # sin prueba de procedencia, se contiene como siempre
         return f
+
+
+POSTPONE_SWEEPS = 4  # ~2 min: más que una verificación o una descarga que ocupe la ranura de dpkg
+_postponed: dict[str, int] = {}
+
+
+def _ready(findings: list[dict]) -> list[dict]:
+    """Lo que se puede decidir ya. Un hallazgo cuya prueba de procedencia no tuvo respuesta no se registra
+    (así vuelve como nuevo en el barrido siguiente); si sigue sin respuesta, se decide sin ella, como antes:
+    contenido. Un dpkg ocupado no puede confinar un programa de paquete, ni dejar libre uno desconocido."""
+    ready = []
+    for f in findings:
+        if not f.pop("postponed", False):
+            if _postponed:
+                _postponed.pop(response.fingerprint(f), None)
+            ready.append(f)
+            continue
+        key = response.fingerprint(f)
+        n = _postponed.get(key, 0) + 1
+        if n <= POSTPONE_SWEEPS:
+            _postponed[key] = n
+            if len(_postponed) > 512:  # acotado: lo más antiguo se olvida y se decide en su próxima vuelta
+                _postponed.pop(next(iter(_postponed)))
+            continue
+        _postponed.pop(key, None)
+        ready.append(f)
+    return ready
 
 
 # ── capa lenta: expediente + presupuesto ─────────────────────────────────────
