@@ -125,7 +125,21 @@ check "el intento desde una sesión de login no cuenta" \
 check "una lectura permitida no se cuenta como denegada" \
   sh -c "! limactl shell $VM sudo grep -q 'root tried to open' /var/lib/arx/incidents.jsonl"
 
-v bash -c 'systemctl disable --now acme-lib acme-read >/dev/null 2>&1; rm -f /dev/shm/evil.so /tmp/acme-lib-flag /tmp/acme-read-flag'
+step "auditd: un fichero de identidad y un señuelo llegan por el lector propio del log (B72)"
+# `ausearch --checkpoint` no entregaba los eventos nuevos en auditd 4.0: estas dos claves no llegaban nunca.
+v bash -c 'rm -rf /srv/arx-canary-lab && mkdir -p /srv/arx-canary-lab'
+v arx canaries plant --in /srv/arx-canary-lab >/dev/null 2>&1
+CANARY=$(limactl shell "$VM" sudo ls -A /srv/arx-canary-lab | head -1 | tr -d '[:space:]')
+canary_rule() { local out; out=$(v auditctl -l); grep -qF -- "-w /srv/arx-canary-lab/$CANARY -p rwa -k arx_canary" <<<"$out"; }
+check "precondición: señuelo plantado ($CANARY) y vigilado por auditd" wait_for 30 canary_rule
+v touch /etc/passwd
+v cat "/srv/arx-canary-lab/$CANARY" >/dev/null
+check "escribir en /etc/passwd llega como «auditd · identity», con el programa" \
+  wait_for 75 incident "auditd · identity: .*/etc/passwd using /usr/bin/touch"
+check "abrir el señuelo llega como «canary accessed», con el programa" \
+  wait_for 75 incident "canary accessed · .*$CANARY using /usr/bin/cat"
+
+v bash -c 'systemctl disable --now acme-lib acme-read >/dev/null 2>&1; rm -rf /dev/shm/evil.so /tmp/acme-lib-flag /tmp/acme-read-flag /srv/arx-canary-lab'
 echo
 [ "$FAILED" = 0 ] && echo "══ LAB DE LIBRERÍAS Y FICHEROS COMPLETO ══" || echo "══ LAB DE LIBRERÍAS Y FICHEROS CON FALLOS (ver [FAIL]) ══"
 exit "$FAILED"
