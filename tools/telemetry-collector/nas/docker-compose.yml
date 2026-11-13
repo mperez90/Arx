@@ -2,38 +2,56 @@
 # Layout (as on the ASL NAS):
 #   /volume2/docker/services/arx-collector/   collector.py, this file, .env (0600)
 #   /volume2/docker/volumes/arx-collector/    reports (owned by uid 10001)
-# The collector publishes no port: cloudflared reaches it as http://arx-collector:8787 on the tunnel's network.
+# Nothing is published to the host: cloudflared reaches the collector as http://arx-collector:8787 on the
+# tunnel's network. The scheduler sends the daily digest and applies retention from its own network,
+# so the host needs no cron entry and no root access.
+
+x-hardening: &hardening
+  image: ${ARX_COLLECTOR_IMAGE:-python:3.12-alpine}
+  working_dir: /app
+  env_file: ./.env
+  volumes:
+    - ./collector.py:/app/collector.py:ro
+    - ${ARX_COLLECTOR_DATA_DIR:-/volume2/docker/volumes/arx-collector}:/data
+  user: "${ARX_COLLECTOR_UID:-10001}:${ARX_COLLECTOR_GID:-10001}"
+  read_only: true
+  tmpfs: [/tmp]
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  restart: unless-stopped
+
 services:
   arx-collector:
-    image: python:3.12-alpine
+    <<: *hardening
     container_name: arx-collector
     command: ["python", "/app/collector.py", "serve"]
-    working_dir: /app
-    env_file: ./.env
     environment:
       ARX_COLLECTOR_BIND: 0.0.0.0
       ARX_COLLECTOR_PORT: "8787"
       ARX_COLLECTOR_DATA: /data
       TZ: UTC
-    volumes:
-      - ./collector.py:/app/collector.py:ro
-      - ${ARX_COLLECTOR_DATA_DIR:-/volume2/docker/volumes/arx-collector}:/data
     networks: [tunnel]
-    user: "10001:10001"
-    read_only: true
-    tmpfs: [/tmp]
-    cap_drop: [ALL]
-    security_opt: ["no-new-privileges:true"]
     mem_limit: 256m
     cpus: 0.5
-    restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/healthz', timeout=3)"]
       interval: 60s
       timeout: 5s
       retries: 3
 
+  arx-collector-digest:
+    <<: *hardening
+    container_name: arx-collector-digest
+    command: ["python", "/app/collector.py", "schedule"]
+    environment:
+      ARX_COLLECTOR_DATA: /data
+      TZ: UTC
+    networks: [egress]
+    mem_limit: 128m
+    cpus: 0.25
+
 networks:
   tunnel:
     external: true
     name: ${ARX_TUNNEL_NETWORK:?set ARX_TUNNEL_NETWORK to the Docker network cloudflared is on}
+  egress: {}

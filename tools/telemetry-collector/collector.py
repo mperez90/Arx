@@ -7,6 +7,8 @@ Receives the anonymous reports that Arx installations send only after their owne
     collector.py serve                    HTTP on 127.0.0.1:8787, behind an HTTPS reverse proxy
     collector.py digest [--date D] [--dry-run]   email the digest of day D (default: yesterday, UTC)
     collector.py summary [--days N]       print the summary of the last N days
+    collector.py schedule                 run forever: daily digest at DIGEST_AT (UTC) and retention
+    collector.py purge                    delete reports older than RETENTION_DAYS
 
 Privacy by construction:
   · Source IPs are never written anywhere. The access log is silenced.
@@ -17,6 +19,7 @@ Privacy by construction:
 Configuration (environment, e.g. a systemd EnvironmentFile with mode 0600):
   ARX_COLLECTOR_BIND (127.0.0.1)  ARX_COLLECTOR_PORT (8787)  ARX_COLLECTOR_DATA (/var/lib/arx-collector)
   ARX_COLLECTOR_INTERVAL_DAYS (7)  ARX_COLLECTOR_MIN_GAP_H (12)  ARX_COLLECTOR_MAX_PER_MIN (600)
+  ARX_COLLECTOR_DIGEST_AT (06:17, UTC)  ARX_COLLECTOR_RETENTION_DAYS (396, about 13 months)
   ARX_COLLECTOR_MAIL_TO  ARX_COLLECTOR_MAIL_FROM
   ARX_COLLECTOR_SMTP_HOST  ARX_COLLECTOR_SMTP_PORT (587)  ARX_COLLECTOR_SMTP_TLS (starttls|ssl|none)
   ARX_COLLECTOR_SMTP_USER  ARX_COLLECTOR_SMTP_PASSWORD
@@ -356,6 +359,56 @@ def digest(day: str | None, dry_run: bool) -> int:
     return 0
 
 
+def purge(retention_days: int, today: date | None = None, root: Path | None = None) -> list[str]:
+    """Delete the daily files older than the retention period. Goes by the date in the file name."""
+    today = today or datetime.now(timezone.utc).date()
+    cutoff = today - timedelta(days=retention_days)
+    removed = []
+    for path in sorted(((root or data_dir()) / "reports").glob("*.jsonl")):
+        try:
+            day = date.fromisoformat(path.stem)
+        except ValueError:
+            continue
+        if day < cutoff:
+            path.unlink()
+            removed.append(path.name)
+    return removed
+
+
+def next_run(now: datetime, at: str) -> datetime:
+    hour, minute = (int(x) for x in at.split(":"))
+    run = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    return run if run > now else run + timedelta(days=1)
+
+
+def scheduled_once(retention_days: int, attempts: int = 3, wait_s: float = 1800, sleep=time.sleep) -> bool:
+    """One scheduled round: the digest (retried a few times if mail fails) and then retention."""
+    sent = False
+    for attempt in range(attempts):
+        try:
+            digest(None, dry_run=False)
+            sent = True
+            break
+        except (Exception, SystemExit) as e:  # a mail outage must not stop the scheduler
+            print(f"digest failed ({type(e).__name__}: {e}); attempt {attempt + 1}/{attempts}", flush=True)
+            if attempt + 1 < attempts:
+                sleep(wait_s)
+    removed = purge(retention_days)
+    if removed:
+        print(f"retention: removed {len(removed)} file(s) older than {retention_days} days", flush=True)
+    return sent
+
+
+def schedule() -> int:
+    at = env("DIGEST_AT", "06:17")
+    retention = int(env("RETENTION_DAYS", "396"))
+    print(f"arx-collector scheduler: digest daily at {at} UTC, retention {retention} days", flush=True)
+    while True:
+        now = datetime.now(timezone.utc)
+        time.sleep(max(1.0, (next_run(now, at) - now).total_seconds()))
+        scheduled_once(retention)
+
+
 def summary(days: int) -> int:
     today = datetime.now(timezone.utc).date()
     reports = load(data_dir(), [today - timedelta(days=i) for i in range(days)])
@@ -372,11 +425,19 @@ def main(argv: list[str] | None = None) -> int:
     p_d.add_argument("--dry-run", action="store_true", help="print it instead of sending it")
     p_s = sub.add_parser("summary", help="print a summary of recent days")
     p_s.add_argument("--days", type=int, default=7)
+    sub.add_parser("schedule", help="run forever: daily digest and retention")
+    sub.add_parser("purge", help="delete reports older than the retention period")
     args = p.parse_args(argv)
     if args.cmd == "serve":
         return serve()
     if args.cmd == "digest":
         return digest(args.date, args.dry_run)
+    if args.cmd == "schedule":
+        return schedule()
+    if args.cmd == "purge":
+        removed = purge(int(env("RETENTION_DAYS", "396")))
+        print(f"removed {len(removed)} file(s)")
+        return 0
     return summary(args.days)
 
 

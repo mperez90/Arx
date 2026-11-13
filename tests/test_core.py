@@ -9950,13 +9950,43 @@ class TelemetryCollectorTests(unittest.TestCase):
         with open(os.path.join(kit, "docker-compose.yml"), encoding="utf-8") as f:
             compose = f.read()
         self.assertNotIn("ports:", compose)
-        for line in ('user: "10001:10001"', "read_only: true", "cap_drop: [ALL]", "no-new-privileges:true",
-                     "./collector.py:/app/collector.py:ro", "ARX_COLLECTOR_BIND: 0.0.0.0"):
+        for line in ('user: "${ARX_COLLECTOR_UID:-10001}:${ARX_COLLECTOR_GID:-10001}"', "read_only: true",
+                     "cap_drop: [ALL]", "no-new-privileges:true", "./collector.py:/app/collector.py:ro",
+                     "ARX_COLLECTOR_BIND: 0.0.0.0", '"/app/collector.py", "serve"', '"/app/collector.py", "schedule"'):
             self.assertIn(line, compose)
-        with open(os.path.join(kit, "arx-collector.cron"), encoding="utf-8") as f:
-            cron = f.read()
-        self.assertIn("collector.py digest", cron)
-        self.assertIn("-mtime +396 -delete", cron)  # 13 meses, como dice docs/telemetry.md
+        with open(os.path.join(kit, "env.example"), encoding="utf-8") as f:
+            self.assertIn("ARX_COLLECTOR_RETENTION_DAYS=396", f.read())  # 13 meses, como dice docs/telemetry.md
+
+    def test_retention_goes_by_the_day_in_the_file_name(self):
+        from datetime import date
+        reports = os.path.join(self.d, "reports")
+        os.makedirs(reports)
+        for name in ("2025-10-12.jsonl", "2025-10-13.jsonl", "2026-11-13.jsonl", "notes.jsonl"):
+            open(os.path.join(reports, name), "w").close()
+        removed = self.c.purge(396, today=date(2026, 11, 13), root=pathlib_path(self.d))
+        self.assertEqual(removed, ["2025-10-12.jsonl"])
+        self.assertEqual(sorted(os.listdir(reports)), ["2025-10-13.jsonl", "2026-11-13.jsonl", "notes.jsonl"])
+
+    def test_the_scheduler_runs_daily_at_the_set_time_and_survives_mail_outages(self):
+        utc = timezone.utc
+        self.assertEqual(self.c.next_run(datetime(2026, 11, 13, 5, 0, tzinfo=utc), "06:17"),
+                         datetime(2026, 11, 13, 6, 17, tzinfo=utc))
+        self.assertEqual(self.c.next_run(datetime(2026, 11, 13, 6, 17, tzinfo=utc), "06:17"),
+                         datetime(2026, 11, 14, 6, 17, tzinfo=utc))
+        calls, waits = [], []
+
+        def flaky(day, dry_run):
+            calls.append(day)
+            if len(calls) < 3:
+                raise OSError("smtp down")
+            return 0
+        with mock.patch.object(self.c, "digest", flaky), mock.patch.dict(os.environ, {"ARX_COLLECTOR_DATA": self.d}), \
+                mock.patch("sys.stdout", new=io.StringIO()):
+            self.assertTrue(self.c.scheduled_once(396, attempts=3, wait_s=7, sleep=waits.append))
+        self.assertEqual((len(calls), waits), (3, [7, 7]))
+        with mock.patch.object(self.c, "digest", side_effect=SystemExit("no recipient")), \
+                mock.patch.dict(os.environ, {"ARX_COLLECTOR_DATA": self.d}), mock.patch("sys.stdout", new=io.StringIO()):
+            self.assertFalse(self.c.scheduled_once(396, attempts=2, wait_s=0, sleep=lambda s: None))
 
     def test_digest_needs_a_recipient_unless_it_is_a_dry_run(self):
         with mock.patch.dict(os.environ, {"ARX_COLLECTOR_DATA": self.d}, clear=False):

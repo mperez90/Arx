@@ -9,7 +9,10 @@ tunnel's Docker network, and Cloudflare provides HTTPS.
 | `../collector.py` | `/volume2/docker/services/arx-collector/collector.py` |
 | `docker-compose.yml` | `/volume2/docker/services/arx-collector/docker-compose.yml` |
 | `env.example` | `/volume2/docker/services/arx-collector/.env` (mode 0600, edited) |
-| `arx-collector.cron` | `/etc/cron.d/arx-collector` (root, 0644) |
+
+Two containers run from the same image: `arx-collector` receives reports, and `arx-collector-digest`
+sends the daily digest and deletes reports older than 13 months. The host needs no cron entry and no
+root access beyond creating the data directory.
 
 Adjust the paths if your Docker stack lives elsewhere.
 
@@ -23,8 +26,10 @@ sudo install -m 0644 /path/to/collector.py /path/to/docker-compose.yml .
 sudo install -m 0600 /path/to/env.example .env
 ```
 
-The container runs as uid 10001 with a read-only root filesystem, no capabilities, 256 MB of memory
-and half a CPU. Only `/volume2/docker/volumes/arx-collector` is writable.
+Both containers run as uid 10001 with a read-only root filesystem and no capabilities (256 MB and half
+a CPU for the receiver, 128 MB and a quarter of a CPU for the scheduler). Only
+`/volume2/docker/volumes/arx-collector` is writable. Without root to `chown` it, create it as a normal
+user and set `ARX_COLLECTOR_UID`/`ARX_COLLECTOR_GID` in `.env` to that user's ids.
 
 ## 2. Settings
 
@@ -35,7 +40,8 @@ Edit `.env`:
 - SMTP: with Resend, host `smtp.resend.com`, port `465`, TLS `ssl`, user `resend`, and a Resend API
   key with sending access as the password. A key dedicated to the collector is better than reusing
   another service's.
-- Add `ARX_TUNNEL_NETWORK=<network>`: the Docker network `cloudflared` is attached to. Find it with:
+- `ARX_COLLECTOR_IMAGE`: any Python 3.10+ image; one the host already has saves a download.
+- `ARX_TUNNEL_NETWORK`: the Docker network `cloudflared` is attached to. Find it with:
 
 ```bash
 docker inspect cloudflared --format '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}'
@@ -73,18 +79,19 @@ curl -s https://telemetry.example.com/healthz      # {"ok": true}
 
 ## 5. Daily digest and retention
 
-```bash
-sudo install -m 0644 arx-collector.cron /etc/cron.d/arx-collector
-docker exec arx-collector python /app/collector.py digest --dry-run    # preview
-docker exec arx-collector python /app/collector.py digest              # send one now
-```
+`arx-collector-digest` sends the previous UTC day's digest at `ARX_COLLECTOR_DIGEST_AT` (06:17 UTC by
+default), retrying up to three times if mail fails, and then deletes daily files older than
+`ARX_COLLECTOR_RETENTION_DAYS` (396, about 13 months).
 
-The cron file sends the previous UTC day's digest at 06:17 and, once a month, deletes reports older
-than 13 months.
+```bash
+docker logs arx-collector-digest                                              # its schedule
+docker exec arx-collector-digest python /app/collector.py digest --dry-run    # preview
+docker exec arx-collector-digest python /app/collector.py digest              # send one now
+```
 
 ## Verified
 
 This kit was run end to end on a replica: a real Arx report posted over the tunnel's network was
 stored with hour precision and no address; a repeated report was refused (429), a malformed one
-rejected (400), and other paths answered 404. The container was healthy, ran as uid 10001 on a
+rejected (400), and other paths answered 404. The containers were healthy, ran as uid 10001 on a
 read-only filesystem, and the digest arrived by SMTP with the day's reports attached.
