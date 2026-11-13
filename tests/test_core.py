@@ -4550,6 +4550,68 @@ class ExecWatchTests(unittest.TestCase):
         freeze.assert_called_once()
         handled.assert_called_once()
 
+    def _fresh_capture(self):
+        from arx.modules import execfanwatch
+        self.x._events.clear()
+        self.x._recent.clear()
+        execfanwatch._snapshots.clear()
+        old_state = dict(execfanwatch._state)
+        execfanwatch._state.update(captured=0, dropped=0, expired=0, superseded=0)
+        for undo in (self.x._events.clear, self.x._recent.clear, execfanwatch._snapshots.clear,
+                     execfanwatch._state.clear):
+            self.addCleanup(undo)
+        self.addCleanup(execfanwatch._state.update, old_state)
+        return execfanwatch
+
+    def test_a_live_shebang_script_is_contained_as_the_interpreter_that_runs_it(self):
+        """Revisión independiente: script → intérprete → cargador; /proc dice el intérprete. Exigir que fuera
+        el script convertía un proceso vivo en «ya terminó» y la shell de una webshell dejó de congelarse."""
+        fan = self._fresh_capture()
+        base = self._ev(exe="/usr/bin/dash", unit="system.slice/web.service", parent_exe="/usr/sbin/nginx",
+                        parent_user="www-data", user="www-data", argv=["/bin/sh", "/tmp/x.sh"])
+        for captured, exe in ((100, "/tmp/x.sh"), (110, "/usr/bin/dash"), (120, "/usr/lib/ld-linux.so.2")):
+            fan._store({**base, "exe": exe, "uid": 33, "parent_uid": 33, "_captured_ns": captured, "_root": ""})
+        with mock.patch.object(self.x, "describe", return_value=dict(base)), \
+                mock.patch.dict(self.x._state, {"hot_fn": lambda ev: "webshell"}), \
+                mock.patch.object(self.x, "_freeze", return_value=True) as freeze, \
+                mock.patch.object(self.x, "_hot_handle"):
+            got = self.x.handle_pid(4242, "", lambda: True, ts=150)
+        self.assertEqual(got["exe"], "/usr/bin/dash")
+        self.assertFalse(got.get("partial"))
+        self.assertEqual(got["argv"], ["/bin/sh", "/tmp/x.sh"])
+        self.assertEqual(got["chain"], ["/tmp/x.sh", "/usr/bin/dash"])
+        freeze.assert_called_once()
+
+    def test_a_failed_exec_cannot_lend_its_known_identity_to_the_next_one(self):
+        """Revisión independiente: execve(app conocida) que falla tras su permiso y luego execve(implante). El
+        primer snapshot del grupo no puede tapar al programa que de verdad corre."""
+        fan = self._fresh_capture()
+        base = self._ev(unit="system.slice/app.service", parent_exe="/usr/sbin/app", parent_user="app",
+                        user="app")
+        for captured, exe in ((100, "/usr/sbin/app"), (120, "/tmp/.x/implant"), (130, "/usr/lib/ld-linux.so.2")):
+            fan._store({**base, "exe": exe, "uid": 1001, "parent_uid": 1001, "_captured_ns": captured, "_root": ""})
+        live = {**base, "exe": "/tmp/.x/implant", "argv": ["/tmp/.x/implant"]}
+        with mock.patch.object(self.x, "describe", return_value=dict(live)), \
+                mock.patch.dict(self.x._state, {"hot_fn": lambda ev: "unexpected"}), \
+                mock.patch.object(self.x, "_freeze", return_value=True) as freeze, \
+                mock.patch.object(self.x, "_hot_handle"):
+            got = self.x.handle_pid(4242, "", lambda: True, ts=150)
+        self.assertEqual(got["exe"], "/tmp/.x/implant")
+        self.assertFalse(got.get("partial"))
+        freeze.assert_called_once()
+
+        # Ya terminado: cada programa del grupo es evidencia; uno conocido no tapa al desconocido.
+        fan._snapshots.clear()
+        self.x._events.clear()
+        for captured, exe in ((300, "/usr/sbin/app"), (320, "/tmp/.x/implant"), (330, "/usr/lib/ld-linux.so.2")):
+            fan._store({**base, "exe": exe, "uid": 1001, "parent_uid": 1001, "_captured_ns": captured, "_root": ""})
+        with mock.patch.object(self.x, "describe", return_value=None):
+            self.x.handle_pid(4242, "", lambda: True, ts=350)
+        gone = list(self.x._events)
+        self.assertEqual(sorted(ev["exe"] for ev in gone), ["/tmp/.x/implant", "/usr/sbin/app"])
+        self.assertTrue(all(ev["partial"] and ev["gone"] for ev in gone))
+        self.assertNotIn("/usr/lib/ld-linux.so.2", [ev["exe"] for ev in gone])
+
     def test_a_delayed_netlink_event_cannot_inherit_the_identity_of_a_later_reexec(self):
         """El snapshot fecha CADA exec; describir el re-exec final no puede reetiquetar el evento anterior."""
         from arx.modules import execfanwatch

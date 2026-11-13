@@ -205,6 +205,9 @@ def claim(pid: int, root: str, ts: int | None = None) -> tuple[dict | None, bool
         for key, _ in group:
             _snapshots.pop(key, None)
         ev = dict(selected)
+        # Todo el grupo, en orden: script e intérprete, binario y cargador, y también un exec que falló tras
+        # su permiso (no emite EXEC) justo antes del bueno. Quien lo use no puede dejar que uno tape a otro.
+        ev["chain"] = [pair[1].get("exe") for pair in group if pair[1].get("exe")]
         captured = ev.get("_captured_ns", 0)
         later = any(other.get("pid") == pid and other.get("start") == start
                     and other.get("_captured_ns", 0) > captured

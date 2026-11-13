@@ -664,6 +664,11 @@ def set_hot_verdict(fn) -> None:
     _state["hot_fn"] = fn
 
 
+def _is_loader(exe: str) -> bool:
+    """El cargador ELF (ld-linux, ld-musl, ld.so) lo abre el kernel por el binario: no es otro programa."""
+    return os.path.basename(exe).startswith(("ld-linux", "ld-musl", "ld.so", "ld64.so"))
+
+
 def _complete_partial(ev: dict) -> dict:
     """Resuelve nombres fuera del permiso fanotify; dentro solo se guardaron uid numéricos."""
     import pwd
@@ -691,19 +696,30 @@ def handle_pid(pid: int, root: str, enforce, ts: int | None = None) -> dict | No
     # primero `/proc` reetiquetaba el evento anterior con el programa final, aunque (pid,start) no cambie.
     snapshot, later = execfanwatch.claim(pid, root, ts)
     live = describe(pid, root)
-    ev = None
+    ev, extra = None, []
     if snapshot:
-        same_live = bool(live and not live.get("gone")
-                         and all(live.get(key) == snapshot.get(key) for key in ("pid", "start", "exe", "unit")))
+        chain = [e for e in (snapshot.pop("chain", None) or [snapshot.get("exe")]) if e]
+        # lo que de verdad ejecutó cada paso; un cargador ELF solo acompaña a su binario
+        primaries = list(dict.fromkeys(e for e in chain if not _is_loader(e))) or chain[:1]
+        # Vivo y del mismo nacimiento: /proc dice el programa que corre (el intérprete de un script, el
+        # implante tras un exec señuelo que falló). Es del mismo EXEC si figura en su grupo.
+        same_live = bool(live and not live.get("gone") and live.get("exe") in chain
+                         and all(live.get(key) == snapshot.get(key) for key in ("pid", "start", "unit")))
         if same_live and not later:
             later = execfanwatch.has_later(snapshot)  # otro exec pudo ocurrir mientras se leía `/proc`
         if same_live and not later:
             ev = live  # argv/títulos solo se enriquecen cuando todavía representan al exec confirmado
+            if len(primaries) > 1:
+                ev["chain"] = primaries
             execfanwatch.discard_through(pid, live["start"], ts)
         else:
             snapshot.pop("_captured_ns", None)
             snapshot.update(partial=True, gone=True)
+            if len(primaries) > 1:
+                snapshot["chain"] = primaries
             ev = _complete_partial(snapshot)
+            # Sin el proceso no se sabe cuál de ellos corrió: todos son evidencia, ninguno tapa a otro.
+            extra = [_complete_partial({**snapshot, "exe": exe}) for exe in primaries if exe != ev.get("exe")]
     elif live and not later and not execfanwatch.has_pending(pid, root):
         ev = live
         execfanwatch.discard_through(pid, live["start"], ts)
@@ -727,6 +743,9 @@ def handle_pid(pid: int, root: str, enforce, ts: int | None = None) -> dict | No
         ev["stopped"] = _freeze(ev)
         _hot_handle(ev, hot)
     _events.append(ev)
+    for other in extra:  # forense de un proceso ya muerto: sin contención retroactiva, como el principal
+        other["preauth"], other["sure"] = ev["preauth"], ev["sure"]
+        _events.append(other)
     return ev
 
 
