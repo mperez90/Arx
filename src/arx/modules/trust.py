@@ -21,6 +21,8 @@ que no se pudieron hacer (un host sin conexión). Una sola prueba obligatoria fa
 """
 from __future__ import annotations
 
+import fnmatch
+import glob
 import hashlib
 import itertools
 import json
@@ -137,12 +139,47 @@ def check_signed(f: dict) -> dict:
     return _check("signed_repository", "pass" if ok else "fail", where, required=True)
 
 
+DPKG_CFG = "/etc/dpkg/dpkg.cfg"
+DPKG_CFG_D = "/etc/dpkg/dpkg.cfg.d"
+# Documentación: lo que borran las imágenes minimizadas y localepurge. No ejecuta nada, así que su ausencia no
+# es una manipulación del código del paquete.
+_DOC_TREES = ("/usr/share/doc/", "/usr/share/man/", "/usr/share/info/", "/usr/share/locale/",
+              "/usr/share/lintian/", "/usr/share/help/", "/usr/share/gtk-doc/")
+
+
+def _dpkg_filters() -> list[tuple[bool, str]]:
+    """Los path-exclude/path-include de dpkg, en su orden de lectura (dpkg.cfg.d/*, luego dpkg.cfg)."""
+    rules = []
+    for name in [*sorted(glob.glob(os.path.join(DPKG_CFG_D, "*"))), DPKG_CFG]:
+        try:
+            with open(name, encoding="utf-8", errors="replace") as fh:
+                lines = fh.read().splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            key, _, value = line.strip().partition("=")
+            if key.strip() in ("path-exclude", "path-include") and value.strip():
+                rules.append((key.strip() == "path-include", value.strip()))
+    return rules
+
+
+def _absent_on_purpose(path: str, rules: list[tuple[bool, str]]) -> bool:
+    """¿Falta porque dpkg no lo instaló (su filtro: la última regla que casa decide) o es documentación?"""
+    if path.startswith(_DOC_TREES):
+        return True
+    excluded = False
+    for include, pattern in rules:
+        if fnmatch.fnmatchcase(path, pattern):
+            excluded = not include
+    return excluded
+
+
 def check_files(f: dict) -> dict:
     """El paquete entero, no solo el binario: una librería alterada pasa por el mismo sitio."""
     rc, out = _run(["dpkg", "--verify", f["package"]], timeout=120)
     if rc != 0 and not out.strip():
         return _check("files_intact", "unknown", tr("dpkg --verify did not answer"), required=True)
-    conf = _conffiles(f["package"])
+    conf, rules = _conffiles(f["package"]), _dpkg_filters()
     changed, recognized, ignored = [], 0, 0
     for line in out.splitlines():
         if len(line) > 13 and line[2] == "5":
@@ -155,7 +192,7 @@ def check_files(f: dict) -> dict:
             recognized += 1
             rest = line[len("missing"):].strip()
             is_conf, path = rest.startswith("c "), rest[2:] if rest.startswith("c ") else rest
-            if is_conf or path in conf:
+            if is_conf or path in conf or _absent_on_purpose(path, rules):
                 ignored += 1
             else:
                 changed.append(path)
@@ -192,7 +229,7 @@ def check_repository_copy(f: dict) -> dict:
             deb = os.path.join(tmp, debs[0])
         if os.path.getsize(deb) > MAX_DEB_BYTES:
             return _check("matches_repository", "unknown", tr("package too large to compare"))
-        conf, differ, compared = _conffiles(f["package"]), [], 0
+        conf, differ, compared, rules = _conffiles(f["package"]), [], 0, _dpkg_filters()
         deadline = time.monotonic() + COMPARE_BUDGET_S
         try:  # en streaming: un paquete grande no puede llevar a Arx a su tope de memoria
             proc = maintenance.Popen(["dpkg-deb", "--fsys-tarfile", deb], stdout=subprocess.PIPE,
@@ -211,8 +248,12 @@ def check_repository_copy(f: dict) -> dict:
                     path = "/" + member.name.lstrip("./")
                     if path in conf:
                         continue
+                    if not os.path.lexists(path):
+                        if not _absent_on_purpose(path, rules):  # un binario o una librería que falta, sí
+                            differ.append(path)
+                        continue
                     if not os.path.isfile(path) or os.path.islink(path):
-                        differ.append(path)  # falta o dejó de ser el archivo regular que firmó el paquete
+                        differ.append(path)  # dejó de ser el archivo regular que firmó el paquete
                         continue
                     expected = _sha256_of(tar.extractfile(member))
                     try:

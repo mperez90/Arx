@@ -8616,6 +8616,53 @@ class TrustTests(unittest.TestCase):
         self.assertIn(os.path.join(root, "linked"), c["detail"])
         self.assertNotIn(os.path.join(root, "same"), c["detail"])
 
+    def test_files_absent_on_purpose_are_not_tampering_but_a_missing_binary_still_is(self):
+        """Revisión independiente: imágenes minimizadas (path-exclude de dpkg) y localepurge no instalan la
+        documentación; contarla como «cambiada» dejaba la confianza en 0 y confinaba cada actualización."""
+        import io
+        import tarfile
+        root = tempfile.mkdtemp()
+        cfg_d = os.path.join(root, "dpkg.cfg.d")
+        os.makedirs(cfg_d)
+        with open(os.path.join(cfg_d, "excludes"), "w") as f:
+            f.write("path-exclude=/opt/acme/examples/*\npath-include=/opt/acme/examples/keep.txt\n")
+        files = {"/usr/share/doc/acme/changelog.Debian.gz": b"docs", "/opt/acme/examples/a.conf": b"x",
+                 "/opt/acme/examples/keep.txt": b"y", "/usr/bin/acme-missing": b"code"}
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w") as tar:
+            for path, data in files.items():
+                info = tarfile.TarInfo("." + path)
+                info.size = len(data)
+                tar.addfile(info, io.BytesIO(data))
+        deb = os.path.join(root, "pkg.deb")
+        open(deb, "wb").write(b"x")
+
+        class Proc:
+            stdout = io.BytesIO(buf.getvalue())
+
+            def wait(self, timeout=None):
+                return 0
+
+            def close(self):
+                pass
+        with mock.patch.object(self.t, "_cached_deb", lambda f: deb), \
+                mock.patch.object(self.t.shutil, "which", lambda name: "/usr/bin/" + name), \
+                mock.patch.object(self.t, "_conffiles", lambda pkg: set()), \
+                mock.patch.object(self.t, "DPKG_CFG_D", cfg_d), \
+                mock.patch.object(self.t, "DPKG_CFG", os.path.join(root, "dpkg.cfg")), \
+                mock.patch.object(self.t.maintenance, "Popen", lambda *a, **k: Proc()):
+            c = self.t.check_repository_copy({"package": "acme", "version": "1.0"})
+            self.assertEqual(c["result"], "fail")  # el binario que falta y el ejemplo re-incluido sí cuentan
+            self.assertIn("/usr/bin/acme-missing", c["detail"])
+            self.assertIn("/opt/acme/examples/keep.txt", c["detail"])
+            self.assertNotIn("changelog", c["detail"])
+            self.assertNotIn("a.conf", c["detail"])
+            verify = ("missing     /usr/share/man/man1/acme.1.gz\nmissing     /opt/acme/examples/a.conf\n")
+            with mock.patch.object(self.t, "_run", return_value=(1, verify)):
+                self.assertEqual(self.t.check_files(self.F)["result"], "pass")
+            with mock.patch.object(self.t, "_run", return_value=(1, verify + "missing     /usr/bin/xz\n")):
+                self.assertEqual(self.t.check_files(self.F)["result"], "fail")
+
     def test_a_helper_killed_mid_stream_never_passes_the_repository_comparison(self):
         """B62: el slice mata a su auxiliar al agotar memoria. Cortado justo entre dos miembros, tarfile en
         modo stream lo toma por el final del archivo: sin el código de salida de dpkg-deb, una comparación
