@@ -17,6 +17,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -387,6 +388,62 @@ def collect_ssh() -> dict | None:
     return d or None
 
 
+# B49: sistemas de ficheros locales donde un bit SUID da privilegios. Fuera: overlay (contenedores, llenos de
+# su/passwd que no son del host), squashfs (snaps, solo lectura), red, FUSE, y todo montaje nosuid o noexec.
+SUID_FILESYSTEMS = {"ext2", "ext3", "ext4", "xfs", "btrfs", "zfs", "f2fs", "jfs", "reiserfs", "bcachefs", "tmpfs"}
+_SUID_SKIP = ("/proc", "/sys", "/run", "/snap", "/var/snap", "/var/lib/docker", "/var/lib/containers", "/var/lib/lxd")
+SUID_BUDGET_S = 25
+SUID_CACHE_S = 60
+_suid_cache: list = []
+
+
+def suid_scope(text: str | None = None) -> list[str]:
+    """Qué recorre el barrido SUID: siempre «/» (-xdev) y, además, cada sistema de ficheros local distinto,
+    sin nosuid ni noexec (antes solo el raíz: un /home, /var u /opt separado quedaba sin mirar)."""
+    from arx.modules.execfanwatch import _unescape
+    text = (_read("/proc/self/mountinfo") or "") if text is None else text
+    rows = []
+    for line in text.splitlines():
+        fields = line.split()
+        try:
+            sep = fields.index("-")
+            rows.append((fields[2], _unescape(fields[4]), fields[5].split(","), fields[sep + 1]))
+        except (ValueError, IndexError):
+            continue
+    devs = {dev for dev, path, _, _ in rows if path == "/"}
+    scope = ["/"]
+    for dev, path, options, fstype in rows:
+        if path == "/" or dev in devs or fstype not in SUID_FILESYSTEMS or "nosuid" in options \
+                or "noexec" in options or any(path == p or path.startswith(p + "/") for p in _SUID_SKIP):
+            continue
+        devs.add(dev)
+        scope.append(path)
+    return scope
+
+
+def suid_scan() -> tuple[list[str], list[str]] | None:
+    """(alcance recorrido, binarios SUID). Caro: un presupuesto común para todo, y un minuto de caché para
+    que la huella y la lista del mismo barrido no recorran el disco dos veces. None si «/» no se pudo."""
+    now = time.monotonic()
+    if _suid_cache and now - _suid_cache[0] < SUID_CACHE_S:
+        return _suid_cache[1]
+    deadline, scope, found = now + SUID_BUDGET_S, [], []
+    for mount in suid_scope():
+        left = deadline - time.monotonic()
+        if left < 1:
+            break  # lo que no cupo queda fuera del alcance esta vez: no se adopta ni se acusa
+        out = _run(["find", mount, "-xdev", "-perm", "-4000", "-type", "f"], timeout=max(1, int(left)))
+        if out is None:
+            if mount == "/":
+                return None
+            continue
+        scope.append(mount)
+        found += out.splitlines() if out else []
+    result = (scope, sorted(set(found)))
+    _suid_cache[:] = [time.monotonic(), result]
+    return result
+
+
 def collect_users() -> dict:
     d: dict = {}
     passwd = _read("/etc/passwd")
@@ -410,10 +467,10 @@ def collect_users() -> dict:
                 members = line.split(":")[3].strip()
                 if members:
                     d.setdefault("sudo_members", []).extend(members.split(","))
-    # SUID: solo el fs raíz (-xdev), acotado en tiempo
-    suid = _run(["find", "/", "-xdev", "-perm", "-4000", "-type", "f"], timeout=25)
-    if suid is not None:
-        d["suid_binaries"] = suid.splitlines() if suid else []
+    # SUID: «/» y los demás sistemas de ficheros donde el bit da privilegios, acotado en tiempo (B49)
+    scan = suid_scan()
+    if scan is not None:
+        d["suid_scope"], d["suid_binaries"] = scan
     cron = [p for p in ["/etc/crontab", *glob.glob("/etc/cron.d/*")] if _read(p)]
     if cron:
         d["cron_files"] = cron

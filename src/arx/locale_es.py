@@ -828,6 +828,13 @@ ES = {
         "escritura/cambio de atributos en un fichero de identidad o privilegios",
     "canary accessed · {line}":
         "señuelo accedido · {line}",
+    "Arx now also watches SUID binaries on {mounts}; {n} already there were taken as known: {files}":
+        "Arx vigila ahora también los binarios SUID de {mounts}; {n} que ya estaban se tomaron por conocidos: "
+        "{files}",
+    "they were there before Arx looked at that filesystem: review them; any SUID that appears there from now on "
+    "is reported as new":
+        "estaban antes de que Arx mirara ese sistema de ficheros: revísalos; cualquier SUID que aparezca allí a "
+        "partir de ahora se avisa como nuevo",
     "{who} tried to open {file} and the kernel denied it ({exe}, pid {pid}{unit})":
         "{who} intentó abrir {file} y el kernel se lo denegó ({exe}, pid {pid}{unit})",
     "a process reaching for passwords or keys it may not read is what an intruder probing the host does; "

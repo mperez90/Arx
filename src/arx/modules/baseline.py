@@ -385,6 +385,22 @@ def mark_late_watches() -> None:
             save(b)
 
 
+def adopt_suid_scope(scope: list[str], adopt: list[str]) -> None:
+    """Arx empieza a mirar otros sistemas de ficheros (B49): lo que ya había allí pasa a conocido, y la huella
+    sellada se rehace sobre lo conocido (no sobre lo actual: un SUID nuevo en el raíz sigue saliendo)."""
+    with config.locked("baseline"):
+        b = load()
+        if not b:
+            return
+        known = b.setdefault("sets", {}).setdefault("suid_binaries", {})
+        for p in adopt:
+            known[p] = known.get(p, 0) + 1
+        b["meta"]["suid_scope"] = list(scope)
+        b.setdefault("integrity", {})["suid_set"] = _h("\n".join(sorted(known)))
+        b["meta"]["updated"] = _now()
+        save(b)
+
+
 def accept(key: str, item: str) -> bool:
     """Incorpora a la base un cambio legítimo (p. ej. instalaste nginx → 'tcp 80 all')."""
     with config.locked("baseline"):
@@ -452,9 +468,11 @@ def run(samples: int = 1, interval: int = 0, seal: bool = False, status: bool = 
         baseline["meta"]["sealed"] = True
         baseline["meta"]["late_watches"] = True  # sellada con todas las vigilancias: nada se adopta solo
         # la huella dice QUE cambió el conjunto SUID, no cuál: sin la lista no se sabe qué hay de nuevo
-        suid = recon.collect_users().get("suid_binaries")
+        users = recon.collect_users()
+        suid = users.get("suid_binaries")
         if suid is not None:
             baseline["sets"]["suid_binaries"] = {p: 1 for p in suid}
+            baseline["meta"]["suid_scope"] = list(users.get("suid_scope") or ["/"])
         save(baseline)
         # Respaldo de los ficheros críticos al sellar: sin copia buena no hay restauración.
         from arx.modules import response

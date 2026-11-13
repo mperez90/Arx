@@ -97,6 +97,21 @@ check "y el servicio se queda sin salida" wait_for 30 confined acme-read.service
 check "pero sigue en pie" v systemctl is-active -q acme-read
 check "la sesión del usuario que leyó shadow no cuenta" sh -c "! limactl shell $VM sudo grep -q 'session.*opened /etc/shadow' /var/lib/arx/incidents.jsonl"
 
+step "SUID fuera del sistema de ficheros raíz (B49)"
+# Un ext4 propio, montado sin nosuid: un SUID ahí da privilegios y antes el barrido (find / -xdev) no lo miraba.
+v bash -c 'umount /mnt/arx-b49 2>/dev/null; rm -f /var/tmp/arx-b49.img; truncate -s 24M /var/tmp/arx-b49.img
+  mkfs.ext4 -q -F /var/tmp/arx-b49.img && mkdir -p /mnt/arx-b49 && mount -o loop /var/tmp/arx-b49.img /mnt/arx-b49
+  install -m 4755 /usr/bin/id /mnt/arx-b49/preexisting-id'
+v systemctl restart arx  # el primer barrido tras arrancar incluye el recorrido SUID
+check "lo que ya estaba en un sistema de ficheros recién vigilado se adopta y se dice (no crítico)" \
+  wait_for 90 incident "watches SUID binaries on /mnt/arx-b49; 1 already there were taken as known"
+check "no se acusa como nuevo" no_incident "new SUID binary: /mnt/arx-b49/preexisting-id"
+v install -m 4755 /usr/bin/id /mnt/arx-b49/planted-id
+v systemctl restart arx
+check "un SUID plantado después en ese sistema de ficheros: alerta crítica" \
+  wait_for 90 incident "new SUID binary: /mnt/arx-b49/planted-id"
+v bash -c 'umount /mnt/arx-b49; rm -rf /mnt/arx-b49 /var/tmp/arx-b49.img'
+
 step "intentos denegados (B50): fanotify no los ve; la regla de auditd sí"
 denied_rules() { local out; out=$(v auditctl -l); grep -q "path=/etc/shadow .*key=arx_denied" <<<"$out"; }
 check "precondición: las reglas de aperturas fallidas están en auditd" wait_for 30 denied_rules

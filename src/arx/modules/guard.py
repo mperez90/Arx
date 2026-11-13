@@ -102,6 +102,9 @@ def _integrity_drift(base: dict, include_suid: bool) -> list[dict]:
         baseline.mark_late_watches()
         base.setdefault("meta", {})["late_watches"] = True
     known_suid = (base.get("sets") or {}).get("suid_binaries")
+    if include_suid and "suid_set" in sealed and known_suid is not None:
+        grew, known_suid = _suid_scope_grew(base, known_suid)
+        findings += grew
     for k, v in sealed.items():
         if k == "suid_set":
             if k in now and now[k] != v:
@@ -120,6 +123,35 @@ def _integrity_drift(base: dict, include_suid: bool) -> list[dict]:
             findings.append(_integrity_finding(k, tr("{k} changed since the baseline was sealed", k=k),
                                                f"integrity|cambió {k} desde el sellado de la línea base|{now[k]}"))
     return findings
+
+
+def _suid_scope_grew(base: dict, known: dict) -> tuple[list[dict], dict]:
+    """B49: si el barrido SUID cubre sistemas de ficheros que la base no cubría (una versión anterior solo
+    miraba el raíz, o se montó uno nuevo), lo que ya había allí se adopta y se dice. Se comprueba en cada
+    barrido SUID, cambie o no la huella: si no, un montaje sin SUID nunca entraría en el alcance y lo que se
+    plantara después se tomaría por preexistente."""
+    users = recon.collect_users()
+    scope = users.get("suid_scope")
+    meta = base.setdefault("meta", {})
+    sealed = list(meta.get("suid_scope") or ["/"])
+    added = [m for m in scope or [] if m not in sealed]
+    if not added:
+        return [], known
+
+    def owner(path: str) -> str:
+        return max((m for m in scope if m == "/" or path == m or path.startswith(m.rstrip("/") + "/")), key=len)
+    adopt = sorted(p for p in users.get("suid_binaries") or [] if owner(p) in added and p not in known)
+    meta["suid_scope"] = sealed + added
+    baseline.adopt_suid_scope(meta["suid_scope"], adopt)
+    known = {**known, **{p: 1 for p in adopt}}
+    if not adopt:
+        return [], known
+    return [{"sev": "med", "kind": "suid_scope_added", "set": "suid_binaries", "item": ",".join(added),
+             "detail": tr("Arx now also watches SUID binaries on {mounts}; {n} already there were taken as known: "
+                          "{files}", mounts=", ".join(added), n=len(adopt), files=", ".join(adopt[:10])),
+             "why": tr("they were there before Arx looked at that filesystem: review them; any SUID that appears "
+                       "there from now on is reported as new"),
+             "fp_key": f"suid_scope|{','.join(added)}"}], known
 
 
 def _new_suid(known) -> list[dict]:

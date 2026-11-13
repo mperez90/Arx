@@ -2341,6 +2341,68 @@ class SuidDiffTests(unittest.TestCase):
             self.b.run(seal=True)
         self.assertEqual(self.b.load()["sets"]["suid_binaries"], {"/usr/bin/sudo": 1})
 
+    MOUNTINFO = (
+        "22 1 252:1 / / rw,relatime - ext4 /dev/vda1 rw\n"
+        "30 22 252:2 / /srv rw,relatime - xfs /dev/vdb1 rw\n"
+        "31 22 252:3 / /home rw,nosuid,relatime - ext4 /dev/vdc1 rw\n"           # nosuid: el bit no sirve
+        "32 22 0:40 / /tmp rw,nosuid,nodev - tmpfs tmpfs rw\n"
+        "33 22 0:41 / /opt/ramdisk rw,relatime - tmpfs tmpfs rw\n"               # tmpfs sin nosuid: sí
+        "34 22 0:42 / /var/lib/docker/overlay2/x/merged rw - overlay overlay rw\n"  # contenedor: no
+        "35 22 7:0 / /snap/core22/1 ro,nodev - squashfs /dev/loop0 ro\n"        # snap: no
+        "36 22 252:1 /srv-bind /mnt/bind rw - ext4 /dev/vda1 rw\n"              # mismo dispositivo que «/»
+        "37 22 0:43 / /mnt/nfs rw - nfs4 host:/x rw\n"
+        "38 22 252:4 / /data rw,noexec - ext4 /dev/vdd1 rw\n")
+
+    def test_the_suid_walk_covers_every_filesystem_where_the_bit_gives_privileges(self):
+        """B49: antes solo el raíz (-xdev); un /srv, /opt o /home separado sin nosuid quedaba sin mirar."""
+        self.assertEqual(self.rc.suid_scope(self.MOUNTINFO), ["/", "/srv", "/opt/ramdisk"])
+        self.rc._suid_cache.clear()
+        self.addCleanup(self.rc._suid_cache.clear)
+        found = {"/": "/usr/bin/sudo", "/srv": "/srv/app/helper", "/opt/ramdisk": None}
+        with mock.patch.object(self.rc, "_read", lambda p: self.MOUNTINFO), \
+                mock.patch.object(self.rc, "_run", lambda argv, timeout=10: found[argv[1]]):
+            scope, binaries = self.rc.suid_scan()
+        self.assertEqual(scope, ["/", "/srv"])  # el que no respondió no entra: ni se adopta ni se acusa
+        self.assertEqual(binaries, ["/srv/app/helper", "/usr/bin/sudo"])
+
+    def _sealed(self, known, scope=None):
+        b = self.b.new_baseline()
+        b["meta"]["sealed"] = True
+        if scope:
+            b["meta"]["suid_scope"] = scope
+        b["sets"]["suid_binaries"] = {p: 1 for p in known}
+        b["integrity"] = {"suid_set": self.b._h("\n".join(sorted(known)))}
+        self.b.save(b)
+        return self.b.load()
+
+    def _drift_scan(self, base, scope, binaries):
+        with mock.patch.object(self.rc, "collect_users", lambda: {"suid_scope": scope, "suid_binaries": binaries}), \
+                mock.patch.object(self.b, "integrity_fingerprint", lambda include_suid=True: {
+                    "suid_set": self.b._h("\n".join(sorted(binaries)))}):
+            return self.g._integrity_drift(base, True)
+
+    def test_what_was_already_on_a_newly_watched_filesystem_is_adopted_and_said_not_accused(self):
+        base = self._sealed(["/usr/bin/sudo"])  # base de una versión que solo miraba el raíz
+        out = self._drift_scan(base, ["/", "/srv"], ["/usr/bin/sudo", "/srv/app/helper", "/usr/bin/evil"])
+        self.assertEqual([(f["kind"], f["sev"]) for f in out], [("suid_scope_added", "med"), ("suid_new", "crit")])
+        self.assertIn("/srv/app/helper", out[0]["detail"])
+        self.assertEqual(out[1]["target"]["path"], "/usr/bin/evil")  # lo nuevo del raíz sigue siendo nuevo
+        sealed = self.b.load()
+        self.assertEqual(sealed["meta"]["suid_scope"], ["/", "/srv"])
+        self.assertIn("/srv/app/helper", sealed["sets"]["suid_binaries"])
+        self.assertNotIn("/usr/bin/evil", sealed["sets"]["suid_binaries"])
+        later = self._drift_scan(self.b.load(), ["/", "/srv"],
+                                 ["/usr/bin/sudo", "/srv/app/helper", "/srv/app/planted"])
+        self.assertEqual([f["target"]["path"] for f in later if f["kind"] == "suid_new"], ["/srv/app/planted"])
+
+    def test_a_watched_filesystem_without_suid_cannot_launder_one_planted_later(self):
+        """La huella no cambia si el montaje nuevo no tiene SUID: el alcance se registra igualmente."""
+        base = self._sealed(["/usr/bin/sudo"])
+        self.assertEqual(self._drift_scan(base, ["/", "/srv"], ["/usr/bin/sudo"]), [])
+        self.assertEqual(self.b.load()["meta"]["suid_scope"], ["/", "/srv"])
+        out = self._drift_scan(self.b.load(), ["/", "/srv"], ["/usr/bin/sudo", "/srv/planted"])
+        self.assertEqual([(f["kind"], f["target"]["path"]) for f in out], [("suid_new", "/srv/planted")])
+
 
 class LogVanishedTests(unittest.TestCase):
     def setUp(self):
