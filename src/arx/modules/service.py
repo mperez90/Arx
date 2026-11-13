@@ -369,7 +369,7 @@ def _restart_status() -> dict:
                "result": None, "restarts": None}
     try:
         r = subprocess.run(["systemctl", "show", "arx.service", "--no-pager",
-                            "--property=ActiveState,SubState,Result,NRestarts"],
+                            "--property=ActiveState,SubState,Result,NRestarts,Restart"],
                            capture_output=True, text=True, timeout=5)
     except (OSError, subprocess.TimeoutExpired):
         return unknown
@@ -385,7 +385,10 @@ def _restart_status() -> dict:
         state = "recovered"
     elif sub == "auto-restart" or active == "activating":
         state = "scheduled"
-    elif result == "start-limit-hit":
+    elif result == "start-limit-hit" or (active == "failed" and values.get("Restart") == "always"):
+        # systemd 255 (medido en Ubuntu 24.04): al agotar el límite en reinicios automáticos queda failed y
+        # Result conserva el motivo original; start-limit-hit solo aparece si se rechaza un arranque manual.
+        # Con Restart=always, quedarse en failed tras un fallo solo ocurre cuando systemd deja de reintentar.
         state = "exhausted"
     elif active == "failed" or sub == "failed":
         state = "failed"

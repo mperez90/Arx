@@ -5376,9 +5376,16 @@ class SelfProtectionTests(unittest.TestCase):
              "restart 1 is scheduled in 10 seconds"),
             ("recovered", "ActiveState=active\nSubState=running\nResult=success\nNRestarts=1\n",
              "has already recovered"),
+            # systemd 255 real (Ubuntu 24.04, lab): al agotar el límite en reinicios automáticos queda
+            # failed y Result conserva el motivo original; start-limit-hit solo llega con un arranque manual.
+            ("exhausted", "ActiveState=failed\nSubState=failed\nResult=exit-code\nNRestarts=9\nRestart=always\n",
+             "restart limit is exhausted"),
             ("exhausted", "ActiveState=failed\nSubState=failed\nResult=start-limit-hit\nNRestarts=10\n",
              "restart limit is exhausted"),
             ("failed", "ActiveState=failed\nSubState=failed\nResult=exit-code\nNRestarts=0\n",
+             "remains failed without evidence that the restart limit was exhausted"),
+            # alguien quitó Restart=always: quedarse en failed ya no prueba el agotamiento
+            ("failed", "ActiveState=failed\nSubState=failed\nResult=exit-code\nNRestarts=3\nRestart=no\n",
              "remains failed without evidence that the restart limit was exhausted"),
             ("unknown", "", "restart state is unknown"),
         ]
