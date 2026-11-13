@@ -168,8 +168,7 @@ Read these before you rely on it.
   Arx also checks the package against a fresh copy from its repository, known-malicious databases
   and its install scripts, and watches what the service does and what it starts. sshd running anything
   before authenticating (the xz backdoor's pattern) is frozen on the spot. Still hard: a backdoor that
-  neither starts a program nor talks somewhere new. An intruder who is already root can stop Arx; you
-  get told.
+  neither starts a program nor talks somewhere new.
 - **Confining needs cgroup v2, nftables that can match by cgroup, and systemd.** Without them, Arx
   suspends instead. Tested on Ubuntu 22.04 and 24.04 VMs, across service restarts and reboots.
   Some kernels accept `socket cgroupv2 level 2` but keep rendering `level 0`. Arx detects this with
@@ -187,8 +186,17 @@ Read these before you rely on it.
 - **Without journald, `auth.log` can be forged.** Any local user can write to it with `logger`, and
   that could get an IP blocked for an hour. Hosts with journald, which is nearly all of them, read
   from it instead, where that doesn't work.
-- **Root can stop Arx.** An attacker who is already root can disable the service, and nothing warns
-  you when that happens. A silent Arx isn't proof of a quiet server.
+- **Root can blind Arx.** Stopping or crashing the service sends an alert through your channels, but an
+  attacker who is already root can suppress it: freeze the process, override its unit at runtime, or cut
+  its network first. A silent Arx isn't proof of a quiet server.
+- **Sensitive files: only successful opens are seen.** A read that the kernel denies (a web user trying
+  `/etc/shadow`) never reaches Arx, so the attempt leaves no trace; seeing attempts would need audit rules.
+- **New SUID binaries are found hourly, on the root filesystem only.** Other filesystems mounted without
+  `nosuid` (a separate `/home`, `/var` or `/opt`) aren't walked. `/tmp` as tmpfs is normally `nosuid`,
+  where the bit has no effect.
+- **A suspended reverse shell must still be the same program.** The channel is cut in the kernel by IP and
+  port either way; but if the shell already replaced itself with another program, that process isn't
+  suspended.
 - **Ransomware is only seen through its decoys.** Plant them with `arx canaries plant`. Arx doesn't
   recognize mass encryption itself, and doesn't prevent it.
 - **Locking an account ends everything running under it,** services included, and lists it for you.
