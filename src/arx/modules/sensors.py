@@ -3,7 +3,7 @@
 Detecta y usa lo que haya en el host, con fallback a los colectores base de `recon`:
   · osquery   — consultas SQL al estado del sistema (multiplataforma).
   · auditd    — eventos de syscalls/ficheros (Linux) con reglas PROPIAS de Arx (claves
-                arx_ident / arx_canary), leídos de forma incremental con `--checkpoint`.
+                arx_ident / arx_canary / arx_denied), leídos de forma incremental del propio log.
   · Falco     — comportamiento en kernel/eBPF (Linux); su JSONL se lee por offset.
 
 INCREMENTAL: cada barrido entrega solo los eventos nuevos desde el anterior. El primer
@@ -156,25 +156,154 @@ def ensure_audit_rules(canary_paths: list[str] | None = None) -> bool:
     return True
 
 
-def _ausearch_new(key: str, raw: bool = False) -> list[str]:
-    """Eventos nuevos de una clave, en formato legible (`--format text`) o crudo (todos los campos)."""
-    if not shutil.which("ausearch"):
-        return []
-    ckpt = config.state_dir() / f"ausearch-{key}.ckpt"
-    first = not ckpt.exists()
-    args = ["ausearch", "-k", key, "--checkpoint", str(ckpt), *(["--raw"] if raw else ["--format", "text"])]
-    if first:
-        args += ["-ts", "recent"]
+# Lectura incremental PROPIA del log de auditd. `ausearch --checkpoint` no entrega los eventos nuevos en auditd 4.0
+# (Debian 13, medido: rc=1 y cero líneas con los eventos ya escritos en el log), y Arx dejaba de ver las tres claves.
+# Se sigue el fichero por dispositivo+inodo+desplazamiento, como el JSONL de Falco, y se sobrevive a su rotación.
+AUDIT_CONF = "/etc/audit/auditd.conf"
+AUDIT_LOG = "/var/log/audit/audit.log"
+AUDIT_TAIL_STATE = "audit-tail.json"
+AUDIT_KEYS = ("arx_ident", "arx_canary", DENIED_KEY)
+AUDIT_READ_MAX = 8 << 20   # por barrido: un atasco se drena en varios barridos, no se salta
+AUDIT_QUEUE_MAX = 200      # eventos pendientes por clave
+AUDIT_YOUNG_S = 2.0        # el último evento del fichero, si es así de reciente, puede estar a medio escribir
+_AUDIT_EVENT = re.compile(r"msg=audit\(([\d.]+):(\d+)\)")
+_AUDIT_KEY = re.compile(r' key="([^"]*)"')
+_audit_pending: dict[str, list[list[str]]] = {}
+
+
+def _audit_log_path() -> str:
     try:
-        r = subprocess.run(args, capture_output=True, text=True, timeout=15)
-    except (OSError, subprocess.TimeoutExpired):
+        with open(AUDIT_CONF, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                name, sep, value = line.partition("=")
+                if sep and name.strip() == "log_file" and value.strip():
+                    return value.strip()
+    except OSError:
+        pass
+    return AUDIT_LOG
+
+
+def _audit_save(dev: int, ino: int, off: int) -> None:
+    p = config.state_dir() / AUDIT_TAIL_STATE
+    try:
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"dev": dev, "ino": ino, "off": off}))
+        os.replace(tmp, p)
+    except OSError:
+        pass
+
+
+def _audit_poll(now: float | None = None) -> None:
+    """Lee lo que auditd ha añadido desde la vez anterior y encola los eventos de las claves de Arx. El primer
+    barrido solo fija el punto de partida (no re-emite la historia)."""
+    path = _audit_log_path()
+    try:
+        st = os.stat(path)
+    except OSError:
+        return
+    try:
+        saved = json.loads((config.state_dir() / AUDIT_TAIL_STATE).read_text())
+        saved = (int(saved["dev"]), int(saved["ino"]), int(saved["off"]))
+    except (OSError, ValueError, TypeError, KeyError):
+        for old in config.state_dir().glob("ausearch-*.ckpt"):  # los checkpoints de ausearch ya no se usan
+            old.unlink(missing_ok=True)
+        _audit_save(st.st_dev, st.st_ino, st.st_size)
+        return
+    dev, ino, off = saved
+    segments = []  # (ruta, desde, ¿es el fichero vivo?)
+    if (dev, ino) == (st.st_dev, st.st_ino):
+        segments.append((path, off if off <= st.st_size else 0, True))  # más corto: lo truncaron, desde el principio
+    else:  # rotado: lo que faltaba por leer sigue en el fichero anterior
+        try:
+            old = os.stat(path + ".1")
+            if (old.st_dev, old.st_ino) == (dev, ino):
+                segments.append((path + ".1", min(off, old.st_size), False))
+        except OSError:
+            pass
+        segments.append((path, 0, True))
+    budget, lines, state = AUDIT_READ_MAX, [], None
+    for seg_path, start, live in segments:
+        try:
+            with open(seg_path, "rb") as f:
+                f.seek(start)
+                data = f.read(budget)
+                fst = os.fstat(f.fileno())
+        except OSError:
+            break
+        budget -= len(data)
+        at_end = start + len(data) >= fst.st_size
+        used = len(data) if at_end and not live else data.rfind(b"\n") + 1  # en el vivo, la línea a medias espera
+        pos, seg_lines = start, []
+        for raw in data[:used].split(b"\n")[:-1] if used else []:
+            seg_lines.append((pos, raw.decode("utf-8", "replace")))
+            pos += len(raw) + 1
+        if not live and used and not data[:used].endswith(b"\n"):  # fichero rotado sin salto final
+            seg_lines.append((pos, data[pos - start:used].decode("utf-8", "replace")))
+        end = start + used
+        m = _AUDIT_EVENT.search(seg_lines[-1][1]) if seg_lines and (live or not at_end) else None
+        if m:  # el último evento puede estar incompleto: recién escrito, o cortado por el presupuesto de lectura
+            first = next(i for i, (_, text) in enumerate(seg_lines) if m.group(0) in text)
+            young = live and at_end and (time.time() if now is None else now) - float(m.group(1)) < AUDIT_YOUNG_S
+            if young or (not at_end and first > 0):  # se relee entero en el barrido siguiente
+                end = seg_lines[first][0]
+                seg_lines = seg_lines[:first]
+        lines += [text for _, text in seg_lines]
+        state = (fst.st_dev, fst.st_ino, end)
+        if not at_end or budget <= 0:
+            break
+    if state is None:
+        return
+    keyed: dict[str, str] = {}
+    for text in lines:
+        if text.startswith("type=SYSCALL") and ' key="arx_' in text:
+            k, e = _AUDIT_KEY.search(text), _AUDIT_EVENT.search(text)
+            if k and e and k.group(1) in AUDIT_KEYS:
+                keyed[e.group(0)] = k.group(1)
+    if keyed:
+        grouped: dict[str, list[str]] = {}
+        for text in lines:
+            e = _AUDIT_EVENT.search(text)
+            if e and e.group(0) in keyed:
+                grouped.setdefault(e.group(0), []).append(text)
+        for event_id, records in grouped.items():
+            queue = _audit_pending.setdefault(keyed[event_id], [])
+            queue.append(records)
+            del queue[:-AUDIT_QUEUE_MAX]
+    _audit_save(*state)
+
+
+def _audit_new(key: str) -> list[list[str]]:
+    """Eventos nuevos (cada uno, sus registros crudos) de una clave de Arx."""
+    _audit_poll()
+    return _audit_pending.pop(key, [])
+
+
+def _audit_text(events: list[list[str]]) -> list[str]:
+    """Una línea legible por evento: la de `ausearch --format text` (lee los registros por stdin); sin él, un
+    resumen de los campos."""
+    if not events:
         return []
-    if r.returncode in (10, 11, 12):  # checkpoint inválido (logs rotados): reiniciar
-        ckpt.unlink(missing_ok=True)
-        return []
-    if first or r.returncode != 0:  # rc 1 = sin coincidencias
-        return []
-    return [l.strip() for l in r.stdout.splitlines() if l.strip()]
+    if shutil.which("ausearch"):
+        try:
+            r = subprocess.run(["ausearch", "--format", "text"], input="".join(l + "\n" for ev in events for l in ev),
+                               capture_output=True, text=True, timeout=15)
+            out = [l.strip() for l in r.stdout.splitlines() if l.strip()]
+            if r.returncode == 0 and len(out) == len(events):
+                return out
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    summary = []
+    for ev in events:
+        sc, name = {}, "?"
+        for line in ev:
+            fields = {k: _audit_value(k, v) for k, v in _AUDIT_FIELD.findall(line)}
+            if line.startswith("type=SYSCALL"):
+                sc = fields
+            elif line.startswith("type=PATH") and name == "?" and fields.get("name"):
+                name = fields["name"]
+        summary.append(f"{sc.get('exe', '?')} (pid {sc.get('pid', '?')}, uid {sc.get('uid', '?')}, "
+                       f"success={sc.get('success', '?')}) {name}")
+    return summary
 
 
 _AUDIT_FIELD = re.compile(r'(\w+)=("[^"]*"|\S+)')
@@ -212,7 +341,7 @@ def _unit_of_pid(pid: str) -> str | None:
 def read_denied_opens(lines: list[str] | None = None) -> list[dict]:
     """Intentos DENEGADOS de abrir un fichero sensible (B50): fanotify no los ve; auditd sí."""
     import pwd
-    lines = _ausearch_new(DENIED_KEY, raw=True) if lines is None else lines
+    lines = [line for ev in _audit_new(DENIED_KEY) for line in ev] if lines is None else lines
     events: dict[str, dict] = {}
     for line in lines:
         m = _AUDIT_SERIAL.search(line)
@@ -256,12 +385,12 @@ def read_denied_opens(lines: list[str] | None = None) -> list[dict]:
 
 def read_auditd_events() -> list[dict]:
     events = []
-    for line in _ausearch_new("arx_ident")[-MAX_EVENTS:]:
+    for line in _audit_text(_audit_new("arx_ident")[-MAX_EVENTS:]):
         events.append({"sev": "high", "kind": "auditd", "detail": tr("auditd · identity: {line}",
                                                                      line=line)[:400],
                        "fp_key": "auditd|" + f"auditd · identidad: {line}"[:400],
                        "why": tr("write/attribute change on an identity or privilege file")})
-    for line in _ausearch_new("arx_canary")[-MAX_EVENTS:]:
+    for line in _audit_text(_audit_new("arx_canary")[-MAX_EVENTS:]):
         events.append({"sev": "high", "kind": "canary", "detail": tr("canary accessed · {line}",
                                                                      line=line)[:400],
                        "fp_key": "canary|" + f"señuelo accedido · {line}"[:400],

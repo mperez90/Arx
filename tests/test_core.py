@@ -1563,6 +1563,128 @@ class DeniedSensitiveOpenTests(unittest.TestCase):
         self.assertFalse(any("path=/etc/sudoers" in a for c in calls for a in c))  # ya estaba
 
 
+class AuditLogTailTests(unittest.TestCase):
+    """B50: `ausearch --checkpoint` no entregaba los eventos nuevos en auditd 4.0 (Debian 13, medido); Arx sigue el
+    log de auditd por su cuenta, como el JSONL de Falco: sin historia al empezar, sin perder ni repetir eventos."""
+
+    NOW = 1794571200.0
+
+    def setUp(self):
+        d = _isolate()
+        from arx.modules import sensors
+        self.s = sensors
+        self.log = os.path.join(d, "audit.log")
+        open(self.log, "w").close()
+        for attr, value in (("AUDIT_LOG", self.log), ("AUDIT_CONF", os.path.join(d, "no-auditd.conf"))):
+            p = mock.patch.object(sensors, attr, value)
+            p.start()
+            self.addCleanup(p.stop)
+        p = mock.patch.object(sensors.time, "time", side_effect=lambda: self.now)
+        p.start()
+        self.addCleanup(p.stop)
+        self.now = self.NOW
+        sensors._audit_pending.clear()
+        self.addCleanup(sensors._audit_pending.clear)
+
+    @staticmethod
+    def event(serial, key="arx_denied", name="/etc/shadow", t=1794571000.5, uid=33):
+        """Registros de un evento tal como los escribe auditd 4.0 con log_format=ENRICHED."""
+        a = f"msg=audit({t:.3f}:{serial})"
+        return [f'type=SYSCALL {a}: arch=c00000b7 syscall=56 success=no exit=-13 a0=ffffffffffffff9c items=1 '
+                f'ppid=1 pid={serial} auid=4294967295 uid={uid} gid={uid} comm="cat" exe="/usr/bin/cat" '
+                f'subj=unconfined key="{key}"\x1dARCH=aarch64 SYSCALL=openat AUID="unset" UID="www-data"',
+                f'type=CWD {a}: cwd="/"',
+                f'type=PATH {a}: item=0 name="{name}" inode=1 dev=fe:01 mode=0100640 nametype=NORMAL\x1dOUID="root"',
+                f'type=PROCTITLE {a}: proctitle=636174002F6574632F736861646F77']
+
+    def write(self, lines, end="\n", path=None):
+        with open(path or self.log, "a", encoding="utf-8") as f:
+            f.write("".join(line + "\n" for line in lines[:-1]) + (lines[-1] + end if lines else ""))
+
+    def pids(self):
+        return [e["target"]["pid"] for e in self.s.read_denied_opens()]
+
+    def test_first_sweep_sets_the_start_then_each_new_event_is_reported_once(self):
+        self.write(self.event(100) + ['type=USER_ACCT msg=audit(1794571000.600:101): pid=5 uid=0 res=success'])
+        self.assertEqual(self.pids(), [])  # la historia no se re-emite
+        self.write(self.event(102) + self.event(103, key="otra") + self.event(104, key="arx_ident"))
+        self.assertEqual(self.pids(), [102])
+        self.assertEqual(self.pids(), [])
+        self.assertEqual(len(self.s._audit_new("arx_ident")), 1)  # cada clave, a su lector
+
+    def test_a_line_being_written_and_a_just_written_event_wait_for_the_next_sweep(self):
+        self.pids()
+        ev = self.event(200, t=self.NOW - 0.5)
+        self.write(ev[:2] + [ev[2][:30]], end="")  # PATH a medio escribir
+        self.assertEqual(self.pids(), [])
+        with open(self.log, "a", encoding="utf-8") as f:
+            f.write(ev[2][30:] + "\n" + ev[3] + "\n")
+        self.assertEqual(self.pids(), [])  # completo en disco, pero aún podría faltarle un registro
+        self.now += 5
+        got = self.s.read_denied_opens()
+        self.assertEqual([(e["target"]["pid"], e["target"]["file"]) for e in got], [(200, "/etc/shadow")])
+        self.assertEqual(self.pids(), [])
+
+    def test_rotation_reads_the_rest_of_the_old_file_then_the_new_one(self):
+        self.pids()
+        self.write(self.event(300))
+        os.rename(self.log, self.log + ".1")
+        self.write(self.event(301), path=self.log)
+        self.assertEqual(self.pids(), [300, 301])
+        self.write(self.event(302))
+        self.assertEqual(self.pids(), [302])
+
+    def test_a_truncated_log_is_read_from_the_start(self):
+        self.write(self.event(400) * 3)
+        self.pids()
+        with open(self.log, "w", encoding="utf-8") as f:
+            f.write("".join(line + "\n" for line in self.event(401)))
+        self.assertEqual(self.pids(), [401])
+
+    def test_a_backlog_beyond_the_read_budget_drains_over_sweeps_without_loss_or_repeats(self):
+        self.pids()
+        for serial in range(500, 512):
+            self.write(self.event(serial))
+        seen = []
+        with mock.patch.object(self.s, "AUDIT_READ_MAX", 1500):
+            for _ in range(40):
+                seen += self.pids()
+        self.assertEqual(seen, list(range(500, 512)))
+
+    def test_identity_and_canary_lines_come_from_ausearch_text_over_stdin_or_from_the_fields(self):
+        self.pids()
+        self.write(self.event(600, key="arx_ident", name="/etc/passwd")
+                   + self.event(601, key="arx_canary", name="/root/.aws/credentials"))
+        fed = []
+
+        def fake_run(argv, **kw):
+            fed.append((argv, kw.get("input", "")))
+            n = kw["input"].count("type=SYSCALL")
+            return mock.Mock(returncode=0, stdout="".join(f"At 06:58:40 www-data opened-file #{i}\n"
+                                                          for i in range(n)))
+        with mock.patch.object(self.s.shutil, "which", return_value="/usr/sbin/ausearch"), \
+                mock.patch.object(self.s.subprocess, "run", side_effect=fake_run):
+            got = self.s.read_auditd_events()
+        self.assertEqual([e["kind"] for e in got], ["auditd", "canary"])
+        self.assertIn("opened-file #0", got[0]["detail"])
+        self.assertEqual([argv for argv, _ in fed], [["ausearch", "--format", "text"]] * 2)
+        self.assertIn('name="/etc/passwd"', fed[0][1])
+        self.assertNotIn("-k", fed[0][0])  # nada de buscar en el log ni de checkpoints
+        self.write(self.event(602, key="arx_canary", name="/root/.aws/credentials"))
+        with mock.patch.object(self.s.shutil, "which", return_value=None):
+            got = self.s.read_auditd_events()
+        self.assertEqual(len(got), 1)
+        self.assertIn("/usr/bin/cat", got[0]["detail"])
+        self.assertIn("/root/.aws/credentials", got[0]["detail"])
+
+    def test_log_file_comes_from_auditd_conf(self):
+        conf = os.path.join(os.path.dirname(self.log), "auditd.conf")
+        with open(conf, "w", encoding="utf-8") as f:
+            f.write("# comentario\nlog_format = ENRICHED\nlog_file = /srv/audit/audit.log\n")
+        with mock.patch.object(self.s, "AUDIT_CONF", conf):
+            self.assertEqual(self.s._audit_log_path(), "/srv/audit/audit.log")
+
+
 class RevShellActuatorTests(unittest.TestCase):
     """L6 — bloqueo del canal C2 en nftables + suspensión del proceso dueño (reversibles)."""
 
