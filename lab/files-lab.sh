@@ -33,7 +33,8 @@ v bash -c 'systemctl disable --now arx arx-firewall acme-lib acme-read 2>/dev/nu
     /etc/systemd/system/*.service.d/9[01]-arx-*.conf /etc/systemd/system/arx*.service /etc/systemd/system/arx*.timer
   grep -lsE "inet:arx:|inet arx confined" /etc/systemd/system.control/*.service.d/*.conf | xargs -r rm -f
   nft delete table inet arx 2>/dev/null; systemctl daemon-reload
-  export DEBIAN_FRONTEND=noninteractive; apt-get -o DPkg::Lock::Timeout=300 install -y -qq nftables python3 >/dev/null'
+  export DEBIAN_FRONTEND=noninteractive; apt-get -o DPkg::Lock::Timeout=300 install -y -qq nftables python3 auditd >/dev/null
+  systemctl enable --now auditd >/dev/null 2>&1'
 v bash -c "mkdir -p /tmp/arxsrc && cp -r $PWD/src $PWD/packaging /tmp/arxsrc/ && cd /tmp/arxsrc && packaging/build-deb.sh >/dev/null 2>&1 && dpkg -i ./dist/arx_all.deb >/dev/null 2>&1"
 check "Arx instalado" v arx --version
 v bash -s <<'PREP'
@@ -95,6 +96,19 @@ check "acme-read abre /etc/shadow: se avisa" wait_for 60 incident "acme-read.ser
 check "y el servicio se queda sin salida" wait_for 30 confined acme-read.service
 check "pero sigue en pie" v systemctl is-active -q acme-read
 check "la sesión del usuario que leyó shadow no cuenta" sh -c "! limactl shell $VM sudo grep -q 'session.*opened /etc/shadow' /var/lib/arx/incidents.jsonl"
+
+step "intentos denegados (B50): fanotify no los ve; la regla de auditd sí"
+denied_rules() { local out; out=$(v auditctl -l); grep -q "path=/etc/shadow .*key=arx_denied" <<<"$out"; }
+check "precondición: las reglas de aperturas fallidas están en auditd" wait_for 30 denied_rules
+limactl shell "$VM" cat /etc/shadow >/dev/null 2>&1   # el usuario de la sesión olvidó sudo: denegado, no cuenta
+v systemd-run --quiet --wait --uid=nobody --unit=acme-deny sh -c 'cat /etc/shadow >/dev/null 2>&1; true'
+check "un servicio como nobody que intenta leer /etc/shadow: se avisa" \
+  wait_for 75 incident "nobody tried to open /etc/shadow and the kernel denied it (/usr/bin/cat"
+SESSION_USER=$(limactl shell "$VM" id -un | tr -d '[:space:]')
+check "el intento desde una sesión de login no cuenta" \
+  sh -c "! limactl shell $VM sudo grep -q '$SESSION_USER tried to open /etc/shadow' /var/lib/arx/incidents.jsonl"
+check "una lectura permitida no se cuenta como denegada" \
+  sh -c "! limactl shell $VM sudo grep -q 'root tried to open' /var/lib/arx/incidents.jsonl"
 
 v bash -c 'systemctl disable --now acme-lib acme-read >/dev/null 2>&1; rm -f /dev/shm/evil.so /tmp/acme-lib-flag /tmp/acme-read-flag'
 echo

@@ -828,6 +828,12 @@ ES = {
         "escritura/cambio de atributos en un fichero de identidad o privilegios",
     "canary accessed · {line}":
         "señuelo accedido · {line}",
+    "{who} tried to open {file} and the kernel denied it ({exe}, pid {pid}{unit})":
+        "{who} intentó abrir {file} y el kernel se lo denegó ({exe}, pid {pid}{unit})",
+    "a process reaching for passwords or keys it may not read is what an intruder probing the host does; "
+    "the kernel stopped it, Arx tells you":
+        "un proceso que busca contraseñas o llaves que no puede leer es lo que hace un intruso tanteando el "
+        "host; el kernel lo paró, Arx te lo dice",
     "nobody legitimate opens a honeytoken: the access came from the process shown":
         "nadie legítimo abre un honeytoken: el acceso lo hizo el proceso indicado",
     "{path} was truncated (same inode, smaller size)":

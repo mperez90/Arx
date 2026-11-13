@@ -121,6 +121,18 @@ def _is_root() -> bool:
     return hasattr(os, "geteuid") and os.geteuid() == 0
 
 
+# B50: fanotify solo ve las aperturas que el kernel permite (la comprobación de permisos va antes del evento).
+# Una regla de syscall de auditd sí registra el intento denegado sobre el propio fichero.
+DENIED_KEY = "arx_denied"
+DENIED_SYSCALLS = ("openat", "open", "openat2")  # no todas existen en cada arquitectura: cada una se prueba
+DENIED_MAX_PATHS = 64
+
+
+def _audit_arch() -> str:
+    import sys
+    return "b64" if sys.maxsize > 2 ** 32 else "b32"
+
+
 def ensure_audit_rules(canary_paths: list[str] | None = None) -> bool:
     """Instala (idempotente) las reglas de Arx en auditd. Requiere root + auditctl."""
     if not (_is_root() and shutil.which("auditctl")):
@@ -133,16 +145,24 @@ def ensure_audit_rules(canary_paths: list[str] | None = None) -> bool:
             continue
         subprocess.run(["auditctl", "-w", path, "-p", perm, "-k", key],
                        capture_output=True, text=True, timeout=10)
+    from arx.modules import filewatch  # perezoso: los mismos ficheros que vigila fanotify
+    for path in filewatch.sensitive_files()[:DENIED_MAX_PATHS]:
+        if any(f"path={path} " in f"{line} " and f"key={DENIED_KEY}" in line for line in current.splitlines()):
+            continue
+        for syscall in DENIED_SYSCALLS:
+            subprocess.run(["auditctl", "-a", "always,exit", "-F", f"arch={_audit_arch()}", "-S", syscall,
+                            "-F", f"path={path}", "-F", "success=0", "-k", DENIED_KEY],
+                           capture_output=True, text=True, timeout=10)
     return True
 
 
-def _ausearch_new(key: str) -> list[str]:
-    """Eventos nuevos de una clave, en formato legible (`--format text`)."""
+def _ausearch_new(key: str, raw: bool = False) -> list[str]:
+    """Eventos nuevos de una clave, en formato legible (`--format text`) o crudo (todos los campos)."""
     if not shutil.which("ausearch"):
         return []
     ckpt = config.state_dir() / f"ausearch-{key}.ckpt"
     first = not ckpt.exists()
-    args = ["ausearch", "-k", key, "--checkpoint", str(ckpt), "--format", "text"]
+    args = ["ausearch", "-k", key, "--checkpoint", str(ckpt), *(["--raw"] if raw else ["--format", "text"])]
     if first:
         args += ["-ts", "recent"]
     try:
@@ -155,6 +175,83 @@ def _ausearch_new(key: str) -> list[str]:
     if first or r.returncode != 0:  # rc 1 = sin coincidencias
         return []
     return [l.strip() for l in r.stdout.splitlines() if l.strip()]
+
+
+_AUDIT_FIELD = re.compile(r'(\w+)=("[^"]*"|\S+)')
+_AUDIT_SERIAL = re.compile(r"msg=audit\([\d.]+:(\d+)\)")
+
+
+_AUDIT_HEX_FIELDS = {"name", "cwd", "exe", "comm", "proctitle"}
+
+
+def _audit_value(key: str, value: str) -> str:
+    """auditd cita los valores normales y codifica en hexadecimal, solo en campos de texto (rutas, nombres),
+    los que llevan espacios o bytes raros. Un pid o un uid son números: nunca se decodifican."""
+    if value.startswith('"'):
+        return value.strip('"')
+    if key in _AUDIT_HEX_FIELDS and len(value) % 2 == 0 and re.fullmatch(r"(?:[0-9A-F]{2})+", value):
+        try:
+            return bytes.fromhex(value).decode("utf-8", "replace")
+        except ValueError:
+            return value
+    return value
+
+
+def _unit_of_pid(pid: str) -> str | None:
+    try:
+        with open(f"/proc/{int(pid)}/cgroup", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("0::"):
+                    last = line.strip()[3:].rsplit("/", 1)[-1]
+                    return last if last.endswith(".service") else None
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def read_denied_opens(lines: list[str] | None = None) -> list[dict]:
+    """Intentos DENEGADOS de abrir un fichero sensible (B50): fanotify no los ve; auditd sí."""
+    import pwd
+    lines = _ausearch_new(DENIED_KEY, raw=True) if lines is None else lines
+    events: dict[str, dict] = {}
+    for line in lines:
+        m = _AUDIT_SERIAL.search(line)
+        if not m:
+            continue
+        rec = events.setdefault(m.group(1), {"syscall": None, "names": [], "cwd": ""})
+        fields = {k: _audit_value(k, v) for k, v in _AUDIT_FIELD.findall(line)}
+        if line.startswith("type=SYSCALL"):
+            rec["syscall"] = fields
+        elif line.startswith("type=PATH") and fields.get("name"):
+            rec["names"].append(fields["name"])
+        elif line.startswith("type=CWD"):
+            rec["cwd"] = fields.get("cwd", "")
+    out = []
+    for rec in events.values():
+        sc = rec["syscall"]
+        # root no es la señal (puede leerlo todo), lo permitido ya lo cuenta fanotify, y una sesión de login (auid
+        # puesto: un admin que olvidó sudo) no cuenta, como en filewatch: solo servicios y lo que lanzan
+        if not sc or sc.get("success") != "no" or sc.get("uid") in (None, "0") \
+                or sc.get("auid", "4294967295") not in ("4294967295", "-1"):
+            continue
+        name = rec["names"][0] if rec["names"] else "?"
+        path = name if name.startswith("/") or not rec["cwd"] else os.path.join(rec["cwd"], name)
+        uid, pid, exe = sc.get("uid", "?"), sc.get("pid", "?"), sc.get("exe", "?")
+        try:
+            who = pwd.getpwuid(int(uid)).pw_name
+        except (KeyError, ValueError):
+            who = f"uid {uid}"
+        unit = _unit_of_pid(pid)
+        out.append({
+            "sev": "high", "kind": "sensitive_denied",
+            "detail": tr("{who} tried to open {file} and the kernel denied it ({exe}, pid {pid}{unit})",
+                         who=who, file=path, exe=exe, pid=pid, unit=f", {unit}" if unit else ""),
+            "why": tr("a process reaching for passwords or keys it may not read is what an intruder probing "
+                      "the host does; the kernel stopped it, Arx tells you"),
+            "target": {"pid": int(pid) if str(pid).isdigit() else None, "exe": exe, "file": path, "uid": uid,
+                       **({"unit": unit} if unit else {})},
+            "fp_key": f"sensitive_denied|{exe}|{path}|{uid}"})
+    return out[-MAX_EVENTS:]
 
 
 def read_auditd_events() -> list[dict]:
@@ -175,7 +272,7 @@ def read_auditd_events() -> list[dict]:
 
 def collect_events() -> list[dict]:
     """Todos los eventos NUEVOS de sensores disponibles, normalizados."""
-    return (read_falco_events() + read_auditd_events() + read_auth_log()
+    return (read_falco_events() + read_auditd_events() + read_denied_opens() + read_auth_log()
             + detect_port_scan() + detect_reverse_shell())
 
 

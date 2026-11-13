@@ -1500,6 +1500,69 @@ class ReverseShellSensorTests(unittest.TestCase):
         self.assertEqual(a["fp_key"], b["fp_key"])
 
 
+class DeniedSensitiveOpenTests(unittest.TestCase):
+    """B50: fanotify no ve una apertura que el kernel deniega; una regla de syscall de auditd sí."""
+
+    RAW = [
+        'type=PROCTITLE msg=audit(1794560000.101:501): proctitle=636174002F6574632F736861646F77',
+        'type=PATH msg=audit(1794560000.101:501): item=0 name="/etc/shadow" inode=1234 dev=fe:01 mode=0100640 '
+        'ouid=0 ogid=42 rdev=00:00 nametype=NORMAL',
+        'type=CWD msg=audit(1794560000.101:501): cwd="/var/www"',
+        'type=SYSCALL msg=audit(1794560000.101:501): arch=c00000b7 syscall=56 success=no exit=-13 a0=ffffff9c '
+        'items=1 ppid=900 pid=4242 auid=4294967295 uid=33 gid=33 euid=33 comm="cat" exe="/usr/bin/cat" '
+        'key="arx_denied"',
+        # relativo, en hexadecimal (lleva un espacio) y con el cwd del proceso
+        'type=PATH msg=audit(1794560001.202:502): item=0 name=7072697661746520692E6B6579 nametype=NORMAL',
+        'type=CWD msg=audit(1794560001.202:502): cwd="/etc/ssl/private"',
+        'type=SYSCALL msg=audit(1794560001.202:502): arch=c00000b7 syscall=56 success=no exit=-13 pid=4300 '
+        'uid=1001 comm="python3" exe="/usr/bin/python3.12" key="arx_denied"',
+        # root no es la señal, y lo permitido ya lo cuenta fanotify
+        'type=PATH msg=audit(1794560002.303:503): item=0 name="/etc/shadow" nametype=NORMAL',
+        'type=SYSCALL msg=audit(1794560002.303:503): success=no exit=-13 pid=1 uid=0 exe="/usr/sbin/x"',
+        'type=PATH msg=audit(1794560003.404:504): item=0 name="/etc/shadow" nametype=NORMAL',
+        'type=SYSCALL msg=audit(1794560003.404:504): success=yes exit=3 pid=77 uid=33 exe="/usr/bin/cat"',
+        # un admin que olvidó sudo desde su sesión (auid puesto): no es un servicio, no cuenta
+        'type=PATH msg=audit(1794560004.505:505): item=0 name="/etc/shadow" nametype=NORMAL',
+        'type=SYSCALL msg=audit(1794560004.505:505): success=no exit=-13 pid=88 auid=1000 uid=1000 '
+        'exe="/usr/bin/cat"',
+    ]
+
+    def setUp(self):
+        _isolate()
+        from arx.modules import sensors
+        self.s = sensors
+
+    def test_a_denied_open_of_a_sensitive_file_is_reported_with_who_and_what(self):
+        ev = self.s.read_denied_opens(self.RAW)
+        self.assertEqual([e["target"]["file"] for e in ev], ["/etc/shadow", "/etc/ssl/private/private i.key"])
+        first = ev[0]
+        self.assertEqual((first["kind"], first["sev"]), ("sensitive_denied", "high"))
+        self.assertEqual(first["target"]["exe"], "/usr/bin/cat")
+        self.assertEqual(first["target"]["pid"], 4242)
+        self.assertIn("/etc/shadow", first["detail"])
+        self.assertEqual(first["fp_key"], "sensitive_denied|/usr/bin/cat|/etc/shadow|33")
+        from arx.modules import response
+        self.assertEqual(response.classify(first)["tier"], 0)  # sin proceso vivo que atribuir: se avisa
+
+    def test_rules_cover_each_sensitive_file_only_for_failed_opens_and_are_idempotent(self):
+        calls = []
+        with mock.patch.object(self.s, "_is_root", return_value=True), \
+                mock.patch.object(self.s.shutil, "which", lambda name: "/usr/sbin/" + name), \
+                mock.patch.object(self.s.os.path, "exists", return_value=False), \
+                mock.patch("arx.modules.filewatch.sensitive_files", return_value=["/etc/shadow", "/etc/sudoers"]), \
+                mock.patch.object(self.s.recon, "_run",
+                                  return_value="-a always,exit -F arch=b64 -S openat -F path=/etc/sudoers "
+                                               "-F success=0 -F key=arx_denied\n"), \
+                mock.patch.object(self.s.subprocess, "run", side_effect=lambda argv, **k: calls.append(argv)):
+            self.assertTrue(self.s.ensure_audit_rules([]))
+        self.assertEqual([c[c.index("-S") + 1] for c in calls], ["openat", "open", "openat2"])
+        for argv in calls:
+            self.assertIn("path=/etc/shadow", argv)
+            self.assertIn("success=0", argv)
+            self.assertEqual(argv[-2:], ["-k", "arx_denied"])
+        self.assertFalse(any("path=/etc/sudoers" in a for c in calls for a in c))  # ya estaba
+
+
 class RevShellActuatorTests(unittest.TestCase):
     """L6 — bloqueo del canal C2 en nftables + suspensión del proceso dueño (reversibles)."""
 
