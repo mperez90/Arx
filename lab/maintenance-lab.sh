@@ -285,7 +285,11 @@ PY
 
 step "control: la misma presión dentro de arx.service agota su memcg"
 CONTROL_START=$(v date +%s | tr -d '[:space:]')
-v python3 - control >/tmp/arx-maintenance-control.log 2>&1 <<'PY' || true
+svc_high() { v awk '$1 == "high" {print $2}' /sys/fs/cgroup/system.slice/arx.service/memory.events 2>/dev/null | tr -d '[:space:]'; }
+H0=$(svc_high)
+# Con plazo: en Debian 6.12 el kernel mata a los ~2 min; en Ubuntu 6.8 MemoryHigh la estrangula durante decenas de
+# minutos sin llegar a MemoryMax. Ambos son el modo de fallo antiguo: el guardián comparte esa presión.
+v timeout -s KILL 240 python3 - control >/tmp/arx-maintenance-control.log 2>&1 <<'PY' || true
 import os, sys, time
 with open("/sys/fs/cgroup/system.slice/arx.service/cgroup.procs", "w") as f:
     f.write(str(os.getpid()))
@@ -295,10 +299,19 @@ for i in range(0, len(data), 4096):
 time.sleep(2)
 PY
 kernel_oom() { v sh -c "journalctl -k --no-pager --since '@$CONTROL_START'" | grep -q 'Memory cgroup out of memory'; }
-check "el kernel registra el OOM de control en el memcg de Arx" wait_for 30 kernel_oom
+throttled() { local h1; h1=$(svc_high); [ $(( ${h1:-0} - ${H0:-0} )) -ge 1000 ]; }
+if wait_for 30 kernel_oom; then
+  pass "la presión dentro de arx.service la mata el kernel en el memcg de Arx (OOM)"
+elif throttled; then
+  pass "la presión dentro de arx.service queda estrangulada en el memcg de Arx ($(( $(svc_high) - ${H0:-0} )) eventos high, sin OOM en 240 s)"
+else
+  fail "la presión de control no afectó al memcg de Arx"
+fi
+# El control puede haber dejado al guardián estrangulado o caído: las mediciones parten de uno limpio.
 v systemctl reset-failed arx >/dev/null 2>&1
-v systemctl start arx >/dev/null 2>&1
+v systemctl restart arx >/dev/null 2>&1
 check "Arx queda activo para las mediciones" wait_for 40 v systemctl is-active -q arx
+check "con los dos watchers otra vez en marcha" wait_for 45 watch_ready
 INV=$(v systemctl show arx -p InvocationID --value | tr -d '[:space:]')
 
 step "APT/dpkg reales nacen en el slice hermano"
@@ -495,25 +508,33 @@ check "investigación: no queda ningún scope" wait_for 20 no_scopes
 step "la presión aislada mata al auxiliar, no al guardián"
 guard_oom() { v awk '$1 == "oom_kill" {print $2}' /sys/fs/cgroup/system.slice/arx.service/memory.events 2>/dev/null | tr -d '[:space:]'; }
 maint_oom() { v awk '$1 == "oom_kill" {print $2}' /sys/fs/cgroup/arx.slice/arx-maintenance.slice/memory.events 2>/dev/null | tr -d '[:space:]'; }
-G0=$(guard_oom); M0=$(maint_oom)
-check "640 MiB exceden el presupuesto del auxiliar aislado" v python3 - <<'PY'
-import os, sys
+maint_high() { v awk '$1 == "high" {print $2}' /sys/fs/cgroup/arx.slice/arx-maintenance.slice/memory.events 2>/dev/null | tr -d '[:space:]'; }
+INV=$(inv)
+G0=$(guard_oom); M0=$(maint_oom); MH0=$(maint_high)
+check "640 MiB no caben: el presupuesto del slice para al auxiliar (OOM o, estrangulado, su timeout)" v python3 - <<'PY'
+import os, subprocess, sys, time
 with open("/sys/fs/cgroup/system.slice/arx.service/cgroup.procs", "w") as f:
     f.write(str(os.getpid()))
 sys.path.insert(0, "/usr/lib/arx/arx.pyz")
 from arx.modules import maintenance
-r = maintenance.run(["/tmp/arx-maintenance-lab/dpkg", "allocate", "/tmp/arx-maintenance-lab/isolated-oom.json"],
-                    timeout=300)
-print("isolated_oom_returncode=", r.returncode)
-assert r.returncode != 0, "the memory limit did not stop the allocator"
+start = time.monotonic()
+try:
+    r = maintenance.run(["/tmp/arx-maintenance-lab/dpkg", "allocate", "/tmp/arx-maintenance-lab/isolated-oom.json"],
+                        timeout=300)
+    print("isolated_returncode=", r.returncode, "elapsed_s=", round(time.monotonic() - start, 1))
+    assert r.returncode != 0, "the memory limit did not stop the allocator"
+except subprocess.TimeoutExpired:
+    print("isolated_timeout_s=", round(time.monotonic() - start, 1), "(estrangulado bajo MemoryHigh; scope detenido)")
 PY
-G1=$(guard_oom); M1=$(maint_oom)
-echo "  oom_kill arx.service: ${G0:-0} → ${G1:-0} · arx-maintenance.slice: ${M0:-0} → ${M1:-0}"
-check "el OOM pertenece al slice de mantenimiento" test "${M1:-0}" -gt "${M0:-0}"
+G1=$(guard_oom); M1=$(maint_oom); MH1=$(maint_high)
+echo "  oom_kill arx.service: ${G0:-0} → ${G1:-0} · arx-maintenance.slice: ${M0:-0} → ${M1:-0} · high del slice: ${MH0:-0} → ${MH1:-0}"
+check "la presión cayó en el slice de mantenimiento (OOM o estrangulamiento allí)" \
+  test "${M1:-0}" -gt "${M0:-0}" -o $(( ${MH1:-0} - ${MH0:-0} )) -ge 1000
 check "no suma otro OOM al memcg de Arx" test "${G1:-0}" = "${G0:-0}"
 check "el guardián conserva el mismo InvocationID" test "$(v systemctl show arx -p InvocationID --value | tr -d '[:space:]')" = "$INV"
 check "y sigue activo" v systemctl is-active -q arx
 check "sin scopes huérfanos al terminar" wait_for 20 no_scopes
+check "el guardián sigue vigilando con los dos watchers" watch_ready
 v sh -c 'pid=$(systemctl show -p MainPID --value arx); s=/sys/fs/cgroup/system.slice/arx.service; m=/sys/fs/cgroup/arx.slice/arx-maintenance.slice
   echo "  guardián: $(grep VmRSS /proc/$pid/status) · hilos $(ls /proc/$pid/task | wc -l) · arx.service memory.current $(cat $s/memory.current) B"
   echo "  arx-maintenance.slice: memory.current $(cat $m/memory.current) B · $(grep -E "^Memory(High|Max)=" /etc/systemd/system/arx-maintenance.slice | tr "\n" " ")"
