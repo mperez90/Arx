@@ -1550,6 +1550,38 @@ class RevShellActuatorTests(unittest.TestCase):
                          [{"tool": "nft_c2", "ip": "10.0.0.2", "port": 4444},
                           {"tool": "sigstop", "exe": "/bin/bash", "pids": [4242]}])
 
+    def test_a_shell_that_became_another_program_is_still_suspended_by_its_birth(self):
+        """B52: `exec python3 …` conservando el socket. Con su nacimiento, el dueño del canal se sigue aunque
+        /proc/<pid>/exe ya no sea la shell; un PID reutilizado (otro nacimiento) no se toca."""
+        import signal
+        from arx.modules import execwatch
+        births = {4242: 777, 5151: 900}
+        self._patch(execwatch, "_stat", lambda pid: (1, births[pid]) if pid in births else None)
+        self._patch(self.r.os, "readlink", lambda p: "/usr/bin/python3.12")  # ya no es la shell
+        f = self._rev(pids=(4242, 5151))
+        f["target"]["births"] = {"4242": 777, "5151": 123}  # 5151 lo reutilizó otro proceso
+        o = self.r.handle(f, enforce=True, cfg={})
+        self.assertEqual(self.kills, [(4242, signal.SIGSTOP)])
+        self.assertIn("suspendido", o["status"])
+        sig = [b["revert"] for b in self.r._load_blocks() if b["revert"].get("tool") == "sigstop"]
+        self.assertEqual(sig, [{"tool": "sigstop", "exe": "/bin/bash", "pids": [4242], "births": {"4242": 777}}])
+        self.kills.clear()
+        self.r._apply_revert(sig[0])
+        self.assertEqual(self.kills, [(4242, signal.SIGCONT)])  # mismo nacimiento, aunque sea otro programa
+        births[4242] = 778  # el pid ya es de otro proceso
+        self.kills.clear()
+        self.r._apply_revert(sig[0])
+        self.assertEqual(self.kills, [])
+
+    def test_the_detector_records_each_owners_birth(self):
+        from arx.modules import execwatch, sensors
+        owners = [{"exe": "/usr/bin/bash", "remote_ip": "203.0.113.9", "remote_port": 4444, "local_port": 51000,
+                   "state": "ESTABLISHED", "pid": 4242}]
+        with mock.patch.object(execwatch, "_stat", lambda pid: (1, 777)), \
+                mock.patch.object(sensors.recon, "local_ips", lambda: {"10.0.0.9"}):
+            ev = sensors.detect_reverse_shell(owners=owners, listen_ports=set())
+        self.assertEqual(ev[0]["target"]["births"], {"4242": 777})
+
     def test_never_uses_ss_kill(self):
         """`ss -K` destruye el socket (irreversible, prohibido en Tier 1) y puede devolver
         rc=0 sin cortar nada si el kernel no trae INET_DIAG_DESTROY."""

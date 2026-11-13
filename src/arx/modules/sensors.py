@@ -487,16 +487,19 @@ def detect_reverse_shell(owners: list[dict] | None = None,
             continue
         # un canal, todos sus dueños: un hijo que hereda el socket también debe suspenderse
         channels.setdefault((exe, ip, c.get("remote_port")), []).append(c.get("pid"))
+    from arx.modules import execwatch  # perezoso: el nacimiento distingue al dueño de un pid reutilizado
     events: list[dict] = []
     for (exe, ip, port), pids in channels.items():
         pids = sorted({p for p in pids if isinstance(p, int)})
+        # B52: con su nacimiento, la respuesta sigue al dueño aunque haga exec a otro programa con el socket
+        births = {str(p): st[1] for p in pids if (st := execwatch._stat(p))}
         events.append({
             "sev": "crit", "kind": "reverse_shell",
             "detail": tr("shell with an outbound connection: {exe} → {ip}:{port} (pid {v})",
                          exe=exe, ip=ip, port=port, v=', '.join(map(str, pids)) or '?'),
             "why": tr("a shell owning an outbound network socket is the C2 signature of a reverse "
                       "shell: nobody legitimate does this"),
-            "target": {"ip": ip, "port": port, "exe": exe, "pids": pids},
+            "target": {"ip": ip, "port": port, "exe": exe, "pids": pids, **({"births": births} if births else {})},
             # la huella no incluye el pid (cambia entre barridos); el canal C2 sí es estable
             "fp_key": f"reverse_shell|{exe}|{ip}:{port}",
         })

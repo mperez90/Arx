@@ -453,13 +453,21 @@ def _apply_revert(revert) -> str | None:
         if not (isinstance(exe, str) and exe.startswith("/") and isinstance(pids, list)
                 and all(isinstance(p, int) and p > 1 for p in pids)):
             return None
+        from arx.modules import execwatch  # perezoso
+        births = revert.get("births") if isinstance(revert.get("births"), dict) else {}
         done = 0
         for pid in pids:
             try:
-                # anti reutilización de PID: solo SIGCONT si sigue siendo el mismo binario
-                if os.readlink(f"/proc/{pid}/exe").removesuffix(" (deleted)") == exe:
-                    os.kill(pid, signal.SIGCONT)
-                    done += 1
+                start = births.get(str(pid))
+                if isinstance(start, int):  # el mismo proceso, aunque haya cambiado de programa (B52)
+                    st = execwatch._stat(pid)
+                    if not st or st[1] != start:
+                        continue
+                # anti reutilización de PID sin nacimiento: solo SIGCONT si sigue siendo el mismo binario
+                elif os.readlink(f"/proc/{pid}/exe").removesuffix(" (deleted)") != exe:
+                    continue
+                os.kill(pid, signal.SIGCONT)
+                done += 1
             except OSError:
                 continue
         return tr("SIGCONT to {done} process(es) of {exe}", done=done, exe=exe)
@@ -2540,21 +2548,30 @@ def _execute_tier1(finding: dict, cfg: dict | None = None) -> tuple[str, dict | 
                 actions.append(tr("C2 channel cut in nftables ({ip}:{port})", ip=ip, port=port))
         if not reverts:
             actions.append(tr("the C2 channel IS STILL OPEN (no usable nftables)"))
-        # 2) suspender SOLO el proceso dueño; anti reutilización de PID: solo si
-        #    /proc/<pid>/exe sigue siendo el mismo binario (nunca se suspende por nombre).
-        stopped = []
+        # 2) suspender SOLO el proceso dueño, nunca por nombre. Con su nacimiento (pid, inicio) es el mismo
+        #    proceso aunque ya haya hecho exec a otro programa conservando el socket (B52); sin él (un target
+        #    antiguo), solo si /proc/<pid>/exe sigue siendo el mismo binario.
+        from arx.modules import execwatch  # perezoso
+        births = target.get("births") if isinstance(target.get("births"), dict) else {}
+        stopped, kept = [], {}
         if exe.startswith("/"):
             for pid in target.get("pids") or []:
                 if not (isinstance(pid, int) and pid > 1 and pid != os.getpid()):
                     continue
+                start = births.get(str(pid))
                 try:
-                    if os.readlink(f"/proc/{pid}/exe").removesuffix(" (deleted)") == exe:
-                        os.kill(pid, signal.SIGSTOP)
-                        stopped.append(pid)
+                    if isinstance(start, int):
+                        if not execwatch.exe_now_if_same_birth(pid, start):
+                            continue
+                        kept[str(pid)] = start
+                    elif os.readlink(f"/proc/{pid}/exe").removesuffix(" (deleted)") != exe:
+                        continue
+                    os.kill(pid, signal.SIGSTOP)
+                    stopped.append(pid)
                 except OSError:
                     continue
         if stopped:
-            reverts.append({"tool": "sigstop", "exe": exe, "pids": stopped})
+            reverts.append({"tool": "sigstop", "exe": exe, "pids": stopped, **({"births": kept} if kept else {})})
             actions.append(tr("owning process suspended ({n} pid)", n=len(stopped)))
         else:
             actions.append(tr("no live process to suspend"))
