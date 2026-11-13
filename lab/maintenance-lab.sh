@@ -61,7 +61,8 @@ clean_victim() {
   v bash -c 'rm -f /run/systemd/system/arx.service.d/zz-lab-*.conf; systemctl daemon-reload
   systemctl disable --now arx arx-firewall arx-revive.timer 2>/dev/null; pkill -9 -f "[a]rx.pyz"
   systemctl list-units --type=scope --all --plain --no-legend 2>/dev/null | awk '\''$1 ~ /^arx-maint-.*\.scope$/ {print $1}'\'' | xargs -r systemctl stop
-  dpkg --configure -a >/dev/null 2>&1; apt-get -o DPkg::Lock::Timeout=300 purge -y -qq arx >/dev/null 2>&1
+  dpkg --configure -a >/dev/null 2>&1; dpkg --purge arx-b71-other >/dev/null 2>&1
+  apt-get -o DPkg::Lock::Timeout=300 purge -y -qq arx >/dev/null 2>&1
   rm -rf /etc/arx /var/lib/arx /tmp/arx-maintenance-lab /run/arx /etc/systemd/system/arx*.service \
     /etc/systemd/system/arx*.timer /etc/systemd/system/arx*.slice /etc/systemd/system/*.service.d/9[01]-arx-*.conf
   grep -lsE "inet:arx:|inet arx confined" /etc/systemd/system.control/*.service.d/*.conf 2>/dev/null | xargs -r rm -f
@@ -112,6 +113,36 @@ assert b"MemoryMax=512M" in data, data
 assert json.load(open("/var/lib/arx/self.json"))[path] == hashlib.sha256(data).hexdigest()
 PY
 check "no quedan marcas de la actualización" v sh -c 'test ! -e /run/arx/package-upgrade-active && test ! -e /run/arx/planned-stop'
+
+step "una actualización desde v0.0.8rc5 que falla al desempaquetar deja a Arx en marcha (B71)"
+clean_victim
+v dpkg -i /tmp/arxold/dist/arx_all.deb >/dev/null 2>&1
+put_on_guard
+check "la v0.0.8rc5 está de guardia" wait_for 30 v systemctl is-active -q arx
+INV_B71=$(inv)
+check "y terminó de arrancar" wait_for 45 sh -c "limactl shell '$VM' sudo journalctl --no-pager -o cat _SYSTEMD_INVOCATION_ID='$INV_B71' | grep -q 'Arx on guard'"
+INC_B71=$(incidents_count)
+# Otro paquete posee un fichero que la RC también trae: dpkg aborta el unpack. El .deb de la RC se reempaqueta con
+# ese fichero; sus maintainer scripts son los mismos.
+v bash -c 'set -e; rm -rf /tmp/b71 && mkdir -p /tmp/b71/other/DEBIAN /tmp/b71/other/usr/share/arx-b71
+  printf "Package: arx-b71-other\nVersion: 1\nArchitecture: all\nMaintainer: lab <lab@example.invalid>\nDescription: B71\n" \
+    > /tmp/b71/other/DEBIAN/control
+  echo other > /tmp/b71/other/usr/share/arx-b71/conflict
+  dpkg-deb --root-owner-group -b /tmp/b71/other /tmp/b71/other.deb >/dev/null && dpkg -i /tmp/b71/other.deb >/dev/null
+  dpkg-deb -R /tmp/arxsrc/dist/arx_all.deb /tmp/b71/arx && mkdir -p /tmp/b71/arx/usr/share/arx-b71
+  echo arx > /tmp/b71/arx/usr/share/arx-b71/conflict
+  dpkg-deb --root-owner-group -b /tmp/b71/arx /tmp/b71/arx.deb >/dev/null'
+check "dpkg aborta la actualización (fichero de otro paquete)" \
+  sh -c "! limactl shell '$VM' sudo dpkg -i /tmp/b71/arx.deb >/dev/null 2>&1"
+check "sigue instalada la 0.0.8~rc5" \
+  sh -c "limactl shell '$VM' sudo dpkg-query -W -f='\${Version} \${Status}' arx | grep -qx '0.0.8~rc5 install ok installed'"
+check "Arx vuelve a estar activo tras el abort (antes se quedaba parado y sin aviso)" wait_for 30 v systemctl is-active -q arx
+INV_B71B=$(inv)
+check "es un proceso nuevo, del archive anterior y sin errores de zipimport" \
+  sh -c "[ -n '$INV_B71B' ] && [ '$INV_B71B' != '$INV_B71' ] && ! limactl shell '$VM' sudo journalctl --no-pager -o cat _SYSTEMD_INVOCATION_ID='$INV_B71B' | grep -qE 'ZipImportError|bad local file header'"
+check "no quedan marcas de la operación" v sh -c 'test ! -e /run/arx/package-upgrade-active && test ! -e /run/arx/planned-stop'
+check "y la parada planeada no dejó un self_stopped espurio" no_self_stopped_since "$INC_B71"
+v bash -c 'dpkg --purge arx-b71-other >/dev/null 2>&1; rm -rf /tmp/b71'
 
 step "víctima limpia y paquete actual"
 clean_victim

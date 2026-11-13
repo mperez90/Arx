@@ -152,6 +152,14 @@ chmod 0755 "$PKG/DEBIAN/prerm"
 cat > "$PKG/DEBIAN/postrm" <<'EOF'
 #!/bin/sh
 set -e
+# B71: si el unpack falla después de que preinst parara a Arx, dpkg llama a este postrm con abort-upgrade. Lo
+# desempaquetado nunca reemplazó los ficheros viejos (medido: en este punto el zipapp en disco es el anterior),
+# así que se vuelve a arrancar el Arx que corría. Al venir de ≤0.0.8, su postinst abort-upgrade no lo haría.
+if [ "$1" = "abort-upgrade" ] && [ -f /run/arx/package-upgrade-active ] && [ -d /run/systemd/system ]; then
+  if systemctl start arx.service; then
+    rm -f /run/arx/package-upgrade-active
+  fi
+fi
 # purge: también la configuración (claves de API, la palabra) y el estado
 if [ "$1" = "purge" ]; then
   rm -rf /etc/arx /var/lib/arx

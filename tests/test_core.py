@@ -7158,8 +7158,23 @@ exit 0
         self.assertEqual(self.run_script("prerm", "upgrade", "0.0.9~rc2").returncode, 0)
         self.assertEqual(self.run_script("postrm", "upgrade", "0.0.9~rc2").returncode, 0)
         self.assertEqual(self.run_script("postrm", "abort-upgrade", "0.0.9~rc2").returncode, 0)
-        self.assertEqual(self.calls(), [])
+        self.assertEqual(self.calls(), [])  # sin marca de esta operación no hay nada que reanudar
         self.assertEqual(self.state(), "active")
+
+    def test_a_failed_unpack_starts_again_the_guard_preinst_stopped(self):
+        """B71: el unpack falla tras la parada del preinst nuevo; al venir de ≤0.0.8 nadie lo arrancaba."""
+        self.assertEqual(self.run_script("preinst", "upgrade", "0.0.8~rc5").returncode, 0)
+        self.assertEqual(self.state(), "inactive")
+        self.assertEqual(self.run_script("postrm", "abort-upgrade", "0.0.8~rc5").returncode, 0)
+        self.assertIn("start arx.service", self.calls())
+        self.assertEqual(self.state(), "active")
+        self.assertFalse(os.path.exists(self.mark))
+        self.state("inactive")
+        os.makedirs(os.path.dirname(self.mark), exist_ok=True)
+        open(self.mark, "w").close()
+        self.flag("start_fails")  # si no arranca, la marca queda para la próxima operación de paquete
+        self.assertEqual(self.run_script("postrm", "abort-upgrade", "0.0.8~rc5").returncode, 0)
+        self.assertTrue(os.path.exists(self.mark))
 
 
 class UpgradeMarkTests(unittest.TestCase):
