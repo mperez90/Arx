@@ -36,8 +36,8 @@ Existing installations keep their settings; they are asked about the improvement
 
 ## Known limitations
 
-- The improvement program reports to `https://telemetry.adsyslabs.com/v1/report`. Until that
-  collector is deployed, a server that joined keeps retrying at most every 6 hours, without affecting
-  the defense.
+- The improvement program reports to `https://telemetry.adsyslabs.com/v1/report`, a collector run by
+  ASL behind Cloudflare. If a report cannot be delivered, Arx tries again at most every 6 hours,
+  without affecting the defense.
 - Colors use the terminal's own palette; the exact shade depends on its theme.
 - The limitations of v0.0.9rc1 still apply.
