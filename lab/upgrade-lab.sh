@@ -24,10 +24,10 @@ git archive --format=tar "$RC2_REF" src packaging > "$WORK/rc2.tar" || exit 2
 git archive --format=tar "$NEW_REF" src packaging > "$WORK/new.tar" || exit 2
 limactl cp "$WORK/rc2.tar" "$VM:/tmp/upg-rc2.tar" && limactl cp "$WORK/new.tar" "$VM:/tmp/upg-new.tar" || exit 2
 v sh -c 'rm -rf /tmp/upg && mkdir -p /tmp/upg/rc2 /tmp/upg/new &&
-  (cd /tmp/upg/rc2 && tar xf /tmp/upg-rc2.tar && bash packaging/build-deb.sh "0.0.9~rc2" >/dev/null 2>&1 &&
-    cp dist/arx_0.0.9~rc2_all.deb /tmp/upg/rc2.deb) &&
+  (cd /tmp/upg/rc2 && tar xf /tmp/upg-rc2.tar && bash packaging/build-deb.sh "0.0.9rc2" >/dev/null 2>&1 &&
+    cp dist/arx_all.deb /tmp/upg/rc2.deb) &&
   (cd /tmp/upg/new && tar xf /tmp/upg-new.tar && bash packaging/build-deb.sh "0.0.9~rc2+upg" >/dev/null 2>&1 &&
-    cp dist/arx_0.0.9~rc2+upg_all.deb /tmp/upg/new.deb) && ls -l /tmp/upg/*.deb' || { echo "[FAIL] no se pudieron construir los .deb"; exit 1; }
+    cp dist/arx_all.deb /tmp/upg/new.deb) && ls -l /tmp/upg/*.deb' || { echo "[FAIL] no se pudieron construir los .deb"; exit 1; }
 
 step "dejar la VM como un usuario de rc2"
 v sh -c 'tar czf /root/arx-state-before-upgrade-lab.tgz /var/lib/arx /etc/arx 2>/dev/null; systemctl stop arx 2>/dev/null;
