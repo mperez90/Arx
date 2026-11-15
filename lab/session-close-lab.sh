@@ -45,6 +45,11 @@ def sshd_pids():
     return {int(p) for p in out}
 
 
+def sleepers(uid):
+    """Los `sleep 600` de esa cuenta: el comando que lanza la sesión de prueba (hijo de su shell o de su sshd)."""
+    return [int(p) for p in sh("pgrep", "-u", str(uid), "-f", "^sleep 600$").stdout.split()]
+
+
 def wait(cond, secs=10):
     end = time.time() + secs
     while time.time() < end:
@@ -80,7 +85,8 @@ def run_case(user, via_tier2):
         check(found, f"[{user}] Arx localiza la sesión de {user} desde {ORIGIN}")
         if not found:
             return
-        mine = response._ssh_session_pids(user, uid, ORIGIN)
+        check(wait(lambda: bool(sleepers(uid))), f"[{user}] la sesión está completa (su comando ya corre)")
+        mine = response._ssh_session_pids(user, uid, ORIGIN)  # con la sesión completa: el monitor, el hijo y lo que lanzó
         check(not (mine & keep), f"[{user}] y no confunde las sesiones que ya había")
         if via_tier2:
             finding = {"kind": "login_users", "sev": "high", "detail": f"nuevo en login_users: {user}@{ORIGIN}",
@@ -96,6 +102,7 @@ def run_case(user, via_tier2):
             check(bool(closed) and not survivors, f"[{user}] se cerró la sesión ({len(closed)} procesos), sin supervivientes")
         check(wait(lambda: client.poll() is not None), f"[{user}] el cliente de ssh perdió la conexión")
         check(wait(lambda: not (mine & sshd_pids())), f"[{user}] los procesos de esa sesión ya no están")
+        check(wait(lambda: not sleepers(uid)), f"[{user}] el comando que lanzó esa sesión murió con ella")
         check(all(alive(p) for p in keep), f"[{user}] el sshd que escucha y la sesión del lab siguen vivos")
         check(os.path.isdir("/proc/1"), f"[{user}] systemd, cron y el resto de root no se tocaron")
         client.kill()
