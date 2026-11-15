@@ -24,6 +24,7 @@ docs/*
 !docs/runbook.md
 !docs/release-v0.0.9rc1.md
 !docs/release-v0.0.9rc2.md
+!docs/release-v0.0.9.md
 !docs/manual.md
 !docs/manual.es.md
 !docs/telemetry.md
