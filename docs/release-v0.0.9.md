@@ -42,13 +42,52 @@ TODO: confirmar con arx-98 — ítem interno B73. Behavior after the fix.
 
 TODO: confirmar con arx-98 — ítem interno B75. Behavior after the fix.
 
-### Alerts for changed files: what changed and who changed it
+### Critical configuration is checked by meaning, file by file
 
-TODO: confirmar con arx-98 — ítem interno B77. Behavior after the fix.
+BORRADOR. TODO: confirmar con arx-98 (fuentes: d7220be + 0e94db4; incluye B73 y HZ#1-5). No lab figures.
 
-### CPU, journal and scope load while watching packages
+Each critical file is now tracked on its own: its contents, what a change means, its permissions, its
+owner and, for a link, its target. Arx no longer reports one hash for a whole group.
 
-TODO: confirmar con arx-98 — ítem interno B78. Behavior after the fix.
+- An alert names the file, says what the change means, and shows a diff against the known-good copy.
+- An empty `sources.list` and an unsigned repository are no longer reported as the same change.
+- Arx's own systemd units and drop-ins are compared with a manifest of their expected content. A mismatch
+  means someone changed Arx itself.
+- Watched files now also include drop-ins, sockets, timers, `.wants` links, generators,
+  `authorized_keys2` and `cron.daily`.
+- APT configuration is read the way APT reads it, so a comment marker inside a string cannot hide a
+  later hook.
+- An SSH key's type is read from the key itself. Certificates and `sk-` keys are recognized. An
+  unrecognized new line in root's `authorized_keys` is reported as high.
+- A new systemd unit or drop-in is reported as high. `OnFailure=`, `Wants=` and `BindPaths=` are
+  treated as sensitive.
+- A new APT repository or APT key stays critical.
+- Reads never follow links and never block on a FIFO. They have size and file-count limits. When a group
+  has too many files, only the first ones are watched and the alert says so.
+- Restoring a file from an alert (Tier 2) touches only that file.
+
+**Upgrading.** Baselines from earlier versions are migrated. Unchanged files are adopted silently. A
+changed group is rebuilt from the vault if its copy matches what was sealed and is judged by meaning;
+otherwise its group alert stays until you accept it.
+
+### Arx uses almost nothing while the host is quiet
+
+BORRADOR. TODO: confirmar con arx-98 (fuentes: 1552c3a + 7d5ead9). The title claims "almost nothing";
+only a bounded dpkg query budget is tested, and no measurement is published here. No lab figures.
+
+While the host is quiet, Arx asks dpkg only when dpkg's state changes: when a transaction finishes or is
+running, or when diversions change. It no longer repeats the full package inventory on every sweep.
+
+- The package inventory is read once per dpkg state. Owner lookups are batched and cached per state.
+- If dpkg does not answer (timeout, or it cannot run), the error is reported and nothing is stored. A
+  missing answer is never read as "nothing changed" or as "no package owns this file".
+- Services with no process, or with a statically linked binary, are retried with growing waits instead
+  of on every sweep.
+- The libraries of a service are learned again when the processes in its control group change (start or
+  restart).
+- A test checks that quiet periods trigger a bounded number of dpkg queries.
+
+**Upgrading.** The first comparison after upgrading from 0.0.9rc2 or earlier does an extra check.
 
 ### Model verdicts with Kimi
 
