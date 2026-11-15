@@ -30,7 +30,7 @@ from datetime import datetime, timezone
 from arx import config, consensus, engine, notify, redact, telemetry
 from arx import license as lic
 from arx.i18n import lang, tr
-from arx.modules import (baseline, canaries, dnswatch, execwatch, filewatch, fleet, integrity, profile, provenance, recon, response, sandbox,
+from arx.modules import (baseline, canaries, dnswatch, execwatch, filewatch, fleet, integrity, pkgdb, profile, provenance, recon, response, sandbox,
                          sensors, service, telegram, vaccines)
 
 SYSTEM_PROMPT = (
@@ -103,6 +103,18 @@ def _own_artifacts() -> tuple[dict[str, str], set[str]]:
     return own, skip
 
 
+def _package_wrote(path: str) -> bool:
+    """¿El fichero es de un paquete de un repositorio firmado, y el dpkg que lo escribió es el auténtico?
+    Solo entonces un cambio que solo hizo dpkg es una actualización y no un hallazgo. Ante cualquier duda, no."""
+    try:
+        pkg = pkgdb.owner(path)
+        if not pkg or provenance.intact(integrity.DPKG, "dpkg") is not True:
+            return False
+        return bool(provenance.signed_origin("dpkg")[0] and provenance.signed_origin(pkg)[0])
+    except Exception:  # noqa: BLE001 - sin respuesta de dpkg no se rebaja nada
+        return False
+
+
 def _integrity_drift(base: dict, include_suid: bool) -> list[dict]:
     """Ficheros críticos contra la base sellada, fichero a fichero (B77).
 
@@ -157,13 +169,16 @@ def _integrity_drift(base: dict, include_suid: bool) -> list[dict]:
                                                    f"integrity|cambió {g} desde el sellado de la línea base|"
                                                    f"{legacy_now.get(g)}"))
     own, skip = _own_artifacts()
+    sensors.poll_writers()  # la autoría al día antes de comparar
     found, adopt = integrity.drift(files, now_files, own, vault_read=response.vault_copy,
-                                   skip=skip | skip_legacy)
+                                   skip=skip | skip_legacy, writers=sensors.writers_of,
+                                   package_wrote=_package_wrote)
     if adopt:
         baseline.adopt_integrity_files(adopt)
         files.update(adopt)
-        for path in adopt:
-            response.record({"kind": "own_artifact_adopted", "detail": path})
+        for path, st in adopt.items():
+            response.record({"kind": "package_update_adopted" if st.get("by_package") else "own_artifact_adopted",
+                             "detail": path})
     findings += found
     known_suid = (base.get("sets") or {}).get("suid_binaries")
     if include_suid and "suid_set" in sealed and known_suid is not None:

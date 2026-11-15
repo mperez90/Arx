@@ -2058,4 +2058,8 @@ ES = {
         'ajuste de APT que cambia cómo se instalan los paquetes: {items}',
     'new systemd unit or drop-in: {items}':
         'unidad o drop-in de systemd nuevo: {items}',
+    ', login uid {auid}, session {ses}':
+        ', uid de login {auid}, sesión {ses}',
+    'by {exe} (pid {pid}, uid {uid}{session})':
+        'por {exe} (pid {pid}, uid {uid}{session})',
 }

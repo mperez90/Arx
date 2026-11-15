@@ -18,6 +18,7 @@ import glob
 import hashlib
 import os
 import stat
+import time
 
 from arx import config, redact
 from arx.i18n import tr
@@ -96,7 +97,7 @@ def state_from(path: str, group: str, data: bytes, meta: dict) -> dict:
         parsed = cfgsem.analyze(group, data)
     else:
         parsed = cfgsem.analyze(group, data.decode("utf-8", errors="replace"), deb822=path.endswith(".sources"))
-    out = {"g": group, **meta, "sha": hashlib.sha256(data).hexdigest(), "ok": parsed.ok,
+    out = {"g": group, **meta, "at": time.time(), "sha": hashlib.sha256(data).hexdigest(), "ok": parsed.ok,
            "canon": _jsonable(parsed.canon) if parsed.ok else None}
     if not parsed.ok:
         out["reason"] = parsed.reason
@@ -108,7 +109,7 @@ def state(path: str, group: str) -> dict | None:
     meta, data = _read_safely(path)
     if meta is None:
         return None
-    out = {"g": group, **meta}
+    out = {"g": group, **meta, "at": time.time()}
     if data is None:
         out["sha"] = None
         out["ok"] = "link" in meta  # un enlace se compara por su destino; lo especial no se entiende
@@ -218,12 +219,30 @@ def existing() -> dict[str, list[str]]:
     return out
 
 
+DPKG = "/usr/bin/dpkg"
+
+
+def _session(w: dict) -> str:
+    auid, ses = str(w.get("auid", "")), str(w.get("ses", ""))
+    if auid in ("", "?", "4294967295", "-1"):
+        return ""
+    return tr(", login uid {auid}, session {ses}", auid=auid, ses=ses)
+
+
+def who(w: dict) -> str:
+    """«por /usr/bin/sed (pid 123, uid 0, sesión 4)» a partir de un escritor visto por auditd."""
+    return tr("by {exe} (pid {pid}, uid {uid}{session})", exe=w.get("exe", "?"), pid=w.get("pid", "?"),
+              uid=w.get("uid", "?"), session=_session(w))
+
+
 def drift(sealed: dict[str, dict], now: dict[str, dict], own: dict[str, str] | None = None,
-          vault_read=None, skip=()) -> tuple[list[dict], dict[str, dict]]:
+          vault_read=None, skip=(), writers=None, package_wrote=None) -> tuple[list[dict], dict[str, dict]]:
     """(hallazgos, adopciones) del estado actual contra el sellado, fichero a fichero.
 
-    `adopciones` son las piezas propias de Arx que coinciden con lo esperado: el llamador las incorpora a la
-    base sin alertar. `vault_read(path) -> bytes|None` da la copia buena para el diff."""
+    `adopciones` son lo que se incorpora a la base sin alertar: piezas propias de Arx que coinciden con lo
+    esperado, y ficheros de un paquete que solo cambió el dpkg verificado (`package_wrote(path)` lo comprueba).
+    `vault_read(path) -> bytes|None` da la copia buena para el diff; `writers(path, since)` dice quién escribió
+    el fichero según auditd, y eso viaja en la alerta."""
     own = own or {}
     skip = set(skip)
     findings, adopt = [], {}
@@ -271,8 +290,15 @@ def drift(sealed: dict[str, dict], now: dict[str, dict], own: dict[str, str] | N
                                                   why=a.get("reason", "?")))
             else:
                 continue  # mismo significado: formato, comentarios, un fichero vacío
+        ws = writers(path, (b or {}).get("at")) if writers else []
+        if ws and package_wrote and a is not None and all(w.get("exe") == DPKG for w in ws) and package_wrote(path):
+            adopt[path] = {**a, "by_package": True}  # una actualización de paquete firmada y verificada
+            continue
         f = _finding(change.sev, group, path, a, f"{path}: {change.summary}",
                      tr("critical file altered → possible tampering or persistence"))
+        if ws:
+            f["by"] = ws[-3:]
+            f["detail"] += f" — {who(ws[-1])}"
         if vault_read is not None:
             try:
                 good = vault_read(path)

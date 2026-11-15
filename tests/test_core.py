@@ -10402,5 +10402,102 @@ class IntegrityFileTests(unittest.TestCase):
         self.assertEqual([f["kind"] for f in found], ["integrity_watch_added"])
 
 
+class IntegrityAttributionTests(unittest.TestCase):
+    """B77 3/3: quién escribió cada fichero crítico (auditd) viaja en la alerta, y solo el dpkg auténtico
+    instalando un paquete firmado convierte un cambio en una actualización sin alerta."""
+
+    SED = [
+        'type=SYSCALL msg=audit(1731600000.100:77): arch=c000003e syscall=82 success=yes exit=0 ppid=900 pid=1234 '
+        'auid=1000 uid=0 gid=0 euid=0 ses=4 comm="sed" exe="/usr/bin/sed" key="arx_cfg"',
+        'type=CWD msg=audit(1731600000.100:77): cwd="/etc/cron.d"',
+        'type=PATH msg=audit(1731600000.100:77): item=0 name="/etc/cron.d/" inode=1 nametype=PARENT',
+        'type=PATH msg=audit(1731600000.100:77): item=1 name="sedAbC12" inode=2 nametype=DELETE',
+        'type=PATH msg=audit(1731600000.100:77): item=2 name="/etc/cron.d/" inode=1 nametype=PARENT',
+        'type=PATH msg=audit(1731600000.100:77): item=3 name="backup" inode=3 nametype=CREATE',
+    ]
+
+    def setUp(self):
+        self.d = _isolate()
+        from arx import i18n
+        from arx.modules import guard, integrity, sensors
+        self.g, self.i, self.s = guard, integrity, sensors
+        sensors._writers = None
+        self.addCleanup(setattr, sensors, "_writers", None)
+        i18n.set_lang("en")
+        self.addCleanup(i18n.set_lang, "es")
+
+    def _states(self, before: str, after: str, at: float = 1731500000.0):
+        path = os.path.join(self.d, "job")
+        open(path, "w").write(before)
+        b = self.i.state(path, "cron")
+        b["at"] = at
+        open(path, "w").write(after)
+        return path, {path: b}, {path: self.i.state(path, "cron")}
+
+    def test_a_sed_rename_is_attributed_to_the_target_file(self):
+        at = time.time() - 60  # reciente: lo de hace más de 30 días se olvida al guardar
+        self.assertTrue(self.s._note_writer([r.replace("1731600000.100", f"{at:.3f}") for r in self.SED]))
+        ws = self.s.writers_of("/etc/cron.d/backup")
+        self.assertEqual((ws[-1]["exe"], ws[-1]["pid"], ws[-1]["auid"], ws[-1]["ses"]), ("/usr/bin/sed", "1234", "1000", "4"))
+        self.assertTrue(self.s.writers_of("/etc/cron.d/sedAbC12"))  # el temporal también
+        self.assertEqual(self.s.writers_of("/etc/cron.d/backup", since=at + 1), [])
+        self.s._writers_save()
+        self.s._writers = None  # sobrevive a un reinicio de Arx
+        self.assertEqual(len(self.s.writers_of("/etc/cron.d/backup")), 1)
+        self.s._writers_load()["/etc/cron.d/old"] = [{"at": time.time() - 40 * 86400, "exe": "/x"}]
+        self.s._writers_save()
+        self.assertEqual(self.s.writers_of("/etc/cron.d/old"), [])  # más de 30 días: olvidado
+
+    def test_a_failed_write_is_not_an_author(self):
+        failed = [self.SED[0].replace("success=yes", "success=no")] + self.SED[1:]
+        self.assertFalse(self.s._note_writer(failed))
+
+    def test_the_alert_says_who_wrote_the_file(self):
+        path, sealed, now = self._states("0 1 * * * root /bin/a\n", "* * * * * root /tmp/x\n")
+        w = {"at": 1731600000.0, "exe": "/usr/bin/sed", "pid": "1234", "uid": "0", "auid": "1000", "ses": "4"}
+        found, _ = self.i.drift(sealed, now, writers=lambda p, since: [w] if p == path else [])
+        self.assertEqual(found[0]["by"], [w])
+        self.assertIn("/usr/bin/sed", found[0]["detail"])
+        self.assertIn("session 4", found[0]["detail"])
+
+    def test_only_writes_after_the_sealed_state_count(self):
+        path, sealed, now = self._states("0 1 * * * root /bin/a\n", "0 2 * * * root /bin/a\n", at=1731700000.0)
+        self.s._note_writer(self.SED)  # escrito antes de sellar ese estado
+        self.s._writers_load()[path] = self.s._writers_load().pop("/etc/cron.d/backup")
+        found, _ = self.i.drift(sealed, now, writers=self.s.writers_of)
+        self.assertNotIn("by", found[0])
+
+    def test_a_verified_dpkg_update_is_adopted_without_an_alert(self):
+        path, sealed, now = self._states("0 1 * * * root /bin/a\n", "0 1 * * * root /bin/a --new\n")
+        dpkg = {"at": 1731600000.0, "exe": "/usr/bin/dpkg", "pid": "77", "uid": "0", "auid": "4294967295", "ses": "4294967295"}
+        found, adopt = self.i.drift(sealed, now, writers=lambda p, s: [dpkg], package_wrote=lambda p: True)
+        self.assertEqual(found, [])
+        self.assertTrue(adopt[path]["by_package"])
+
+    def test_dpkg_with_an_unverified_package_or_mixed_writers_still_alerts(self):
+        path, sealed, now = self._states("0 1 * * * root /bin/a\n", "* * * * * root /tmp/x\n")
+        dpkg = {"at": 1731600000.0, "exe": "/usr/bin/dpkg", "pid": "77", "uid": "0"}
+        sed = {"at": 1731600001.0, "exe": "/usr/bin/sed", "pid": "78", "uid": "0"}
+        found, _ = self.i.drift(sealed, now, writers=lambda p, s: [dpkg], package_wrote=lambda p: False)
+        self.assertEqual(len(found), 1)  # un .deb local, o dpkg alterado
+        found, _ = self.i.drift(sealed, now, writers=lambda p, s: [dpkg, sed], package_wrote=lambda p: True)
+        self.assertEqual(len(found), 1)  # alguien más escribió después
+        found, _ = self.i.drift(sealed, now, writers=lambda p, s: [], package_wrote=lambda p: True)
+        self.assertEqual(len(found), 1)  # sin autoría no se rebaja nada
+
+    def test_package_wrote_needs_an_intact_signed_dpkg_and_a_signed_package(self):
+        from arx.modules import pkgdb, provenance
+        cases = [("nginx", True, (True, "repo"), True), (None, True, (True, "repo"), False),
+                 ("nginx", False, (True, "repo"), False), ("nginx", None, (True, "repo"), False),
+                 ("nginx", True, (False, "local"), False)]
+        for owner, intact, origin, want in cases:
+            with mock.patch.object(pkgdb, "owner", lambda p, o=owner: o), \
+                 mock.patch.object(provenance, "intact", lambda p, k, v=intact: v), \
+                 mock.patch.object(provenance, "signed_origin", lambda k, o=origin: o):
+                self.assertEqual(self.g._package_wrote("/etc/nginx/nginx.conf"), want, (owner, intact, origin))
+        with mock.patch.object(pkgdb, "owner", side_effect=pkgdb.NoAnswer("x")):
+            self.assertFalse(self.g._package_wrote("/etc/x"))
+
+
 if __name__ == "__main__":
     unittest.main()

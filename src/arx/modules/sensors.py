@@ -14,6 +14,7 @@ detección por anomalía de la baseline.
 """
 from __future__ import annotations
 
+import glob
 import json
 import os
 import re
@@ -37,6 +38,14 @@ _FALCO_SEV = {
 # Ficheros de identidad vigilados por auditd (escritura/atributos).
 IDENT_WATCH = ["/etc/passwd", "/etc/shadow", "/etc/group", "/etc/sudoers", "/etc/sudoers.d",
                "/root/.ssh"]
+# B77: quién escribe la configuración crítica (solo autoría: estos eventos no son hallazgos por sí mismos)
+CFG_KEY = "arx_cfg"
+CFG_WATCH = ["/etc/apt", "/etc/systemd/system", "/usr/local/lib/systemd", "/etc/crontab", "/etc/cron.d",
+             "/etc/cron.hourly", "/etc/cron.daily", "/etc/cron.weekly", "/etc/cron.monthly", "/var/spool/cron"]
+WRITERS_STATE = "cfg-writers.json"
+WRITERS_PER_PATH = 8
+WRITERS_PATHS = 2000
+WRITERS_TTL_S = 30 * 86400
 
 
 def available() -> dict:
@@ -139,6 +148,7 @@ def ensure_audit_rules(canary_paths: list[str] | None = None) -> bool:
         return False
     current = recon._run(["auditctl", "-l"]) or ""
     wanted = [(p, "wa", "arx_ident") for p in IDENT_WATCH if os.path.exists(p)]
+    wanted += [(p, "wa", CFG_KEY) for p in CFG_WATCH + glob.glob("/home/*/.ssh") if os.path.exists(p)]
     wanted += [(p, "rwa", "arx_canary") for p in (canary_paths or []) if os.path.exists(p)]
     for path, perm, key in wanted:
         if f"-w {path} " in current and f"-k {key}" in current:
@@ -162,7 +172,8 @@ def ensure_audit_rules(canary_paths: list[str] | None = None) -> bool:
 AUDIT_CONF = "/etc/audit/auditd.conf"
 AUDIT_LOG = "/var/log/audit/audit.log"
 AUDIT_TAIL_STATE = "audit-tail.json"
-AUDIT_KEYS = ("arx_ident", "arx_canary", DENIED_KEY)
+AUDIT_KEYS = ("arx_ident", "arx_canary", DENIED_KEY, CFG_KEY)
+_WRITER_KEYS = ("arx_ident", CFG_KEY)  # las que dicen quién escribió un fichero vigilado
 AUDIT_READ_MAX = 8 << 20   # por barrido: un atasco se drena en varios barridos, no se salta
 AUDIT_QUEUE_MAX = 200      # eventos pendientes por clave
 AUDIT_YOUNG_S = 2.0        # el último evento del fichero, si es así de reciente, puede estar a medio escribir
@@ -265,11 +276,86 @@ def _audit_poll(now: float | None = None) -> None:
             e = _AUDIT_EVENT.search(text)
             if e and e.group(0) in keyed:
                 grouped.setdefault(e.group(0), []).append(text)
+        changed = False
         for event_id, records in grouped.items():
+            if keyed[event_id] in _WRITER_KEYS:
+                changed |= _note_writer(records)
+            if keyed[event_id] == CFG_KEY:
+                continue  # solo autoría: no se encola como hallazgo
             queue = _audit_pending.setdefault(keyed[event_id], [])
             queue.append(records)
             del queue[:-AUDIT_QUEUE_MAX]
+        if changed:
+            _writers_save()
     _audit_save(*state)
+
+
+# ── quién escribió cada fichero vigilado (B77) ───────────────────────────────
+_writers: dict[str, list[dict]] | None = None
+
+
+def _writers_load() -> dict[str, list[dict]]:
+    global _writers
+    if _writers is None:
+        data = config.read_json(config.state_dir() / WRITERS_STATE, {}) or {}
+        _writers = {p: [w for w in ws if isinstance(w, dict)] for p, ws in data.items()
+                    if isinstance(p, str) and isinstance(ws, list)}
+    return _writers
+
+
+def _writers_save() -> None:
+    data = _writers_load()
+    horizon = time.time() - WRITERS_TTL_S
+    for p in list(data):
+        data[p] = [w for w in data[p] if float(w.get("at", 0)) >= horizon][-WRITERS_PER_PATH:]
+        if not data[p]:
+            del data[p]
+    if len(data) > WRITERS_PATHS:
+        keep = sorted(data, key=lambda p: max(float(w.get("at", 0)) for w in data[p]))[-WRITERS_PATHS:]
+        for p in set(data) - set(keep):
+            del data[p]
+    config.write_json(config.state_dir() / WRITERS_STATE, data)
+
+
+def _note_writer(records: list[str]) -> bool:
+    """Apunta quién escribió cada ruta de un evento de auditd (SYSCALL + CWD + PATH). True si apuntó algo."""
+    sc, cwd, names, at = {}, "", [], None
+    for line in records:
+        e = _AUDIT_EVENT.search(line)
+        if e and at is None:
+            at = float(e.group(1))
+        fields = {k: _audit_value(k, v) for k, v in _AUDIT_FIELD.findall(line)}
+        if line.startswith("type=SYSCALL"):
+            sc = fields
+        elif line.startswith("type=CWD"):
+            cwd = fields.get("cwd", "")
+        elif line.startswith("type=PATH") and fields.get("name") and fields.get("nametype") != "PARENT":
+            names.append(fields["name"])
+    if not sc or sc.get("success") != "yes" or not names:
+        return False
+    who = {"at": at or time.time(), "exe": sc.get("exe", "?"), "comm": sc.get("comm", "?"),
+           "pid": sc.get("pid", "?"), "ppid": sc.get("ppid", "?"), "uid": sc.get("uid", "?"),
+           "auid": sc.get("auid", "?"), "ses": sc.get("ses", "?")}
+    data = _writers_load()
+    for name in names:
+        path = os.path.normpath(name if name.startswith("/") or not cwd else os.path.join(cwd, name))
+        data.setdefault(path, []).append(who)
+        del data[path][:-WRITERS_PER_PATH]
+    return True
+
+
+def writers_of(path: str, since: float | None = None) -> list[dict]:
+    """Quién escribió `path` (lo más reciente al final), desde `since` si se da. Vacío si auditd no lo vio."""
+    ws = _writers_load().get(path, [])
+    return [w for w in ws if since is None or float(w.get("at", 0)) >= since]
+
+
+def poll_writers() -> None:
+    """Lee lo nuevo del log de auditd para que la autoría esté al día antes de comparar ficheros."""
+    try:
+        _audit_poll()
+    except Exception:  # noqa: BLE001 - sin autoría la integridad sigue funcionando
+        pass
 
 
 def _audit_new(key: str) -> list[list[str]]:
