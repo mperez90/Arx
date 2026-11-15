@@ -127,13 +127,50 @@ def _md5_file(path: str) -> str | None:
         os.close(fd)
 
 
+def _md5sums_files(pkg: str) -> list[str]:
+    """Los `.md5sums` que dpkg puede haber guardado para el paquete (con y sin arquitectura)."""
+    name, _, arch = pkg.partition(":")
+    return [f"{DPKG_INFO}/{name}:{arch}.md5sums", f"{DPKG_INFO}/{name}.md5sums"] if arch else \
+        [f"{DPKG_INFO}/{name}.md5sums", *glob.glob(f"{DPKG_INFO}/{glob.escape(name)}:*.md5sums")]
+
+
+_MD5_RE = re.compile(r"^[0-9a-f]{32}$")
+PKG_ROOT = "/"
+
+
+def verify_package(pkg: str, root: str | None = None) -> tuple[list[str], list[str]] | None:
+    """(ficheros cambiados, ficheros que faltan) del paquete, contra el `.md5sums` que guardó dpkg y sin lanzar nada.
+
+    Es lo que `dpkg --verify` da por alerta (el md5 distinto y `missing`), sin el scope de systemd que cada llamada
+    abre. Rutas absolutas. None si no se puede PROBAR (sin `.md5sums`, una línea que dpkg no escribiría, un fichero
+    que no es regular o no se puede leer): quien lo usa tiene que recurrir a `dpkg --verify`, no darlo por limpio."""
+    root = root or PKG_ROOT
+    try:
+        with open(next(s for s in _md5sums_files(pkg) if os.path.isfile(s)), encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+    except (StopIteration, OSError):
+        return None
+    changed, missing, checked = [], [], 0
+    for line in lines:
+        digest, sep, rel = line.partition("  ")
+        if not (sep and _MD5_RE.match(digest) and rel and not rel.startswith("/")
+                and ".." not in rel.split("/")):
+            return None
+        path = os.path.join(root, rel)
+        if not os.path.lexists(path):
+            missing.append("/" + rel)
+        elif (current := _md5_file(path)) is None:
+            return None
+        elif current != digest:
+            changed.append("/" + rel)
+        checked += 1
+    return (changed, missing) if checked else None
+
+
 def intact(path: str, pkg: str) -> bool | None:
     """¿El fichero es el que instaló dpkg? None si dpkg no guardó su resumen (no se puede probar)."""
-    name, _, arch = pkg.partition(":")
-    sums = [f"{DPKG_INFO}/{name}:{arch}.md5sums", f"{DPKG_INFO}/{name}.md5sums"] if arch else \
-        [f"{DPKG_INFO}/{name}.md5sums", *glob.glob(f"{DPKG_INFO}/{glob.escape(name)}:*.md5sums")]
     wanted = {p.lstrip("/") for p in _variants(path)}
-    for s in sums:
+    for s in _md5sums_files(pkg):
         try:
             with open(s, encoding="utf-8", errors="replace") as f:
                 for line in f:

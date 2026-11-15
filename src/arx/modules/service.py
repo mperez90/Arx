@@ -18,7 +18,7 @@ from pathlib import Path
 
 from arx import config
 from arx.i18n import tr
-from arx.modules import maintenance
+from arx.modules import maintenance, provenance
 
 UNIT_PATH = "/etc/systemd/system/arx.service"
 EARLY_UNIT_PATH = "/etc/systemd/system/arx-firewall.service"
@@ -314,21 +314,29 @@ def self_check(dropin_dirs=DROPIN_DIRS) -> list[dict]:
         return findings
     rc, unavailable = 0, False
     inside = maintenance._in_arx_service()
-    try:
-        result = maintenance.run(["dpkg", "--verify", "arx"], capture_output=True,
-                                 text=True, timeout=30)
-        out, rc = result.stdout or "", result.returncode
-    except maintenance.SlotBusy:
-        return findings  # otro auxiliar ocupaba la ranura: la prueba se repite en la próxima vuelta
-    except maintenance.MaintenanceUnavailable:
-        out, unavailable = "", True
-    except subprocess.TimeoutExpired:
-        out, unavailable = "", True
-    except OSError:
-        # Una CLI en macOS o un host sin dpkg no declara integridad: simplemente no hace esta prueba.
-        out, unavailable = "", inside
-    changed = [line.split()[-1] for line in out.splitlines() if len(line) > 2 and line[2] == "5"]
-    changed += [line.split(None, 1)[1].strip() for line in out.splitlines() if line.startswith("missing ")]
+    # Lo que `dpkg --verify` da por alerta (md5 distinto y ficheros que faltan) se prueba en proceso contra el
+    # `arx.md5sums` de dpkg: cero scopes cada 5 minutos. Solo lo que no se puede probar así recurre a dpkg.
+    verified = provenance.verify_package("arx")
+    out = ""
+    changed = []
+    if verified is not None:
+        changed = [*verified[0], *verified[1]]
+    else:
+        try:
+            result = maintenance.run(["dpkg", "--verify", "arx"], capture_output=True,
+                                     text=True, timeout=30)
+            out, rc = result.stdout or "", result.returncode
+        except maintenance.SlotBusy:
+            return findings  # otro auxiliar ocupaba la ranura: la prueba se repite en la próxima vuelta
+        except maintenance.MaintenanceUnavailable:
+            out, unavailable = "", True
+        except subprocess.TimeoutExpired:
+            out, unavailable = "", True
+        except OSError:
+            # Una CLI en macOS o un host sin dpkg no declara integridad: simplemente no hace esta prueba.
+            out, unavailable = "", inside
+        changed = [line.split()[-1] for line in out.splitlines() if len(line) > 2 and line[2] == "5"]
+        changed += [line.split(None, 1)[1].strip() for line in out.splitlines() if line.startswith("missing ")]
     if changed:
         findings.append(_tamper(tr("Arx's own files differ from its package: {files}", files=", ".join(changed[:3])),
                                 f"code|{','.join(changed)}"))
