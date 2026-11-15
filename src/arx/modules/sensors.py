@@ -333,7 +333,13 @@ def _note_writer(records: list[str]) -> bool:
             names.append(fields["name"])
     if not sc or sc.get("success") != "yes" or not names:
         return False
-    who = {"at": at or time.time(), "exe": sc.get("exe", "?"), "comm": sc.get("comm", "?"),
+    serial = None
+    for line in records:
+        e = _AUDIT_EVENT.search(line)
+        if e:
+            serial = int(e.group(2))
+            break
+    who = {"at": at or time.time(), "serial": serial, "boot": _boot_id(), "exe": sc.get("exe", "?"), "comm": sc.get("comm", "?"),
            "pid": sc.get("pid", "?"), "ppid": sc.get("ppid", "?"), "uid": sc.get("uid", "?"),
            "auid": sc.get("auid", "?"), "ses": sc.get("ses", "?")}
     data = _writers_load()
@@ -342,6 +348,20 @@ def _note_writer(records: list[str]) -> bool:
         data.setdefault(path, []).append(who)
         del data[path][:-WRITERS_PER_PATH]
     return True
+
+
+_BOOT_ID: str | None = None
+
+
+def _boot_id() -> str:
+    """Identidad del arranque: la serie de auditd vuelve a empezar en cada uno."""
+    global _BOOT_ID
+    if _BOOT_ID is None:
+        try:
+            _BOOT_ID = open("/proc/sys/kernel/random/boot_id").read().strip()[:36]
+        except OSError:
+            _BOOT_ID = "?"
+    return _BOOT_ID
 
 
 def writers_of(path: str, since: float | None = None) -> list[dict]:

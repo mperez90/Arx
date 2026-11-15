@@ -153,8 +153,20 @@ def _tupled(x):
 
 # Caché por fichero para el barrido de cada 30 s: releer, hashear y analizar ~100 ficheros cada vez costaba un 2-3 %
 # de CPU en reposo. Un fichero se relee si cambia su lstat (con ctime, que un `touch -r` no puede devolver a su
-# valor), si auditd vio que alguien lo escribió, o si pasó FULL_RECHECK_S desde la última lectura completa.
-_cache: dict[str, tuple[tuple, dict, float]] = {}
+# valor), si auditd vio una escritura que la caché no conocía, o si pasó FULL_RECHECK_S desde la última lectura.
+# Lo de auditd se compara por la IDENTIDAD del último evento (serie, arranque, pid, ejecutable), no por su fecha: con
+# el reloj retrocedido una escritura nueva lleva una fecha vieja (HZ#8 de Q) y un filtro por fecha la dejaría fuera.
+_cache: dict[str, tuple[tuple, dict, float, str | None]] = {}
+
+
+def _last_writer(writers, path: str) -> str | None:
+    if not writers:
+        return None
+    evs = writers(path, None)
+    if not evs:
+        return None
+    last = evs[-1]
+    return repr(tuple(last.get(k) for k in ("boot", "serial", "at", "pid", "exe")))
 
 
 def _stat_key(path: str) -> tuple | None:
@@ -177,12 +189,13 @@ def cached_state(path: str, group: str, writers=None, now: float | None = None) 
         _cache.pop(path, None)
         return None
     hit = _cache.get(path)
-    if hit and hit[0] == key and hit[1].get("g") == group and now - hit[2] < FULL_RECHECK_S:
-        if not (writers and writers(path, hit[1].get("at"))):
-            return hit[1]
+    last = _last_writer(writers, path)
+    if hit and hit[0] == key and hit[1].get("g") == group and now - hit[2] < FULL_RECHECK_S \
+            and (hit[3] if len(hit) > 3 else None) == last:
+        return hit[1]
     s = state(path, group)
     if s is not None:
-        _cache[path] = (key, s, now)
+        _cache[path] = (key, s, now, last)
     else:
         _cache.pop(path, None)
     return s
