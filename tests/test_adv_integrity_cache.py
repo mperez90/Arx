@@ -60,7 +60,7 @@ class CacheGoodBehavior(unittest.TestCase):
         self.assertNotEqual(s1["sha"], s2["sha"])
 
     def test_permission_change_is_reread(self):
-        s1 = I.cached_state(self.p, "sudoers_d", _writers_of([]), now=1000.0)
+        I.cached_state(self.p, "sudoers_d", _writers_of([]), now=1000.0)
         time.sleep(0.01)
         os.chmod(self.p, 0o666)
         s2 = I.cached_state(self.p, "sudoers_d", _writers_of([]), now=1001.0)
