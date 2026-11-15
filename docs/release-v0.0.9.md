@@ -34,29 +34,29 @@ TODO: confirmar con arx-98 — the rc2 items below are carried over; check each 
 TODO: confirmar con arx-98 — the entries below are placeholders. Each one needs its final wording, its
 test reference and its evidence before it is published. Do not describe behavior until arx-98 confirms it.
 
-### B73 · TODO: confirmar con arx-98 (title and scope)
+### Alerts about Arx's own service files
 
-TODO: confirmar con arx-98 — behavior after the fix.
+TODO: confirmar con arx-98 — ítem interno B73. Behavior after the fix.
 
-### B75 · TODO: confirmar con arx-98 (title and scope)
+### Installer output
 
-TODO: confirmar con arx-98 — behavior after the fix.
+TODO: confirmar con arx-98 — ítem interno B75. Behavior after the fix.
 
-### B77 · TODO: confirmar con arx-98 (title and scope)
+### Alerts for changed files: what changed and who changed it
 
-TODO: confirmar con arx-98 — behavior after the fix.
+TODO: confirmar con arx-98 — ítem interno B77. Behavior after the fix.
 
-### B78 · TODO: confirmar con arx-98 (title and scope)
+### CPU, journal and scope load while watching packages
 
-TODO: confirmar con arx-98 — behavior after the fix.
+TODO: confirmar con arx-98 — ítem interno B78. Behavior after the fix.
 
-### B79 · TODO: confirmar con arx-98 (title and scope)
+### Model verdicts with Kimi
 
-TODO: confirmar con arx-98 — behavior after the fix.
+TODO: confirmar con arx-98 — ítem interno B79. Behavior after the fix.
 
-### root · TODO: confirmar con arx-98 (title and scope)
+### Tier 2 actions offered to root
 
-TODO: confirmar con arx-98 — behavior after the fix.
+TODO: confirmar con arx-98 — ítem interno root. Behavior after the fix.
 
 ## Upgrading
 
