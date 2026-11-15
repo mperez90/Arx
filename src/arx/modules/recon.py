@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from arx.i18n import tr
-from arx.modules import maintenance
+from arx.modules import maintenance, pkgdb
 
 TIMEOUT = 8  # segundos por comando; los colectores lentos lo suben explícitamente
 
@@ -362,10 +362,13 @@ def local_ips() -> set[str]:
 def collect_packages() -> dict:
     d: dict = {}
     if _has("dpkg-query"):
-        out = _run(["dpkg-query", "-f", "${Package}\n", "-W"])
-        if out:
+        try:
+            inventory = pkgdb.versions()  # el mismo inventario que usan los demás módulos
+        except pkgdb.NoAnswer:
+            return d
+        if inventory:
             d["manager"] = "dpkg"
-            d["count"] = len(out.splitlines())
+            d["count"] = len(inventory)
     return d
 
 

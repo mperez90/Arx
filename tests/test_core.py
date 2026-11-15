@@ -5760,12 +5760,17 @@ class NoAnswerIsNeverAVerdictTests(unittest.TestCase):
             with self.assertRaises(self.v.NoAnswer):
                 self.v.signed_origin("nginx")
         self.assertEqual(self.v._cache, {})
+        self.assertEqual(dict(self.v.pkgdb._owner_cache), {})  # sin respuesta no se guarda ni un «no»
 
         class R:
             returncode, stdout = 1, ""
-        with mock.patch.object(self.m, "run", return_value=R()):
+        status = os.path.join(tempfile.mkdtemp(), "status")
+        open(status, "w").close()
+        with mock.patch.object(self.m, "run", return_value=R()), \
+                mock.patch.object(self.v.pkgdb, "STATUS", status), \
+                mock.patch.object(self.v.pkgdb, "UPDATES", status + ".updates"):
             self.assertIsNone(self.v.package_of("/opt/loose/server"))  # un «no» de dpkg sí es respuesta
-        self.assertIn(("pkg", "/opt/loose/server"), self.v._cache)
+            self.assertIn("/opt/loose/server", self.v.pkgdb._owner_cache)
 
     def test_trust_stays_pending_and_writes_no_verdict(self):
         with self.busy:
@@ -7728,7 +7733,9 @@ class ProvenanceTests(unittest.TestCase):
     def test_package_owner_ignores_diversions_and_needs_the_exact_path(self):
         out = {"/usr/sbin/nginx": "diversion by x from: /usr/sbin/nginx\nnginx-core: /usr/sbin/nginx\n",
                "/usr/bin/socat": "socat: /usr/bin/socat1\n"}
-        self._patch(self.p, "_q", lambda argv, timeout=10, **kw: out.get(argv[-1]))
+        # dpkg-query -S recibe todas las rutas de una vez: contesta por cada una que conozca
+        self._patch(self.p, "_q", lambda argv, timeout=10, **kw: "".join(
+            out[a] for a in argv[2:] if a in out) if argv[:2] == ["dpkg-query", "-S"] else None)
         self.assertEqual(self.p.package_of("/usr/sbin/nginx"), "nginx-core")
         self.assertIsNone(self.p.package_of("/usr/bin/socat"))  # otro fichero que empieza igual
 
@@ -8366,8 +8373,9 @@ class BehaviorWatchTests(unittest.TestCase):
                                  (profile, "_library_events", lambda subjects, now, cfg: []),
                                  (profile, "_read_events", lambda subjects, now, cfg: []),
                                  (profile, "_installed_versions", lambda: dict(self.installed)),
-                                 (profile, "_library_packages", lambda unit, own: {
+                                 (profile, "_library_packages", lambda unit, own, installed=None: {
                                      p: v for p, v in self.installed.items() if p in self.libs.get(unit, ())}),
+                                 (profile, "_warm_unit_owners", lambda units: None),
                                  (trust, "assess_async", lambda pkg, deep=True, urgent=False: {
                                      "state": self.state_of.get(pkg, "done"), **self.trust_of.get(pkg, self.trust)}),
                                  (profile, "_investigate_later",

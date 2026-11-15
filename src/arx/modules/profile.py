@@ -40,6 +40,7 @@ from datetime import datetime, timedelta, timezone
 
 from arx import config
 from arx.i18n import tr
+from arx.modules import pkgdb
 from arx.modules.maintenance import NoAnswer
 
 OBSERVE_DAYS = 40
@@ -51,7 +52,11 @@ OPEN_DIVERSITY = 64   # redes distintas a partir de las cuales el perfil es por 
 ID_HISTORY = 8        # cgroups recientes de cada servicio, para nombrarlo aunque ya se haya reiniciado
 REPORTED_DEDUP_S = 24 * 3600  # como el timeout del elemento nft: el mismo corte no se repite en un día
 MAX_LIBS = 200
-LIBS_PER_SWEEP = 4    # servicios cuyas librerías se aprenden por barrido (dpkg -S por fichero cuesta)
+LIBS_PER_SWEEP = 4    # servicios cuyas librerías se intentan aprender por barrido
+# Un servicio sin librerías que aprender (sin proceso, o un binario estático) no se reintenta cada barrido: espera
+# cada vez más, y se mira antes si aparece un proceso nuevo en su cgroup (arranque o reinicio, es decir, otro MainPID)
+LIBS_RETRY_S = (120, 600, 3600, 6 * 3600)
+LIBS_MIN_S = 60       # entre un intento y el siguiente, aunque el cgroup no pare de cambiar
 PREVENTIVE_MAX = 3    # servicios afectados por una actualización hasta los que se corta mientras se prueba
 MAX_EXECS = 64        # programas distintos que lanza un servicio; más, y no hay perfil de hijos que valga
 MAX_DNS_FINDINGS = 20
@@ -223,8 +228,16 @@ def _package_version(unit: str) -> tuple[str | None, str | None]:
     pkg = provenance.package_of(frag) if frag else None  # NoAnswer sube: no es «sin paquete»
     if not pkg:
         return None, None
-    out = provenance._q(["dpkg-query", "-W", "-f=${Version}", pkg], strict=True, ok=(0, 1))
-    return pkg, (out or "").strip() or None
+    return pkg, pkgdb.version_of(pkg)  # del inventario de esta generación de dpkg; NoAnswer sube
+
+
+def _warm_unit_owners(units: list[str]) -> None:
+    """Los dueños de los ficheros de unidad de varios servicios, en una sola consulta a dpkg: el primer barrido, o
+    el primero tras actualizar Arx, no hace una por servicio. NoAnswer sube."""
+    from arx.modules import provenance
+    frags = [frag for unit in units if (frag := provenance._unit_files(unit)[0])]
+    if frags:
+        pkgdb.owners(frags)
 
 
 def _host_seed() -> bytes:
@@ -416,13 +429,14 @@ def _doc_review_later(path: str, s: dict, cfg: dict) -> None:
 
 
 def _dpkg_changed(st: dict) -> bool:
-    """¿Cambió algún paquete desde el último barrido? Mirar las versiones de todos cada 30 s sobra."""
-    try:
-        mtime = os.path.getmtime("/var/lib/dpkg/status")
-    except OSError:
+    """¿Cambió algún paquete desde el último barrido? Mirar las versiones de todos cada 30 s sobra.
+    Se compara la generación de dpkg (su base entera, no solo la fecha de `status`)."""
+    gen = pkgdb.generation()
+    if gen is None:  # sin identidad no se puede asegurar que nada cambió
         return True
-    changed = st.get("dpkg_mtime") != mtime
-    st["dpkg_mtime"] = mtime
+    changed = st.get("dpkg_gen") != gen
+    st["dpkg_gen"] = gen
+    st.pop("dpkg_mtime", None)  # lo guardaba ≤0.0.9rc2; la primera comparación tras actualizar es un repaso de más
     return changed
 
 
@@ -439,29 +453,57 @@ def _loaded_libraries(unit: str) -> list[str]:
                   and not p.endswith(" (deleted)"))[:MAX_LIBS]
 
 
-def _library_packages(unit: str, own: str | None) -> dict[str, str]:
+def _library_packages(unit: str, own: str | None, installed: dict | None = None) -> dict[str, str]:
     """{paquete: versión} de lo que carga el servicio, sin su propio paquete. xz llegó así: sshd no cambió,
-    cambió liblzma, que sshd cargaba a través de libsystemd."""
-    from arx.modules import provenance
-    pkgs = {provenance.package_of(lib) for lib in _loaded_libraries(unit)}
+    cambió liblzma, que sshd cargaba a través de libsystemd.
+
+    `installed` es el inventario que ya calculó quien llama; sin él se pide a `pkgdb` solo si hay algo que
+    buscar: un servicio sin librerías cargadas no cuesta ninguna consulta a dpkg. Los dueños de todas las
+    librerías se preguntan en una llamada."""
+    libs = _loaded_libraries(unit)
+    if not libs:
+        return {}
+    pkgs = set(pkgdb.owners(libs).values())
     pkgs.discard(None)
     pkgs.discard(own)
-    return {p: v for p, v in _installed_versions().items() if p in pkgs}
+    if installed is None:
+        installed = _installed_versions()
+    return {p: v for p, v in installed.items() if p in pkgs}
 
 
 def _installed_versions() -> dict[str, str]:
-    """Versión de cada paquete instalado (`libc6:arm64` también como `libc6`), de una sola consulta.
-    Sin respuesta de dpkg lanza NoAnswer: un {} se leería como «nada cambió»."""
-    from arx.modules import provenance
-    out = provenance._q(["dpkg-query", "-W", "-f=${Package}:${Architecture}\t${Version}\n"], timeout=30,
-                        strict=True) or ""
-    versions = {}
-    for line in out.splitlines():
-        name, _, version = line.partition("\t")
-        if version:
-            versions[name] = version
-            versions.setdefault(name.partition(":")[0], version)
-    return versions
+    """Versión de cada paquete instalado (`libc6:arm64` también como `libc6`): el inventario de la generación
+    actual de dpkg, que se pide una vez por cambio. Sin respuesta de dpkg lanza NoAnswer: un {} se leería como
+    «nada cambió»."""
+    return pkgdb.installed_versions()
+
+
+def _procs_sig(path: str) -> str:
+    """Huella de los procesos del cgroup: cambia cuando el servicio arranca, se reinicia o se para."""
+    pids = ",".join(str(p) for p in sorted(_cgroup_pids(path)))
+    return hashlib.blake2b(pids.encode(), digest_size=6).hexdigest()
+
+
+def _libs_due(s: dict, path: str, now: datetime) -> bool:
+    """¿Toca intentar aprender las librerías de este servicio? Siempre la primera vez; después, cuando acabó
+    la espera o cuando su cgroup tiene otros procesos (y han pasado LIBS_MIN_S del último intento)."""
+    probe = s.get("libs_probe")
+    if not isinstance(probe, dict):
+        return True
+    at = _parse(probe.get("at"))
+    if not at or now < at:  # un reloj que retrocede no puede dejar a un servicio sin vigilar
+        return True
+    age = (now - at).total_seconds()
+    if age >= float(probe.get("wait") or LIBS_RETRY_S[0]):
+        return True
+    return age >= LIBS_MIN_S and probe.get("procs") != _procs_sig(path)
+
+
+def _libs_wait(s: dict, path: str, now: datetime) -> None:
+    """Sin librerías que aprender: la próxima espera es más larga que la anterior."""
+    last = float((s.get("libs_probe") or {}).get("wait") or 0)
+    wait = next((w for w in LIBS_RETRY_S if w > last), LIBS_RETRY_S[-1])
+    s["libs_probe"] = {"at": _iso(now), "wait": wait, "procs": _procs_sig(path)}
 
 
 def provenance_q(argv: list[str], timeout: int = 10) -> str | None:
@@ -543,7 +585,13 @@ def _updates(subjects: dict, cfg: dict, now: datetime, check_versions: bool = Tr
     except NoAnswer:  # sin versiones no se decide nada: el barrido siguiente vuelve a mirar
         incomplete.append("installed versions")
         return findings
-    learned = 0
+    if check_versions:
+        try:  # los ficheros de unidad de todos, en una consulta, y no una por servicio
+            _warm_unit_owners([s["unit"] for s in subjects.values()])
+        except NoAnswer:
+            incomplete.append("unit owners")
+            return findings
+    probed = 0
     for path, s in subjects.items():
         if not s.get("package"):
             # Visto sin paquete (una unit suelta, o justo mientras se instalaba o desinstalaba): si dpkg cambió,
@@ -570,13 +618,17 @@ def _updates(subjects: dict, cfg: dict, now: datetime, check_versions: bool = Tr
             _investigate_later(pkg, tr("service {unit} was updated from {old} to {new}", unit=s["unit"],
                                        old=old, new=version), cfg, version=version)
         if s.get("libs") is None:
-            if learned < LIBS_PER_SWEEP:  # de a pocos en cada barrido: dpkg -S por fichero cuesta
+            if probed < LIBS_PER_SWEEP and _libs_due(s, path, now):  # de a pocos, y sin insistir donde no hay nada
+                probed += 1
                 try:
-                    libs = _library_packages(s["unit"], pkg)
+                    libs = _library_packages(s["unit"], pkg, installed if check_versions else None)
                 except NoAnswer:
-                    libs = {}  # se reintenta en otro barrido
-                if libs:  # un servicio parado no carga nada todavía: se reintenta
-                    s["libs"], learned = libs, learned + 1
+                    libs = None  # dpkg no contestó: sin esperar más, se reintenta en otro barrido
+                if libs:
+                    s["libs"] = libs
+                    s.pop("libs_probe", None)
+                elif libs is not None:  # un servicio parado no carga nada todavía: espera cada vez más
+                    _libs_wait(s, path, now)
         elif check_versions:
             for lib, old in sorted(s["libs"].items()):
                 new = installed.get(lib)
@@ -590,7 +642,7 @@ def _updates(subjects: dict, cfg: dict, now: datetime, check_versions: bool = Tr
             # lo ya conocido se queda (tras actualizarse, la vieja sale como «(deleted)» hasta reiniciar)
             known = {lib: installed[lib] for lib in s["libs"] if lib in installed}
             try:
-                s["libs"] = {**known, **_library_packages(s["unit"], pkg)}
+                s["libs"] = {**known, **_library_packages(s["unit"], pkg, installed)}
             except NoAnswer:
                 s["libs"] = {**s["libs"], **known}
         since = _parse(s.get("recheck"))
@@ -770,7 +822,14 @@ def sweep(enforce: bool = False, cfg: dict | None = None, now: datetime | None =
         st = load()
         subjects = st.setdefault("subjects", {})
         reported = st.setdefault("reported", {})
-        for path in running_services():
+        running = running_services()
+        fresh = [p for p in running if p not in subjects and p not in confined and _PATH_RE.match(p)]
+        if len(fresh) > 1:  # varios servicios nuevos a la vez (el primer arranque): sus unidades, en una consulta
+            try:
+                _warm_unit_owners([p.rsplit("/", 1)[-1] for p in fresh])
+            except NoAnswer:  # dpkg no contestó: sin paquete conocido no se crea ningún perfil; otro barrido
+                running = []
+        for path in running:
             if path not in subjects and path not in confined and _PATH_RE.match(path):
                 subject = _new_subject(path, now, cfg)
                 if subject:
@@ -780,6 +839,7 @@ def sweep(enforce: bool = False, cfg: dict | None = None, now: datetime | None =
         findings += _updates(subjects, cfg, now, check_versions=_dpkg_changed(st), enforce=enforce,
                              incomplete=incomplete)
         if incomplete:  # dpkg no contestó a todo: el cambio no se da por visto y el barrido siguiente lo repite
+            st.pop("dpkg_gen", None)
             st.pop("dpkg_mtime", None)
         findings += _exec_events(subjects, now, cfg, st)
         findings += _dns_events(subjects, now, cfg)

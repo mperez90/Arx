@@ -25,10 +25,10 @@ import subprocess
 import time
 
 from arx.i18n import tr
-from arx.modules import maintenance
+from arx.modules import maintenance, pkgdb
 
 DPKG_INFO = "/var/lib/dpkg/info"
-CACHE_S = 300
+CACHE_S = 300  # lo que depende de apt (origen firmado); lo que depende de dpkg se invalida por su generación
 MAX_HASH_BYTES = 1024 * 1024 * 1024
 # El código real de un intérprete está en el script: verificar `python3` no dice nada del programa.
 _INTERPRETER_RE = re.compile(r"^(?:python[0-9.]*|perl[0-9.]*|ruby[0-9.]*|node(?:js)?|php[0-9.]*|"
@@ -68,6 +68,7 @@ def _cached(key, fn):
 
 def clear_cache() -> None:
     _cache.clear()
+    pkgdb.clear()
 
 
 NoAnswer = maintenance.NoAnswer  # ver maintenance.NoAnswer
@@ -98,34 +99,15 @@ def available() -> bool:
     return bool(shutil.which("dpkg-query") and shutil.which("apt-cache") and os.path.isdir(DPKG_INFO))
 
 
-def _variants(path: str) -> list[str]:
-    """La misma ruta antes y después de la fusión de /usr: dpkg puede conocer cualquiera."""
-    out = [path]
-    real = os.path.realpath(path)
-    if real != path:
-        out.append(real)
-    for p in list(out):
-        for short in ("/bin/", "/sbin/", "/lib/", "/lib64/"):
-            if p.startswith("/usr" + short):
-                out.append(p[4:])
-            elif p.startswith(short):
-                out.append("/usr" + p)
-    return list(dict.fromkeys(out))
+_variants = pkgdb.variants  # la misma ruta antes y después de la fusión de /usr
 
 
 def package_of(path: str) -> str | None:
-    """Paquete dueño de un fichero (`nginx`, o `libc6:arm64` en multiarch). None si no es de nadie."""
-    def look():
-        for p in _variants(path):
-            out = _q(["dpkg-query", "-S", p], strict=True, ok=(0, 1))  # 1: de ningún paquete
-            for line in (out or "").splitlines():
-                if line.startswith(("diversion by", "local diversion")):
-                    continue
-                pkgs, sep, f = line.partition(": ")
-                if sep and f.strip() == p:
-                    return pkgs.split(",")[0].strip()
-        return None
-    return _cached(("pkg", path), look)
+    """Paquete dueño de un fichero (`nginx`, o `libc6:arm64` en multiarch). None si no es de nadie.
+
+    Sale de `pkgdb`: una llamada a dpkg por lote y por cambio de dpkg, no una por fichero cada 5 minutos.
+    Sin respuesta de dpkg lanza NoAnswer: no es «de ningún paquete», ni se guarda."""
+    return pkgdb.owner(path)
 
 
 def _md5_file(path: str) -> str | None:
@@ -227,8 +209,8 @@ def signed_origin(pkg: str) -> tuple[bool, str]:
 
 
 def source_package(pkg: str) -> str:
-    out = _q(["dpkg-query", "-W", "-f=${source:Package}", pkg], strict=True, ok=(0, 1))
-    return (out or "").strip() or pkg.partition(":")[0]
+    found = pkgdb.lookup(pkg)
+    return (found.source if found else "") or pkg.partition(":")[0]
 
 
 def unit_of(pid: int) -> tuple[str, str] | None:

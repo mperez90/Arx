@@ -41,7 +41,7 @@ from datetime import datetime, timezone
 
 from arx import config
 from arx.i18n import tr
-from arx.modules import maintenance
+from arx.modules import maintenance, pkgdb
 
 TRUST_MIN = 0.98
 CACHE_DAYS = 7
@@ -100,15 +100,15 @@ def _check(name: str, result: str, detail: str, required: bool = False) -> dict:
 
 
 def package_facts(pkg: str) -> dict | None:
+    """Versión, arquitectura y paquete fuente de lo instalado, del inventario de dpkg (`pkgdb`): una consulta por
+    cambio de dpkg, no una por paquete. Sin respuesta de dpkg lanza NoAnswer."""
     if not PKG_RE.match(pkg):
         return None
-    rc, out = _run(["dpkg-query", "-W", "-f=${Version}\t${Architecture}\t${source:Package}\t${source:Version}",
-                    pkg])
-    parts = out.split("\t") if rc == 0 else []
-    if len(parts) != 4 or not VERSION_RE.match(parts[0]):
+    found = pkgdb.lookup(pkg)
+    if found is None or not VERSION_RE.match(found.version):
         return None
-    return {"package": pkg, "version": parts[0], "arch": parts[1], "source": parts[2] or pkg,
-            "source_version": parts[3] or parts[0]}
+    return {"package": pkg, "version": found.version, "arch": found.arch, "source": found.source or pkg,
+            "source_version": found.source_version or found.version}
 
 
 def os_release() -> dict:
