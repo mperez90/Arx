@@ -378,6 +378,10 @@ ES = {
         "respuesta vacía",
     "the model declined the request":
         "el modelo declinó la petición",
+    "the answer is not a JSON object":
+        "la respuesta no es un objeto JSON",
+    "the answer was cut off":
+        "la respuesta se cortó por el límite de tokens",
     "no provider responded: ":
         "ningún proveedor respondió — ",
     "{prov}: no key or model":
@@ -774,6 +778,8 @@ ES = {
         "  acciones automáticas  {automatic_actions}",
     "  accounts locked by the model  {accounts_locked_by_model}":
         "  cuentas que bloqueó el modelo  {accounts_locked_by_model}",
+    "  model verdicts        {valid}/{asked} valid  ({absent} missing)":
+        "  veredictos del modelo  {valid}/{asked} válidos  ({absent} sin veredicto)",
     "\n  A false positive only counts if you mark it (arx accept, arx unlock): whatever you do not review":
         "\n  Un falso positivo solo cuenta si lo marcas (arx accept, arx unlock): lo que no revises",
     "  shows as «unreviewed», not as a hit. To share only the numbers: arx metrics --json\n":

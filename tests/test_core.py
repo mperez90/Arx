@@ -2876,10 +2876,11 @@ class VerdictTests(unittest.TestCase):
     def test_slow_layer_acts_and_always_tells_the_owner(self):
         sent = []
         pair = self._pair()
-        answer = ('Intruso probable.\nVERDICTS: [{"id": "%s", "verdict": "threat", "confidence": 92, '
-                  '"reason": "r"}]' % pair[1]["fp"])
+        answer = "Intruso probable."  # el análisis es para la persona; el veredicto llega por su canal (B79)
+        verdicts = [{"id": pair[1]["fp"], "verdict": "threat", "confidence": 92, "reason": "r"}]
         base = {"meta": {}, "sets": {}}
         with mock.patch.object(self.g, "_assess_with_engine", lambda *a: answer), \
+             mock.patch.object(self.g, "_verdicts_with_engine", lambda *a: verdicts), \
              mock.patch.object(self.g.notify, "channels", lambda cfg=None: ["webhook"]), \
              mock.patch.object(self.g.notify, "worth_alerting", lambda *a: False), \
              mock.patch.object(self.g.notify, "send", lambda text, cfg=None: sent.append(text)):

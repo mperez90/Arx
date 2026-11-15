@@ -17,6 +17,62 @@ from arx.i18n import tr
 
 TARGET_FP_PER_DAY = 0.1
 _HIGH = ("high", "crit")
+VERDICT_STATS_DAYS = 60  # los contadores de veredictos del modelo se guardan por día y se olvidan pasado esto
+
+
+# ── veredictos del modelo: solo números ──────────────────────────────────────
+def verdict_stats_path():
+    return config.state_dir() / "verdict_stats.json"
+
+
+def verdict_stats() -> dict:
+    stats = config.read_json(verdict_stats_path(), {})
+    return stats if isinstance(stats, dict) else {}
+
+
+def count_verdicts(provider: str | None, asked: int, valid: int, how: str | None) -> None:
+    """Una consulta de veredictos: cuántos se pidieron, cuántos llegaron válidos, de qué proveedor y por qué vía
+    («native» o «fallback»; None si no hubo respuesta). Solo cifras: nada de lo que el modelo dijo."""
+    now = datetime.now(timezone.utc)
+    today = now.date().isoformat()
+    oldest = (now - timedelta(days=VERDICT_STATS_DAYS)).date().isoformat()
+    with config.locked("verdict-stats"):
+        stats = {d: v for d, v in verdict_stats().items() if isinstance(v, dict) and d >= oldest}
+        day = stats.setdefault(today, {"asked": 0, "valid": 0, "by_provider": {}, "paths": {}})
+        day["asked"] += asked
+        day["valid"] += valid
+        by = day["by_provider"].setdefault(provider or "none", {"asked": 0, "valid": 0})
+        by["asked"] += asked
+        by["valid"] += valid
+        if how:
+            day["paths"][how] = day["paths"].get(how, 0) + 1
+        config.write_json(verdict_stats_path(), stats)
+
+
+def _verdict_numbers(days: int, now: datetime) -> dict:
+    since = (now - timedelta(days=days)).date().isoformat()
+    asked = valid = 0
+    by_provider: dict[str, dict] = {}
+    paths: dict[str, int] = {}
+    for day, v in verdict_stats().items():
+        if not isinstance(v, dict) or day < since:
+            continue
+        asked += int(v.get("asked", 0))
+        valid += int(v.get("valid", 0))
+        for prov, n in (v.get("by_provider") or {}).items():
+            into = by_provider.setdefault(str(prov), {"asked": 0, "valid": 0})
+            into["asked"] += int(n.get("asked", 0))
+            into["valid"] += int(n.get("valid", 0))
+        for how, n in (v.get("paths") or {}).items():
+            paths[str(how)] = paths.get(str(how), 0) + int(n)
+    return {
+        "model_verdicts_asked": asked,
+        "model_verdicts_valid": valid,
+        "model_verdicts_absent": max(0, asked - valid),
+        "model_verdict_valid_rate": round(valid / asked, 3) if asked else None,
+        "model_verdicts_by_provider": dict(sorted(by_provider.items())),
+        "model_verdict_paths": dict(sorted(paths.items())),
+    }
 
 
 def _events() -> list[dict]:
@@ -78,6 +134,7 @@ def compute(days: int = 7, now: datetime | None = None) -> dict:
         "accounts_locked_by_model": sum(e.get("kind") == "identity_contained" and bool(e.get("verdict"))
                                         for e in window),
         "high_by_kind": dict(sorted(by_kind.items())),
+        **_verdict_numbers(days, now),
         "target_fp_per_day": TARGET_FP_PER_DAY,
         "within_target": within,  # None: depende de las alertas que aún no ha revisado nadie
     }
@@ -108,6 +165,10 @@ def run(days: int = 7, as_json: bool = False) -> int:
     if m["accounts_locked_by_model"]:
         print(tr("  accounts locked by the model  {accounts_locked_by_model}",
                  accounts_locked_by_model=m['accounts_locked_by_model']))
+    if m["model_verdicts_asked"]:
+        print(tr("  model verdicts        {valid}/{asked} valid  ({absent} missing)",
+                 valid=m['model_verdicts_valid'], asked=m['model_verdicts_asked'],
+                 absent=m['model_verdicts_absent']))
     for kind, n in m["high_by_kind"].items():
         print(f"    {kind:<18} {n}")
     print(tr("\n  A false positive only counts if you mark it (arx accept, arx unlock): whatever "
