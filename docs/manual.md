@@ -856,7 +856,7 @@ tree, behavior watching does not work. LXC containers work like a machine.
 | `arx recon` | `--json <path>`, `--no-save` | map the server |
 | `arx learn` | `--samples <n>`, `--interval <s>`, `--seal`, `--status` | learn the baseline |
 | `arx guard` | `--enforce`, `--interval <s>`, `--once`, `--verbose`, `--chat` | watch, detect, respond |
-| `arx service` | `install [--enforce] [--exec <path>]`, `uninstall`, `status` | run 24/7 with systemd |
+| `arx service` | `install [--enforce] [--exec <path>]`, `uninstall`, `status`, `restore` | run 24/7 with systemd |
 | `arx status` | `--json` | how things stand |
 | `arx accept` | `[<id>] [--dir \| --children]` | accept a legitimate change |
 | `arx authorize` | `[<id>]` | approve a Tier 2 action (word) |
@@ -870,10 +870,12 @@ tree, behavior watching does not work. LXC containers work like a machine.
 | `arx proposals` | `list`, `apply <id>`, `revert <id>` | what Arx suggests (word) |
 | `arx metrics` | `--days <n>`, `--json` | noise on this host |
 | `arx notify` | `test` | test the alert channels |
-| `arx telemetry` | `status`, `show`, `enable`, `disable`, `send` | improvement program |
+| `arx telemetry` | `status`, `show`, `enable`, `disable`, `send`, `ask` | improvement program |
 | `arx license` | `activate <KEY>`, `status`, `deactivate` | license |
 | `arx fleet` | `enroll --console <URL> --token <TOKEN>`, `status`, `sync` | fleet console (Business) |
 | `arx shell` | | interactive console |
+
+**Internal:** `service stopped`, `service down` and `service refresh-maintenance` are run by the systemd units and the package upgrade. Not for manual use.
 
 **Exit codes.** 0 when the command did what was asked; 1 when it could not, or the answer is
 negative (a wrong word, a file that is not clean, nothing sent); 2 for a usage error.

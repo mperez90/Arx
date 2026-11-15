@@ -869,7 +869,7 @@ una máquina.
 | `arx recon` | `--json <ruta>`, `--no-save` | el mapa del servidor |
 | `arx learn` | `--samples <n>`, `--interval <s>`, `--seal`, `--status` | aprender la línea base |
 | `arx guard` | `--enforce`, `--interval <s>`, `--once`, `--verbose`, `--chat` | vigilar, detectar, responder |
-| `arx service` | `install [--enforce] [--exec <ruta>]`, `uninstall`, `status` | funcionar 24/7 con systemd |
+| `arx service` | `install [--enforce] [--exec <ruta>]`, `uninstall`, `status`, `restore` | funcionar 24/7 con systemd |
 | `arx status` | `--json` | cómo está todo |
 | `arx accept` | `[<id>] [--dir \| --children]` | aceptar un cambio legítimo |
 | `arx authorize` | `[<id>]` | aprobar una acción Tier 2 (palabra) |
@@ -883,10 +883,12 @@ una máquina.
 | `arx proposals` | `list`, `apply <id>`, `revert <id>` | lo que Arx sugiere (palabra) |
 | `arx metrics` | `--days <n>`, `--json` | ruido en este host |
 | `arx notify` | `test` | probar los canales de alerta |
-| `arx telemetry` | `status`, `show`, `enable`, `disable`, `send` | programa de mejora |
+| `arx telemetry` | `status`, `show`, `enable`, `disable`, `send`, `ask` | programa de mejora |
 | `arx license` | `activate <CLAVE>`, `status`, `deactivate` | licencia |
 | `arx fleet` | `enroll --console <URL> --token <TOKEN>`, `status`, `sync` | consola de flota (Business) |
 | `arx shell` | | consola interactiva |
+
+**Internos:** `service stopped`, `service down` y `service refresh-maintenance` los ejecutan las unidades de systemd y la actualización del paquete. No son para uso manual.
 
 **Códigos de salida.** 0 cuando el comando hizo lo pedido; 1 cuando no pudo, o la respuesta es
 negativa (una palabra equivocada, un fichero que no está limpio, nada enviado); 2 ante un error de
