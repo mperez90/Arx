@@ -34,17 +34,13 @@ TODO: confirmar con arx-98 — the rc2 items below are carried over; check each 
 TODO: confirmar con arx-98 — the entries below are placeholders. Each one needs its final wording, its
 test reference and its evidence before it is published. Do not describe behavior until arx-98 confirms it.
 
-### Alerts about Arx's own service files
-
-TODO: confirmar con arx-98 — ítem interno B73. Behavior after the fix.
-
 ### Installer output
 
 TODO: confirmar con arx-98 — ítem interno B75. Behavior after the fix.
 
 ### Critical configuration is checked by meaning, file by file
 
-BORRADOR. TODO: confirmar con arx-98 (fuentes: d7220be + 0e94db4; incluye B73 y HZ#1-5). No lab figures.
+BORRADOR. TODO: confirmar con arx-98 (fuentes: d7220be + 0e94db4). No lab figures.
 
 Each critical file is now tracked on its own: its contents, what a change means, its permissions, its
 owner and, for a link, its target. Arx no longer reports one hash for a whole group.
@@ -70,10 +66,9 @@ owner and, for a link, its target. Arx no longer reports one hash for a whole gr
 changed group is rebuilt from the vault if its copy matches what was sealed and is judged by meaning;
 otherwise its group alert stays until you accept it.
 
-### Arx uses almost nothing while the host is quiet
+### Package checks run only when packages change
 
-BORRADOR. TODO: confirmar con arx-98 (fuentes: 1552c3a + 7d5ead9). The title claims "almost nothing";
-only a bounded dpkg query budget is tested, and no measurement is published here. No lab figures.
+BORRADOR. TODO: confirmar con arx-98 (fuentes: 1552c3a + 7d5ead9). No lab figures.
 
 While the host is quiet, Arx asks dpkg only when dpkg's state changes: when a transaction finishes or is
 running, or when diversions change. It no longer repeats the full package inventory on every sweep.
