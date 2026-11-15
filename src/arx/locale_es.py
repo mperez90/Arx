@@ -1977,4 +1977,53 @@ ES = {
         "   Arx puede enviar un informe de uso anónimo cada pocos días: versión, sistema, cómo van sus\n   vigilantes y cuánto ruido hace. Nunca nombres de host, IPs, rutas, usuarios, comandos ni\n   secretos. Míralo tal cual:  arx telemetry show",
     "   Join? (y/n)":
         "   ¿Te unes? (s/n)",
+    # B77 · significado de la configuración crítica
+    'the file can no longer be understood ({why}): review it by hand':
+        'el fichero ya no se puede interpretar ({why}): revísalo a mano',
+    'the order of entries changed':
+        'cambió el orden de las entradas',
+    'APT repository without signature check: {repos}':
+        'repositorio APT sin comprobación de firma: {repos}',
+    'new APT repository, accepted with any key the system trusts: {repos}':
+        'repositorio APT nuevo, aceptado con cualquier clave de confianza del sistema: {repos}',
+    'new APT repository: {repos}':
+        'repositorio APT nuevo: {repos}',
+    'APT repository options changed: {repos}':
+        'cambiaron las opciones de un repositorio APT: {repos}',
+    'APT repository removed: {repos}':
+        'repositorio APT retirado: {repos}',
+    'APT setting that runs commands or skips signatures: {items}':
+        'ajuste de APT que ejecuta órdenes o se salta las firmas: {items}',
+    'APT setting changed: {items}':
+        'cambió un ajuste de APT: {items}',
+    'systemd unit removed':
+        'unidad de systemd retirada',
+    'what systemd runs changed: {items}':
+        'cambió lo que ejecuta systemd: {items}',
+    'systemd setting changed: {items}':
+        'cambió un ajuste de systemd: {items}',
+    'new SSH key accepted: {keys}':
+        'nueva clave SSH aceptada: {keys}',
+    'SSH key options changed: {keys}':
+        'cambiaron las opciones de una clave SSH: {keys}',
+    'unrecognized line in authorized_keys':
+        'línea no reconocida en authorized_keys',
+    'SSH key removed: {keys}':
+        'clave SSH retirada: {keys}',
+    '{group} grants something new: {items}':
+        '{group} concede algo nuevo: {items}',
+    '{group} lost entries: {items}':
+        '{group} perdió entradas: {items}',
+    'new scheduled command: {items}':
+        'nueva orden programada: {items}',
+    'scheduled command removed: {items}':
+        'orden programada retirada: {items}',
+    'accounts changed: {items}':
+        'cambiaron las cuentas: {items}',
+    'new APT signing key':
+        'nueva clave de firma de APT',
+    'APT signing key removed':
+        'clave de firma de APT retirada',
+    '{group} changed':
+        'cambió {group}',
 }
