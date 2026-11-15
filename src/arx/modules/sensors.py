@@ -41,7 +41,10 @@ IDENT_WATCH = ["/etc/passwd", "/etc/shadow", "/etc/group", "/etc/sudoers", "/etc
 # B77: quién escribe la configuración crítica (solo autoría: estos eventos no son hallazgos por sí mismos)
 CFG_KEY = "arx_cfg"
 CFG_WATCH = ["/etc/apt", "/etc/systemd/system", "/usr/local/lib/systemd", "/etc/crontab", "/etc/cron.d",
-             "/etc/cron.hourly", "/etc/cron.daily", "/etc/cron.weekly", "/etc/cron.monthly", "/var/spool/cron"]
+             "/etc/cron.hourly", "/etc/cron.daily", "/etc/cron.weekly", "/etc/cron.monthly", "/var/spool/cron",
+             # persistencias fuera de systemd y cron; en /root, ficheros sueltos (no el historial de la shell)
+             "/etc/rc.local", "/etc/profile", "/etc/profile.d", "/etc/bash.bashrc", "/etc/environment",
+             "/etc/ld.so.conf", "/etc/ld.so.conf.d", "/root/.bashrc", "/root/.profile", "/root/.bash_profile"]
 WRITERS_STATE = "cfg-writers.json"
 WRITERS_PER_PATH = 8
 WRITERS_PATHS = 2000

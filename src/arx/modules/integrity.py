@@ -62,6 +62,11 @@ def groups() -> dict[str, list[str]]:
         "apt_sources": ["/etc/apt/sources.list", *glob.glob("/etc/apt/sources.list.d/*")],
         "apt_conf": ["/etc/apt/apt.conf", *glob.glob("/etc/apt/apt.conf.d/*")],
         "apt_keys": ["/etc/apt/trusted.gpg", *glob.glob("/etc/apt/trusted.gpg.d/*"), *glob.glob("/etc/apt/keyrings/*")],
+        # persistencias clásicas que no pasan por systemd ni cron (HZ#M3-6: rc-local.service ejecuta /etc/rc.local)
+        "rc_local": ["/etc/rc.local"],
+        "shell_init": ["/etc/profile", *glob.glob("/etc/profile.d/*"), "/etc/bash.bashrc", "/etc/environment",
+                       "/root/.bashrc", "/root/.profile", "/root/.bash_profile", "/root/.bash_login"],
+        "ld_conf": ["/etc/ld.so.conf", *glob.glob("/etc/ld.so.conf.d/*")],
     }
 
 

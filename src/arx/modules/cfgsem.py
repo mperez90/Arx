@@ -450,6 +450,7 @@ _ANALYZERS = {
     "apt_sources": apt_sources, "apt_conf": apt_conf, "systemd": systemd_unit,
     "authorized_keys_root": authorized_keys, "authorized_keys_users": authorized_keys,
     "sudoers": lines, "sudoers_d": lines, "ld_preload": lines, "cron": lines, "passwd": lines,
+    "rc_local": lines, "shell_init": lines, "ld_conf": lines,
 }
 
 
@@ -561,6 +562,14 @@ def classify(group: str, before: Parsed | None, after: Parsed | None) -> Change 
         if added:
             return Change("high", tr("new scheduled command: {items}", items=_short(added)), added, removed)
         return Change("low", tr("scheduled command removed: {items}", items=_short(removed)), added, removed)
+    if group in ("rc_local", "shell_init", "ld_conf"):
+        what = {"rc_local": tr("runs as root at every boot"), "shell_init": tr("runs in every login shell"),
+                "ld_conf": tr("changes where every program loads its libraries from")}[group]
+        if added:
+            return Change("high", tr("new line in a file that {what}: {items}", what=what, items=_short(added)),
+                          added, removed)
+        return Change("low", tr("line removed from a file that {what}: {items}", what=what, items=_short(removed)),
+                      added, removed)
     if group == "passwd":
         return Change("high" if added else "med", tr("accounts changed: {items}", items=_short(added or removed)),
                       added, removed)

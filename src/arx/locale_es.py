@@ -2105,4 +2105,14 @@ ES = {
         'la versión instalada no la sirve ningún repositorio firmado',
     "'{path}' belongs to Arx itself: it is not restored or quarantined":
         "'{path}' es del propio Arx: no se restaura ni se pone en cuarentena",
+    'runs as root at every boot':
+        'se ejecuta como root en cada arranque',
+    'runs in every login shell':
+        'se ejecuta en cada shell de inicio de sesión',
+    'changes where every program loads its libraries from':
+        'cambia de dónde carga sus librerías cada programa',
+    'new line in a file that {what}: {items}':
+        'línea nueva en un fichero que {what}: {items}',
+    'line removed from a file that {what}: {items}':
+        'línea retirada de un fichero que {what}: {items}',
 }

