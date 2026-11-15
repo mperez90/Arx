@@ -143,10 +143,15 @@ def _integrity_drift(base: dict, include_suid: bool) -> list[dict]:
         baseline.adopt_integrity_files(files, replace=True)
         base["integrity_files"] = files
         if newly:
-            findings.append({"sev": "med", "kind": "integrity_watch_added", "set": "integrity",
+            risky = integrity.risky_preexisting(newly, now_files, owner=pkgdb.owner)
+            detail = tr("Arx now also watches {n} configuration file(s); what was already there "
+                        "was taken as known: {files}", n=len(newly), files=", ".join(newly[:10]))
+            if risky:
+                detail += " — " + tr("{n} of them run commands or grant trust and belong to no package: {files}",
+                                     n=len(risky), files=", ".join(risky[:10]))
+            findings.append({"sev": "high" if risky else "med", "kind": "integrity_watch_added", "set": "integrity",
                              "item": ",".join(newly[:20]),
-                             "detail": tr("Arx now also watches {n} configuration file(s); what was already there "
-                                          "was taken as known: {files}", n=len(newly), files=", ".join(newly[:10])),
+                             "detail": detail,
                              "why": tr("they were there before Arx looked at them: review them once; any change "
                                        "from now on is reported"),
                              "fp_key": f"integrity_watch_added|{len(newly)}|{newly[0]}"})

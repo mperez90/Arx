@@ -25,6 +25,7 @@ from arx.i18n import tr
 from arx.modules import cfgsem
 
 MAX_FILES_PER_GROUP = 2_000
+MAX_HASH = 64 << 20   # se hashea entero hasta aquí: añadir detrás del primer MB no puede pasar inadvertido
 MAX_DIFF_LINES = 40
 OWN_MANIFEST = "own-artifacts.json"
 
@@ -64,7 +65,10 @@ def groups() -> dict[str, list[str]]:
 
 
 def _read_safely(path: str) -> tuple[dict | None, bytes | None]:
-    """(metadatos, contenido) sin seguir enlaces ni bloquearse. (None, None) si no existe."""
+    """(metadatos, contenido) sin seguir enlaces ni bloquearse. (None, None) si no existe.
+
+    El contenido devuelto es el primer MB (lo que se analiza); `meta` lleva el tamaño y el sha256 del fichero
+    ENTERO (hasta MAX_HASH), para que lo añadido detrás también cambie la huella."""
     try:
         st = os.lstat(path)
     except OSError:
@@ -88,6 +92,12 @@ def _read_safely(path: str) -> tuple[dict | None, bytes | None]:
         if not stat.S_ISREG(fst.st_mode):
             return meta, None
         data = f.read(cfgsem.MAX_TEXT + 1)
+        h, seen = hashlib.sha256(data), len(data)
+        while seen < MAX_HASH and (chunk := f.read(min(1 << 20, MAX_HASH - seen))):
+            h.update(chunk)
+            seen += len(chunk)
+    meta["size"] = fst.st_size
+    meta["full_sha"] = h.hexdigest()
     return meta, data
 
 
@@ -115,7 +125,7 @@ def state(path: str, group: str) -> dict | None:
         out["ok"] = "link" in meta  # un enlace se compara por su destino; lo especial no se entiende
         out["canon"] = None
         return out
-    out["sha"] = hashlib.sha256(data).hexdigest()
+    out["sha"] = out.pop("full_sha", None) or hashlib.sha256(data).hexdigest()
     if group == "apt_keys":
         parsed = cfgsem.analyze(group, data)
     else:
@@ -250,7 +260,7 @@ def drift(sealed: dict[str, dict], now: dict[str, dict], own: dict[str, str] | N
         if path in skip:
             continue
         b, a = sealed.get(path), now.get(path)
-        if b and a and all(b.get(k) == a.get(k) for k in ("sha", "link", "mode", "uid", "gid", "special")):
+        if b and a and all(b.get(k) == a.get(k) for k in ("sha", "link", "mode", "uid", "gid", "special", "size")):
             continue
         group = (a or b)["g"]
         if path in own:
@@ -264,12 +274,13 @@ def drift(sealed: dict[str, dict], now: dict[str, dict], own: dict[str, str] | N
                                      tr("someone changed Arx itself: it could be switched off or turned against you"),
                                      kind="self_tamper"))
             continue
+        if b and a and _loosened(b, a):
+            # HZ#6 de Q: con un cambio de contenido nulo (un comentario) esto quedaba en silencio
+            findings.append(_finding("high", group, path, a,
+                                     tr("permissions or owner of {path} changed (now {mode:o}, uid {uid})",
+                                        path=path, mode=a.get("mode", 0), uid=a.get("uid")),
+                                     tr("someone else can now write a critical file"), tag="perm"))
         if b and a and b.get("sha") == a.get("sha") and b.get("link") == a.get("link"):
-            if _loosened(b, a):
-                findings.append(_finding("high", group, path, a,
-                                         tr("permissions or owner of {path} changed (now {mode:o}, uid {uid})",
-                                            path=path, mode=a.get("mode", 0), uid=a.get("uid")),
-                                         tr("someone else can now write a critical file")))
             continue
         if (a and "special" in a) or (b and "special" in b):
             findings.append(_finding("high", group, path, a, tr("{path} is no longer a regular file", path=path),
@@ -313,8 +324,10 @@ def drift(sealed: dict[str, dict], now: dict[str, dict], own: dict[str, str] | N
 
 
 def _finding(sev: str, group: str, path: str, now: dict | None, detail: str, why: str,
-             kind: str = "integrity") -> dict:
-    tag = (now or {}).get("sha") or (now or {}).get("link") or "gone"
+             kind: str = "integrity", tag: str = "") -> dict:
+    tag = (tag + ":" if tag else "") + ((now or {}).get("sha") or (now or {}).get("link") or "gone")
+    if tag.startswith("perm:"):
+        tag += f":{(now or {}).get('mode')}:{(now or {}).get('uid')}:{(now or {}).get('gid')}"
     return {"sev": sev, "kind": kind, "detail": detail, "why": why,
             "fp_key": f"integrity|{path}|{tag}",
             "target": {"file": group, "path": path}, "set": "integrity", "item": path}
@@ -337,6 +350,26 @@ def legacy_groups() -> dict[str, list[str]]:
         "apt_keys": ["/etc/apt/trusted.gpg", *glob.glob("/etc/apt/trusted.gpg.d/*"),
                      *glob.glob("/etc/apt/keyrings/*")],
     }
+
+
+def risky_preexisting(paths: list[str], now: dict[str, dict], owner=None) -> list[str]:
+    """De lo que se empieza a vigilar al migrar, lo que ejecuta órdenes o da confianza (crit/high si fuera
+    nuevo) y no pertenece a ningún paquete: persistencia que pudo plantarse antes de que Arx mirara."""
+    out = []
+    for p in paths:
+        s = now.get(p)
+        if not s:
+            continue
+        ch = cfgsem.classify(s["g"], None, _parsed(s)) if "link" not in s else cfgsem.Change("high", "link")
+        if ch is None or ch.sev not in ("crit", "high"):
+            continue
+        try:
+            pkg = owner(p) if owner else None
+        except Exception:  # noqa: BLE001 - sin respuesta de dpkg, se nombra (más vale revisarlo)
+            pkg = None
+        if not pkg:
+            out.append(p)
+    return out
 
 
 def migrate(sealed_groups: dict[str, str], now: dict[str, dict], legacy_now: dict[str, str],

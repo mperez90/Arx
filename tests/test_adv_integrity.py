@@ -16,6 +16,7 @@ import os
 import sys
 import unittest
 
+os.environ["ARX_LANG"] = "es"  # antes de importar Arx: el idioma se fija con la primera traducción
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from arx.modules import integrity as I  # noqa: E402

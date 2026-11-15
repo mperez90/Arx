@@ -13,7 +13,10 @@ import re
 from arx import config
 from arx.i18n import tr
 
-REDACTED = tr("«redacted»")
+def redacted() -> str:
+    """El texto que sustituye a un secreto, en el idioma de ahora (no en el del primer import: traducir al
+    importar congelaba el idioma del proceso entero antes de leer la configuración)."""
+    return tr("«redacted»")
 
 # Prefijos de llave habituales, como red de seguridad ante secretos no registrados.
 _PREFIX_PATTERNS = [
@@ -47,9 +50,9 @@ def scrub(text: str) -> str:
     if not text:
         return text
     for sec in known_secrets():
-        text = text.replace(sec, REDACTED)
+        text = text.replace(sec, redacted())
     for pat in _PREFIX_PATTERNS:
-        text = pat.sub(REDACTED, text)
+        text = pat.sub(redacted(), text)
     return text
 
 

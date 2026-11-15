@@ -2062,4 +2062,6 @@ ES = {
         ', uid de login {auid}, sesión {ses}',
     'by {exe} (pid {pid}, uid {uid}{session})':
         'por {exe} (pid {pid}, uid {uid}{session})',
+    '{n} of them run commands or grant trust and belong to no package: {files}':
+        '{n} de ellos ejecutan órdenes o dan confianza y no son de ningún paquete: {files}',
 }

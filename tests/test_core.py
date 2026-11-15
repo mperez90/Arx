@@ -6115,7 +6115,7 @@ class SelfProtectionTests(unittest.TestCase):
         self.assertEqual(entry["kind"], "notify_result")
         self.assertEqual(entry["event"], "self_stopped")
         self.assertEqual(entry["results"]["telegram"], "ok")
-        self.assertIn(redact.REDACTED, entry["results"]["webhook"])
+        self.assertIn(redact.redacted(), entry["results"]["webhook"])
         self.assertNotIn(token, entry["results"]["webhook"])
 
     def test_nested_secrets_are_redacted_at_the_incident_writer_boundary(self):
@@ -6128,7 +6128,7 @@ class SelfProtectionTests(unittest.TestCase):
         raw = open(response._incidents_path(), encoding="utf-8").read()
         self.assertNotIn(token, raw)
         entry = json.loads(raw)
-        self.assertEqual(entry["results"]["channels"][0]["detail"], redact.REDACTED)
+        self.assertEqual(entry["results"]["channels"][0]["detail"], redact.redacted())
         self.assertTrue(entry["results"]["ok"])
 
 
@@ -10393,6 +10393,26 @@ class IntegrityFileTests(unittest.TestCase):
         self._file("systemd", "systemd/web.service", "[Service]\nExecStart=/usr/bin/web --v2\n")  # el grupo cambia
         found = self._drift_legacy(base)
         self.assertEqual([(f["sev"], f["target"]["path"]) for f in found], [("high", other)])
+
+    def test_appending_beyond_the_first_megabyte_is_seen(self):
+        """RSK de Q: la huella era del primer MB; lo añadido detrás pasaba sin verse."""
+        big = "# relleno\n" * 120_000 + "0 1 * * * root /bin/a\n"
+        self._file("cron", "cron.d/big", big)
+        base = self._seal()
+        self._file("cron", "cron.d/big", big + "* * * * * root /tmp/x\n")
+        self.assertEqual([f["sev"] for f in self._drift(base)], ["high"])
+
+    def test_risky_files_found_when_migrating_are_named_unless_a_package_owns_them(self):
+        self._file("passwd", "passwd", "root:x:0:0::/root:/bin/bash\n")
+        base = self._legacy_base()
+        hook = self._file("apt_conf", "apt/apt.conf.d/99x", 'DPkg::Post-Invoke {"/tmp/x";};\n')
+        pkg_hook = self._file("apt_conf", "apt/apt.conf.d/20packagekit", 'DPkg::Post-Invoke {"/usr/bin/pk";};\n')
+        from arx.modules import pkgdb
+        with mock.patch.object(pkgdb, "owner", lambda p: "packagekit" if p == pkg_hook else None):
+            found = self._drift_legacy(base, layout={"passwd": self.layout["passwd"]})
+        self.assertEqual([(f["kind"], f["sev"]) for f in found], [("integrity_watch_added", "high")])
+        self.assertIn(hook, found[0]["detail"].split("—")[1])
+        self.assertNotIn(pkg_hook, found[0]["detail"].split("—")[1])
 
     def test_files_never_watched_before_are_adopted_and_said_once(self):
         self._file("passwd", "passwd", "root:x:0:0::/root:/bin/bash\n")
