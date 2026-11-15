@@ -73,12 +73,15 @@ wall_us = (b["ts"] - a["ts"]) * 1e6
 cpu_us = sum((b[k] or 0) - (a[k] or 0) for k in ("svc_us", "maint_us"))
 cpu_pct = 100 * cpu_us / wall_us if wall_us > 0 else 0.0
 hours = (b["ts"] - a["ts"]) / 3600 or 1
+real_min = hours * 60  # la ventana REAL entre las dos muestras (si el host se suspende, no son los minutos pedidos)
+per_hour = b["scopes"] / hours
 lines_h = (b["arx_lines"] + b["scope_lines"]) / hours
 print(f"window={wall_us / 6e7:.1f} min scopes={b['scopes']} scope_lines={b['scope_lines']} arx_lines={b['arx_lines']} "
       f"lines_per_h={lines_h:.1f} cpu_pct={cpu_pct:.3f} restarts={a['restarts']}->{b['restarts']} "
       f"invocation={a['invocation']}->{b['invocation']}")
 verdicts = [
-    ("scopes en la ventana < %d (%d)" % (max_scopes, b["scopes"]), b["scopes"] < max_scopes * minutes / 30),
+    ("scopes por cada 30 min < %d (%d en %.0f min = %.1f/h)" % (max_scopes, b["scopes"], real_min, per_hour),
+     per_hour * 0.5 < max_scopes),
     ("CPU de Arx < %.1f %% (%.3f %%)" % (max_cpu, cpu_pct), cpu_pct < max_cpu),
     ("líneas de journal por hora < %d (%.1f)" % (max_lines_h, lines_h), lines_h < max_lines_h),
     ("sin reinicios de Arx", a["restarts"] == b["restarts"] and a["invocation"] == b["invocation"]),
