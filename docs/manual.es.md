@@ -67,13 +67,13 @@ El instalador:
 1. comprueba que corre como root en un sistema con `dpkg`;
 2. descarga el `arx_all.deb` de la última release y su `SHA256SUMS`, y no instala nada si la suma
    no coincide;
-3. instala el paquete y deja que `apt` traiga sus dependencias (`python3`, `auditd`, y `nftables`
-   como recomendado);
+3. instala el paquete en un solo paso de `apt`, que trae sus dependencias (`python3`, `auditd`, y
+   `nftables` como recomendado). La salida de `apt` solo se muestra si algo falla;
 4. se asegura de que `auditd` está en marcha, o te dice por qué no (dentro de un contenedor el núcleo
    no deja arrancarlo);
 5. pregunta una sola vez si quieres unirte al [programa de mejora](#11-el-programa-de-mejora). La
    respuesta por defecto es no, y sin terminal no pregunta;
-6. muestra los pasos siguientes.
+6. muestra un único mensaje final con los pasos siguientes.
 
 Variables del instalador:
 
@@ -478,6 +478,10 @@ poner en cuarentena un fichero plantado, bloquear una cuenta y cerrar sus sesion
 proceso que volvió, quitar un bit SUID. Arx las propone; solo tú, con tu palabra, las ejecutas. Una
 palabra equivocada no cambia nada.
 
+Para root, las cuentas del sistema y la última cuenta que puede administrar el host, `arx authorize` no
+bloquea la cuenta. Bloquea el origen de ese acceso (el bloqueo caduca solo) y cierra esa sesión, y solo
+esa. La cuenta sigue abierta. El modelo nunca lo dispara.
+
 ### 6.4 `arx unblock`: levantar un bloqueo antes de tiempo
 
 ```bash
@@ -527,7 +531,7 @@ resumen:
 | Un servicio «arrancó …, que nunca había ejecutado» | Aisló ese proceso sin red | Era esperado: `sudo arx accept <id>` |
 | sshd «antes de autenticar a nadie, ejecutó …» | Congeló y aisló ese proceso | Trátalo como un compromiso. Solo si configuraste tú ese comando: `sudo arx accept <id>` |
 | Un servidor web o una base de datos «arrancó una shell» | Congeló ese proceso | Busca una webshell y después `sudo arx accept <id>` |
-| Acceso desde un origen desconocido | Cerró esa cuenta (con tu palabra o la del modelo) | `sudo arx unlock <cuenta>` solo cuando sepas que era legítimo |
+| Acceso desde un origen desconocido | Cerró esa cuenta (con tu palabra o la del modelo, nunca para root ni para la última cuenta de administración) | `sudo arx unlock <cuenta>` solo cuando sepas que era legítimo. Para root o la última cuenta de administración: `sudo arx authorize <id>` bloquea ese origen y cierra esa sesión |
 | Cron plantado, bit SUID, segunda cuenta root, fichero crítico cambiado | Avisó y pidió tu palabra | `sudo arx authorize <id>`, o `sudo arx accept <id>` si fuiste tú |
 | Un intento denegado de abrir un fichero sensible | Avisó (desde auditd), con usuario, programa y proceso | Averigua por qué lo intentó ese servicio |
 | Se leyó o cambió un señuelo | Alerta alta, con el programa si auditd lo vio | Trátalo como un intruso |
@@ -602,6 +606,9 @@ esperar y te avisa con todo el contexto. El modelo no puede elegir a quién: su 
 sobre un acceso ya señalado en el mismo lote, y el código valida el resto. Nunca se aplica a root, a
 cuentas del sistema ni a la última cuenta que puede administrar el host, sin una sesión viva que Arx
 pueda verificar, ni más de dos veces por hora. Se desactiva en `arx setup`.
+
+Para esas cuentas, la única respuesta es con tu palabra: `sudo arx authorize <id>` bloquea el origen y
+cierra esa sesión. La cuenta en sí sigue abierta.
 
 ### 9.3 Salvaguardas
 

@@ -67,13 +67,13 @@ The installer:
 1. checks that it runs as root on a system with `dpkg`;
 2. downloads the latest release's `arx_all.deb` and its `SHA256SUMS`, and refuses to install if
    the checksum does not match;
-3. installs the package and lets `apt` bring its dependencies (`python3`, `auditd`, and `nftables`
-   as a recommendation);
+3. installs the package in one `apt` step, which brings its dependencies (`python3`, `auditd`, and
+   `nftables` as a recommendation). `apt`'s own output is shown only if something fails;
 4. makes sure `auditd` is running, or tells you why it is not (inside a container the kernel does
    not let it start);
 5. asks once whether you want to join the [improvement program](#11-the-improvement-program). The
    default is no, and without a terminal it does not ask;
-6. prints the next steps.
+6. prints one final message with the next steps.
 
 Installer variables:
 
@@ -471,6 +471,10 @@ vault, quarantine a planted file, lock an account and close its sessions, end a 
 back, remove a SUID bit. Arx proposes them; only you, with your word, carry them out. A wrong word
 changes nothing.
 
+For root, system accounts and the last account that can administer the host, `arx authorize` does
+not lock the account. It blocks the origin of that access (the block expires on its own) and closes
+that one session. The account stays open. The model never triggers this.
+
 ### 6.4 `arx unblock`: lift a block early
 
 ```bash
@@ -519,7 +523,7 @@ Every alert names a finding id. The full guide is [docs/runbook.md](runbook.md).
 | A service "started …, which it never ran" | Isolated that process without network | Expected: `sudo arx accept <id>` |
 | sshd "before authenticating anyone, ran …" | Froze and isolated that process | Treat it as a compromise. Only if you configured that command: `sudo arx accept <id>` |
 | A web server or database "started a shell" | Froze that process | Look for a webshell, then `sudo arx accept <id>` |
-| Login from an unknown origin | Closed that account (on your word or the model's) | `sudo arx unlock <account>` only once you know it was legitimate |
+| Login from an unknown origin | Closed that account (on your word or the model's, never for root or the last admin account) | `sudo arx unlock <account>` only once you know it was legitimate. For root or the last admin account: `sudo arx authorize <id>` blocks that origin and closes that session |
 | Planted cron job, SUID bit, second root account, changed critical file | Alerted and asked for your word | `sudo arx authorize <id>`, or `sudo arx accept <id>` if it was you |
 | A denied attempt to open a sensitive file | Alerted (from auditd), with user, program and process | Find out why that service tried |
 | A canary was read or changed | High-severity alert, with the program if auditd saw it | Treat it as an intruder |
@@ -594,6 +598,9 @@ waiting and tells you with the full context. The model cannot choose who: its ve
 a login already flagged in the same batch, and code validates the rest. It never applies to root,
 system accounts or the last account that can administer the host, without a live session Arx can
 verify, or more than twice an hour. Turn it off in `arx setup`.
+
+For those accounts the only response is on your word: `sudo arx authorize <id>` blocks the origin and
+closes that session. The account itself stays open.
 
 ### 9.3 Guardrails
 

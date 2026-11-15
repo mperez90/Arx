@@ -36,7 +36,11 @@ test reference and its evidence before it is published. Do not describe behavior
 
 ### Installer output
 
-TODO: confirmar con arx-98 — ítem interno B75. Behavior after the fix.
+BORRADOR. TODO: confirmar con arx-98 (fuentes: 86a9749). No lab figures.
+
+The installer now installs the package in one `apt` step, so `apt` resolves `python3`, `auditd` and the
+package together. `apt`'s own output is shown only if something fails. The installer prints one final
+message.
 
 ### Critical configuration is checked by meaning, file by file
 
@@ -61,6 +65,14 @@ owner and, for a link, its target. Arx no longer reports one hash for a whole gr
 - Reads never follow links and never block on a FIFO. They have size and file-count limits. When a group
   has too many files, only the first ones are watched and the alert says so.
 - Restoring a file from an alert (Tier 2) touches only that file.
+- Every integrity alert says who wrote the file, from the sealed state: the executable, its pid and uid
+  and, after a login, that login's uid and session. An edit made with `sed -i` is attributed to the
+  target file, not only to its temporary copy.
+- A change made by dpkg is accepted without an alert only if every write came from an intact
+  `/usr/bin/dpkg` of a signed origin, and the file belongs to a package whose installed version comes
+  from a signed repository. A local `.deb`, a tampered dpkg, mixed writers or missing authorship still
+  raise an alert. A `.deb` that only carries the name of a repository package is not accepted as an
+  update.
 
 **Upgrading.** Baselines from earlier versions are migrated. Unchanged files are adopted silently. A
 changed group is rebuilt from the vault if its copy matches what was sealed and is judged by meaning;
@@ -86,11 +98,42 @@ running, or when diversions change. It no longer repeats the full package invent
 
 ### Model verdicts with Kimi
 
-TODO: confirmar con arx-98 — ítem interno B79. Behavior after the fix.
+BORRADOR. TODO: confirmar con arx-98 (fuentes: 35d5425). No lab figures.
+
+The model's verdict no longer depends on a final `VERDICTS:` line in its prose. Each provider returns it
+in its own structured-output format. If a provider rejects that format or returns no object, Arx asks
+once more for the JSON alone. The analysis written for people and the verdict read by the machine are
+now separate requests. A verdict line inside the analysis is ignored.
+
+- Validation is unchanged: zero tolerance, the same schema, a reason of at most 300 characters. Only
+  the ids Arx asked about are accepted, and one verdict per finding.
+- `arx metrics` shows, per provider and route, how many verdicts were requested, valid and missing,
+  over the last 60 days. It shows counts only.
 
 ### Tier 2 actions offered to root
 
-TODO: confirmar con arx-98 — ítem interno root. Behavior after the fix.
+BORRADOR. TODO: confirmar con arx-98 (fuentes: 4950990). No lab figures.
+
+A new login by root, a system account or the last administrator account is no longer answered by
+locking the account. Arx blocks the origin of that access and closes that one session. The account stays
+open. This is offered only as a Tier 2 action, on your word (`arx authorize`). The model never triggers
+it, not even with `--enforce`.
+
+- The block expires on its own and respects protected IP addresses. `arx unblock` lifts it early.
+- Only the session of that connection is closed. Other sessions, from other origins or accounts, and the
+  SSH daemon that listens are not touched.
+- If the account can be locked when you authorize, Arx locks it.
+
+### Integrity checks reread only what changed
+
+BORRADOR. TODO: confirmar con arx-98 (fuentes: bf72497, e2f1457). No lab figures.
+
+An integrity check reads a file again only when its metadata changes (including its change time, which
+`touch -r` cannot restore), when auditd sees a write to it, or once an hour. Sealing and accepting still
+read everything.
+
+- Setting the system clock back does not hide a write from the cache. Arx compares the identity of the
+  last audit event, not its date.
 
 ## Upgrading
 
