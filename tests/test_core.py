@@ -10477,7 +10477,7 @@ class IntegrityFileTests(unittest.TestCase):
         from arx.modules import pkgdb
         with mock.patch.object(pkgdb, "owner", lambda p: "packagekit" if p == pkg_hook else None):
             found = self._drift_legacy(base, layout={"passwd": self.layout["passwd"]})
-        self.assertEqual([(f["kind"], f["sev"]) for f in found], [("integrity_watch_added", "high")])
+        self.assertEqual([(f["kind"], f["sev"]) for f in found], [("integrity_watch_added", "med")])
         self.assertIn(hook, found[0]["detail"].split("—")[1])
         self.assertNotIn(pkg_hook, found[0]["detail"].split("—")[1])
 

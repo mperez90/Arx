@@ -193,7 +193,9 @@ def _integrity_drift(base: dict, include_suid: bool) -> list[dict]:
             if risky:
                 detail += " — " + tr("{n} of them run commands or grant trust and belong to no package: {files}",
                                      n=len(risky), files=", ".join(risky[:10]))
-            findings.append({"sev": "high" if risky else "med", "kind": "integrity_watch_added", "set": "integrity",
+            # med: muchos servidores tienen unidades propias de sus aplicaciones sin paquete; se nombran para
+            # revisarlas una vez (estado y resumen diario), sin una alerta alta en cada actualización
+            findings.append({"sev": "med", "kind": "integrity_watch_added", "set": "integrity",
                              "item": ",".join(newly[:20]),
                              "detail": detail,
                              "why": tr("they were there before Arx looked at them: review them once; any change "
