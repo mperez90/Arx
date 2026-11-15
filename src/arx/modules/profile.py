@@ -40,7 +40,7 @@ from datetime import datetime, timedelta, timezone
 
 from arx import config
 from arx.i18n import tr
-from arx.modules import pkgdb
+from arx.modules import pkgdb, sweepcache
 from arx.modules.maintenance import NoAnswer
 
 OBSERVE_DAYS = 40
@@ -57,6 +57,12 @@ LIBS_PER_SWEEP = 4    # servicios cuyas librerías se intentan aprender por barr
 # cada vez más, y se mira antes si aparece un proceso nuevo en su cgroup (arranque o reinicio, es decir, otro MainPID)
 LIBS_RETRY_S = (120, 600, 3600, 6 * 3600)
 LIBS_MIN_S = 60       # entre un intento y el siguiente, aunque el cgroup no pare de cambiar
+# nft cuesta ~2 ms de CPU por elemento de cgroup de un set (recorre /sys/fs/cgroup por cada uno): lo caro no se lee
+# cada barrido de 30 s (B78/A#4). Lo que vigila el kernel (cortes, escaneos) sí; lo que se aprende y se limpia, no.
+SEEN_EVERY_S = 300    # destinos vistos: aprender un destino nuevo tarda como mucho esto (o un servicio nuevo, al instante)
+HOUSEKEEPING_EVERY_S = 300  # elementos de cgroups muertos y ¿siguen cargados los servicios fijados? (un flush o un
+#                             reinicio de nftables se ve al momento, por la tabla)
+SETUP_EVERY_S = 300   # estructura de la pista (sets y reglas); la tabla se comprueba en cada barrido
 PREVENTIVE_MAX = 3    # servicios afectados por una actualización hasta los que se corta mientras se prueba
 MAX_EXECS = 64        # programas distintos que lanza un servicio; más, y no hay perfil de hijos que valga
 MAX_DNS_FINDINGS = 20
@@ -120,19 +126,56 @@ def _save(st: dict) -> None:
     config.write_json(_state_path(), st)
 
 
+_cadence: dict[str, float] = {}  # cuándo se hizo cada cosa «de vez en cuando» (reloj monotónico)
+_pins_epoch: list = [None]       # época de la tabla de nft con la que se comprobaron los servicios fijados
+_denied_seen: list = [0]         # cuántos cortes había en el barrido anterior
+
+
+def _due(name: str, every: float, now: datetime) -> bool:
+    """¿Toca? La primera vez y luego cada `every` s de la hora del barrido. Un reloj que retrocede no deja una tarea
+    sin hacer hasta que alcance la hora vieja: el tiempo negativo también cuenta como «toca»."""
+    ts = now.timestamp()
+    last = _cadence.get(name)
+    if last is not None and 0 <= ts - last < every:
+        return False
+    _cadence[name] = ts
+    return True
+
+
+def _reset_cadence() -> None:
+    """Todo vuelve a «toca ahora» (el arranque; y las pruebas, que no comparten reloj ni estado)."""
+    _cadence.clear()
+    _pins_epoch[0] = None
+    _denied_seen[0] = 0
+    _setup_state.update(ok_at=None, epoch=None)
+
+
+_NFT_WRITES =("add", "delete", "flush", "insert", "replace", "create", "-f")
+
+
 def _nft(*args: str) -> bool:
+    if args and args[0] in _NFT_WRITES:
+        sweepcache.forget(("nft",))  # lo leído antes de este cambio ya no vale
     try:
         return subprocess.run(["nft", *args], capture_output=True, text=True, timeout=15).returncode == 0
     except (OSError, subprocess.TimeoutExpired):
         return False
 
 
-def _nft_out(*args: str) -> str:
+def _nft_raw(*args: str) -> str | None:
     try:
         r = subprocess.run(["nft", *args], capture_output=True, text=True, timeout=15)
     except (OSError, subprocess.TimeoutExpired):
-        return ""
-    return r.stdout if r.returncode == 0 else ""
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
+def _nft_out(*args: str) -> str:
+    """La salida de `nft`, «» si falla. `list set` y `list table` se leen una vez por barrido: cada lectura de un set
+    con elementos de cgroup cuesta CPU en proporción a sus elementos, y la tabla los lleva todos."""
+    if args[:2] in (("list", "set"), ("list", "table")):
+        return sweepcache.memo(("nft", *args), lambda: _nft_raw(*args)) or ""
+    return _nft_raw(*args) or ""
 
 
 # ── kernel: la pista, la lista permitida y el corte ──────────────────────────
@@ -145,9 +188,25 @@ _KEY = ["socket", "cgroupv2", "level", "2", ".", "meta", "l4proto", "."]
 # sus elementos en bucle (RC4) y nunca hizo falta: nada se migra.
 
 
+_setup_state: dict = {"ok_at": None, "epoch": None}
+
+
 def setup() -> bool:
-    """Sets y reglas. Aparte del resto: sin soporte de cgroups en nft, el host no pierde lo demás."""
+    """Sets y reglas. Aparte del resto: sin soporte de cgroups en nft, el host no pierde lo demás.
+
+    Cada barrido solo comprueba que la tabla siga ahí; la estructura entera (dos lecturas de la tabla, ~170 ms de
+    CPU cada una) al principio, cada SETUP_EVERY_S y en cuanto la tabla haya desaparecido y vuelto a crearse."""
     from arx.modules import response
+    now, epoch = time.monotonic(), response.tracking_epoch()
+    if (_setup_state["ok_at"] is not None and now - _setup_state["ok_at"] < SETUP_EVERY_S
+            and _setup_state["epoch"] == epoch and response._arx_table_present()):
+        return True
+    ok = _setup_structure(response)
+    _setup_state.update(ok_at=now if ok else None, epoch=epoch)
+    return ok
+
+
+def _setup_structure(response) -> bool:
     if not response._nft_setup():
         return False
     listing = _nft_out("list", "table", "inet", "arx")
@@ -189,6 +248,12 @@ def _elements(set_name: str) -> list[tuple[str, str, str, int]]:
     for m in _ELEMENT_RE.finditer(_nft_out("list", "set", "inet", "arx", set_name)):
         out.append((m.group(1) or m.group(2), m.group(3), m.group(4), int(m.group(5))))
     return out
+
+
+def _watched_members() -> set[str] | None:
+    """Los cgroups cargados en `watched2`, de una lectura. None si no se pudo leer (no se recarga nada a ciegas)."""
+    listing = _nft_out("list", "set", "inet", "arx", "watched2")
+    return set(re.findall(r'"([^"]+)"', listing)) if listing else None
 
 
 def _net_of(ip: str) -> str:
@@ -846,7 +911,10 @@ def sweep(enforce: bool = False, cfg: dict | None = None, now: datetime | None =
         findings += _library_events(subjects, now, cfg)
         findings += _read_events(subjects, now, cfg)
         active = vaccines._active()
-        for fam in ("4", "6"):
+        # lo aprendido (seen) es lo caro de leer: cada SEEN_EVERY_S, o ya si hay un servicio nuevo o hubo un corte
+        learn_now = bool(fresh) or _cadence.pop("seen_now", None) is not None
+        for fam in (("4", "6") if learn_now or _due("seen", SEEN_EVERY_S, now) else ()):
+            _cadence["seen"] = now.timestamp()
             for cg, proto, ip, port in _elements(f"seen{fam}"):
                 s = subjects.get(cg)
                 if not s:
@@ -894,6 +962,13 @@ def sweep(enforce: bool = False, cfg: dict | None = None, now: datetime | None =
                 findings += _doc_apply(path, s, {k: tuple(v) for k, v in pending.items()})
                 if s.get("enforced") and _cgroup_exists(path):
                     _pin(path, s)
+        housekeeping = _due("housekeeping", HOUSEKEEPING_EVERY_S, now)
+        members = None  # los servicios fijados siguen cargados: una lectura de watched2, no un `get` por servicio
+        if enforce and any(x.get("enforced") for x in subjects.values()):
+            epoch = response.tracking_epoch()
+            if housekeeping or _pins_epoch[0] != epoch:
+                _pins_epoch[0] = epoch
+                members = _watched_members()
         for path, s in subjects.items():
             if s["status"] != "watching" or _OBSERVE_ONLY.match(s["unit"]) or path in confined:
                 continue
@@ -903,8 +978,8 @@ def sweep(enforce: bool = False, cfg: dict | None = None, now: datetime | None =
             if enforce and not s.get("enforced") and _cgroup_exists(path):
                 s["enforced"] = _pin(path, s)
                 pinned = True
-            elif enforce and s.get("enforced") and _cgroup_exists(path) and \
-                    not _nft("get", "element", "inet", "arx", "watched2", f'{{ "{path}" }}'):
+            elif enforce and s.get("enforced") and _cgroup_exists(path) and members is not None \
+                    and path not in members:
                 _nft("-f", str(_files_dir() / f"{s['unit']}.nft"))  # un flush o un reinicio sin la tabla
             if s.get("enforced"):
                 dropin = os.path.join(SYSTEMD_DIR, f"{s['unit']}.d", DROPIN)
@@ -936,6 +1011,9 @@ def sweep(enforce: bool = False, cfg: dict | None = None, now: datetime | None =
             for key in list(reported):  # el elemento ya no está en nft: fuera la entrada muerta
                 if key not in alive:
                     del reported[key]
+            if len(alive) > _denied_seen[0]:  # un corte nuevo: el barrido siguiente también lee lo aprendido
+                _cadence["seen_now"] = now.timestamp()
+            _denied_seen[0] = len(alive)
         # el veredicto en caliente del vigilante (B44): servicios vigilados, sin cron/ssh ni observados
         from arx.modules import execwatch
         execwatch.set_hot_verdict(hot_verdict)
@@ -946,7 +1024,8 @@ def sweep(enforce: bool = False, cfg: dict | None = None, now: datetime | None =
         _save(st)
     if pinned:
         subprocess.run(["systemctl", "daemon-reload"], capture_output=True, timeout=60)
-    _cleanup_dead()
+    if housekeeping:
+        _cleanup_dead()
     return findings
 
 

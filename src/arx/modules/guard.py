@@ -31,7 +31,7 @@ from arx import config, consensus, engine, notify, redact, telemetry
 from arx import license as lic
 from arx.i18n import lang, tr
 from arx.modules import (baseline, canaries, dnswatch, execwatch, filewatch, fleet, integrity, metrics, pkgdb, profile, provenance, recon,
-                         response, sandbox, sensors, service, telegram, vaccines)
+                         response, sandbox, sensors, service, sweepcache, telegram, vaccines)
 
 SYSTEM_PROMPT = (
     "You are Arx, the defensive guardian of this server. Answer briefly and action-first, in "
@@ -299,6 +299,7 @@ def _quietly(fn, default):
 
 def sweep(base: dict, enforce: bool = False, include_suid: bool = True,
           cfg: dict | None = None) -> tuple[list[dict], list[dict]]:
+    sweepcache.begin_sweep()  # lo que se lee de fuera (nft, ss) se lee una vez por barrido
     reset = _quietly(response.restore_kernel_blocks, None)  # antes de nada: lo que se creía contenido, lo esté
     response.ensure_nft_tracking()  # la pista de escaneo debe existir ANTES del ataque
     snap = baseline.snapshot()
@@ -321,6 +322,7 @@ def sweep(base: dict, enforce: bool = False, include_suid: bool = True,
     deadline = time.monotonic() + ENRICH_SWEEP_BUDGET_S
     findings = _ready([_prepare(f, enrich=time.monotonic() < deadline) for f in findings])
     findings.sort(key=lambda f: _SEV_RANK.get(f["sev"], 9))
+    sweepcache.end_sweep()  # las respuestas (bloquear, cerrar una sesión) preguntan de nuevo, no leen lo del barrido
     outcomes = []
     for f in findings:
         try:

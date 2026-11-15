@@ -40,6 +40,10 @@ def _isolate():
     os.environ["ARX_CONFIG_DIR"] = os.path.join(d, "cfg")
     os.environ["ARX_STATE_DIR"] = os.path.join(d, "state")
     os.environ["ARX_POLAR_ENV"] = "sandbox"
+    from arx.modules import profile, response, sweepcache
+    profile._reset_cadence()  # lo que se hace «de vez en cuando» (B78/A#4) no pasa de una prueba a otra
+    response._tracking.update(ok_until=0.0, epoch=0)
+    sweepcache.end_sweep()
     return d
 
 

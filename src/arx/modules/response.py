@@ -1661,13 +1661,48 @@ def _nft_available() -> bool:
     return shutil.which("nft") is not None
 
 
+STRUCTURE_EVERY_S = 300  # la estructura de la tabla (sets, cadenas, reglas) se comprueba entera cada tanto
+_tracking = {"ok_until": 0.0, "epoch": 0}
+
+
+def _arx_table_present() -> bool | None:
+    """¿Existe la tabla de Arx? `nft list tables` cuesta ~4 ms; listar la tabla entera, ~170 ms. None si no se sabe."""
+    from arx.modules import sweepcache
+
+    def tables() -> str | None:
+        try:
+            r = subprocess.run(["nft", "list", "tables"], capture_output=True, text=True, timeout=15)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return r.stdout if r.returncode == 0 else None
+
+    out = sweepcache.memo(("nft", "tables"), tables)
+    return None if out is None else "table inet arx" in out
+
+
+def tracking_epoch() -> int:
+    """Cuántas veces se vio que la tabla de Arx había desaparecido (un flush, un reinicio de nftables): quien cargó
+    cosas en ella (los servicios fijados) sabe que tiene que volver a cargarlas."""
+    return _tracking["epoch"]
+
+
 def ensure_nft_tracking() -> bool:
     """Instala la tabla/sets/reglas de Arx — incluida la PISTA de escaneo — aunque aún
     no haya nada que bloquear. La pista debe existir ANTES del primer escaneo, no en
-    la primera respuesta. Idempotente; sin nft o sin root: False silencioso."""
+    la primera respuesta. Idempotente; sin nft o sin root: False silencioso.
+
+    Cada barrido solo comprueba que la tabla exista (4 ms); la estructura entera, al principio y cada
+    STRUCTURE_EVERY_S, o en cuanto la tabla falte (B78/A#4)."""
     if not (_is_linux_root() and _nft_available()):
         return False
-    return _nft_setup()
+    present = _arx_table_present()
+    if present and time.monotonic() < _tracking["ok_until"]:
+        return True
+    if present is False:
+        _tracking["epoch"] += 1  # desapareció: lo que se cargó en ella hay que volver a cargarlo
+    ok = _nft_setup()
+    _tracking["ok_until"] = time.monotonic() + STRUCTURE_EVERY_S if ok else 0.0
+    return ok
 
 
 _NFT_ELEMENT = {"nft": lambda r: (f"block_{r.get('proto')}", str(r.get("port"))),
@@ -1736,18 +1771,30 @@ def _nft_chain(listing: str, name: str) -> str:
     return m.group(1) if m else ""
 
 
+def _table_listing() -> str | None:
+    """`nft list table inet arx`, la tabla entera: «» si no existe, None si nft no contesta. Dentro de un barrido se
+    lee una vez (lleva todos los sets, y los de cgroup cuestan CPU por elemento); en una acción, siempre de nuevo."""
+    from arx.modules import sweepcache
+
+    def read() -> str | None:
+        try:
+            r = subprocess.run(["nft", "list", "table", "inet", "arx"], capture_output=True, text=True, timeout=15)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return (r.stdout or "") if r.returncode == 0 else ""
+
+    return sweepcache.memo(("nft", "list", "table", "inet", "arx"), read)
+
+
 def _nft_setup() -> bool:
     """Tabla/set/cadena de Arx en nftables, idempotente (ignora 'ya existe').
 
     Solo mira SU tabla: mirando todo el firewall, la `chain input` de otra tabla (la que trae la
     configuración por defecto de Debian y Ubuntu) parecía la suya y Arx quedaba sin reglas (B22).
     """
-    try:
-        r = subprocess.run(["nft", "list", "table", "inet", "arx"], capture_output=True,
-                           text=True, timeout=15)
-    except (OSError, subprocess.TimeoutExpired):
+    ruleset = _table_listing()
+    if ruleset is None:
         return False
-    ruleset = (r.stdout or "") if r.returncode == 0 else ""
     cmds = []
     if "table inet arx" not in ruleset:
         cmds.append(["nft", "add", "table", "inet", "arx"])
@@ -1849,14 +1896,24 @@ def _nft_setup() -> bool:
             ["nft", "add", "rule", "inet", "arx", "input", "ip6", "saddr", "@tarpit6",
              "meter", "arx_tpp6", "{", "ip6", "saddr", "limit", "rate", "over", "50/second",
              "}", "drop"]]
-    for argv in cmds:
-        try:
-            r = subprocess.run(argv, capture_output=True, text=True, timeout=15)
-        except (OSError, subprocess.TimeoutExpired):
-            return False
-        if r.returncode != 0:  # sin su regla, meter algo en un set no contiene nada
-            return False
-    return True
+    return _run_nft_cmds(cmds)
+
+
+def _run_nft_cmds(cmds: list[list[str]]) -> bool:
+    """Ejecuta las órdenes de montaje; lo leído de la tabla antes de cambiarla ya no vale."""
+    from arx.modules import sweepcache
+    try:
+        for argv in cmds:
+            try:
+                r = subprocess.run(argv, capture_output=True, text=True, timeout=15)
+            except (OSError, subprocess.TimeoutExpired):
+                return False
+            if r.returncode != 0:  # sin su regla, meter algo en un set no contiene nada
+                return False
+        return True
+    finally:
+        if cmds:
+            sweepcache.forget(("nft",))
 
 
 # ── confinamiento (decisión E): el programa sigue, pero no sale a la red ──────
@@ -2236,12 +2293,9 @@ def _nft_setup_confine() -> bool:
     cgroupv2` no debe dejar al host sin el resto de la contención."""
     if not _nft_setup():
         return False
-    try:
-        r = subprocess.run(["nft", "list", "table", "inet", "arx"], capture_output=True, text=True,
-                           timeout=15)
-    except (OSError, subprocess.TimeoutExpired):
+    listing = _table_listing()
+    if listing is None:
         return False
-    listing = r.stdout or ""
     cmds = []
     for level, name in _CONFINE_SETS.items():
         if f"set {name} " not in listing:
@@ -2254,13 +2308,7 @@ def _nft_setup_confine() -> bool:
                      ["nft", "add", "rule", "inet", "arx", "output", "ct", "direction", "original",
                       "socket", "cgroupv2", "level", str(level), f"@{name}", "meta", "l4proto",
                       "{", "tcp,", "udp", "}", "th", "dport", "53", "drop"]]
-    for argv in cmds:
-        try:
-            if subprocess.run(argv, capture_output=True, text=True, timeout=15).returncode != 0:
-                return False
-        except (OSError, subprocess.TimeoutExpired):
-            return False
-    return True
+    return _run_nft_cmds(cmds)
 
 
 def _can_confine() -> bool:

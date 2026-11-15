@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from arx.i18n import tr
-from arx.modules import maintenance, pkgdb
+from arx.modules import maintenance, pkgdb, sweepcache
 
 TIMEOUT = 8  # segundos por comando; los colectores lentos lo suben explícitamente
 
@@ -194,7 +194,13 @@ def _collect_ports_procfs() -> list[dict]:
 
 
 def collect_ports() -> list[dict]:
-    """Sockets en escucha (TCP/UDP) con proceso dueño y grado de exposición."""
+    """Sockets en escucha (TCP/UDP) con proceso dueño y grado de exposición. Se lee una vez por barrido (la baseline,
+    el detector de reverse shell y el de procedencia la piden en el mismo): cada lectura es un proceso `ss`."""
+    ports = sweepcache.memo(("recon", "ports"), _collect_ports)
+    return [dict(p) for p in ports or []]
+
+
+def _collect_ports() -> list[dict] | None:
     out = _run(["ss", "-tulpnH"]) or _run(["ss", "-tulpn"])
     if not out:
         return _collect_ports_procfs()  # sin ss no significa sin sensor
