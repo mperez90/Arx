@@ -2054,4 +2054,8 @@ ES = {
         'Arx vigila ahora también {n} fichero(s) de configuración; lo que ya había se tomó como conocido: {files}',
     'they were there before Arx looked at them: review them once; any change from now on is reported':
         'estaban antes de que Arx los mirara: revísalos una vez; cualquier cambio a partir de ahora se avisa',
+    'APT setting that changes how packages are installed: {items}':
+        'ajuste de APT que cambia cómo se instalan los paquetes: {items}',
+    'new systemd unit or drop-in: {items}':
+        'unidad o drop-in de systemd nuevo: {items}',
 }

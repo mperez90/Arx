@@ -70,6 +70,14 @@ class AptConfDangerousDirectivesGap(unittest.TestCase):
         self.assertNotEqual(ch.sev, "low", "reemplazar el binario dpkg se clasificó como 'low'")
 
 
+
+def _typed_blob(kind: str) -> str:
+    """Blob cuyo tipo interno coincide con el declarado: sshd rechaza la línea si no coinciden
+    (sshkey_read → SSH_ERR_KEY_TYPE_MISMATCH), así que una prueba realista lo necesita."""
+    import base64
+    raw = kind.encode()
+    return base64.b64encode(len(raw).to_bytes(4, "big") + raw + bytes(range(48))).decode()
+
 class AuthorizedKeysCertTypesGap(unittest.TestCase):
     """HZ#3 (high): faltan tipos de clave de certificado válidos en _KEY_TYPE.
 
@@ -78,13 +86,13 @@ class AuthorizedKeysCertTypesGap(unittest.TestCase):
     ECDSA nueva para root se clasifica como 'raw' (med, «línea no reconocida») en vez de crit."""
 
     def test_ecdsa_cert_key_for_root_is_critical(self):
-        line = f"ecdsa-sha2-nistp256-cert-v01@openssh.com {_BLOB} atacante\n"
+        line = f"ecdsa-sha2-nistp256-cert-v01@openssh.com {_typed_blob('ecdsa-sha2-nistp256-cert-v01@openssh.com')} atacante\n"
         ch = _cl("authorized_keys_root", "", line)
         self.assertIsNotNone(ch)
         self.assertEqual(ch.sev, "crit", f"clave de certificado ECDSA para root quedó en {ch.sev}")
 
     def test_sk_ecdsa_cert_key_for_root_is_critical(self):
-        line = f"sk-ecdsa-sha2-nistp256-cert-v01@openssh.com {_BLOB} atacante\n"
+        line = f"sk-ecdsa-sha2-nistp256-cert-v01@openssh.com {_typed_blob('sk-ecdsa-sha2-nistp256-cert-v01@openssh.com')} atacante\n"
         ch = _cl("authorized_keys_root", "", line)
         self.assertIsNotNone(ch)
         self.assertEqual(ch.sev, "crit", f"clave de certificado sk-ECDSA para root quedó en {ch.sev}")

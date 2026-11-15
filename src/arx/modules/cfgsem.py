@@ -183,64 +183,89 @@ def _repo_risky(r: tuple) -> bool:
 
 
 # ── APT: apt.conf ────────────────────────────────────────────────────────────
-_CONF_TOKEN = re.compile(r'\s*(?:(?P<str>"[^"]*")|(?P<open>\{)|(?P<close>\})|(?P<semi>;)|(?P<word>[^\s{};"]+))')
-
 _DANGER_TRUE = ("apt::get::allowunauthenticated", "acquire::allowinsecurerepositories",
                 "acquire::allowdowngradetoinsecurerepositories", "acquire::allowweakrepositories")
 _DANGER_FALSE_SUFFIX = ("::verify-peer", "::verify-host")
 _HOOK_SUFFIX = ("::pre-invoke", "::post-invoke", "::post-invoke-success", "::pre-install-pkgs")
-_DANGER_PREFIX = ("dir::etc::trusted", "dir::etc::trustedparts", "apt::key::")
+_DANGER_PREFIX = ("dir::bin::", "dir::etc::sourcelist", "dir::etc::sourceparts", "dir::etc::trusted",
+                  "dir::etc::parts", "dir::etc::main", "apt::key::")
+_HIGH_PREFIX = ("dpkg::options", "dpkg::tools::", "dir::", "apt::key-assert", "apt::key::assert-pubkey-algo")
 
 
-def _conf_text(text: str) -> str:
-    text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)
-    out = []
-    for line in text.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("#include") or stripped.startswith("#clear"):
-            out.append(stripped.replace("#", "\x01", 1) + ";")  # directivas, no comentarios
-            continue
-        line = re.sub(r'("[^"]*")|//.*$|#.*$', lambda m: m.group(1) or "", line)
-        out.append(line)
-    return "\n".join(out)
+def _conf_tokens(text: str) -> list[tuple[str, str]]:
+    """Fichas de apt.conf como las lee APT: fuera de comillas, `//` y `#` comentan hasta el final de la línea
+    (salvo `#include`/`#clear`, que son directivas) y `/* … */` comenta aunque abarque líneas. Dentro de
+    comillas nada de eso cuenta: un `/*` en una cadena no puede esconder lo que viene detrás."""
+    out, i, n = [], 0, len(text)
+    while i < n:
+        c = text[i]
+        if c in " \t\r\n":
+            i += 1
+        elif c == '"':
+            j = text.find('"', i + 1)
+            if j < 0:
+                raise ValueError("unterminated string")
+            out.append(("str", text[i + 1:j]))
+            i = j + 1
+        elif text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            if j < 0:
+                raise ValueError("unterminated comment")
+            i = j + 2
+        elif text.startswith("//", i):
+            j = text.find("\n", i)
+            i = n if j < 0 else j
+        elif c == "#":
+            m = re.match(r"#(include|clear)\b", text[i:i + 9])
+            if m:  # directiva: su argumento llega hasta `;` o hasta el final de la línea
+                i += len(m.group(0))
+                ends = [k for k in (text.find(";", i), text.find("\n", i)) if k >= 0]
+                end = min(ends) if ends else n
+                out += [("dir", "#" + m.group(1)), ("str", text[i:end].strip().strip('"')), (";", ";")]
+                i = end + 1 if end < n and text[end] == ";" else end
+            else:
+                j = text.find("\n", i)
+                i = n if j < 0 else j
+        elif c in "{};":
+            out.append((c, c))
+            i += 1
+        else:
+            j = i
+            while j < n and text[j] not in ' \t\r\n{};"#' and not text.startswith(("//", "/*"), j):
+                j += 1
+            out.append(("word", text[i:j]))
+            i = j
+    return out
 
 
 @_safe
 def apt_conf(text: str) -> Parsed:
     """Directivas de apt.conf aplanadas: (clave en minúsculas, valor)."""
-    src = _conf_text(text)
-    pos, scope, pending, items = 0, [], [], []
-    while pos < len(src):
-        m = _CONF_TOKEN.match(src, pos)
-        if not m or m.end() == pos:
-            if src[pos:].strip():
-                return Parsed(False, None, "bad token")
-            break
-        pos = m.end()
-        if m.group("word"):
-            pending.append(m.group("word"))
-        elif m.group("str") is not None:
-            pending.append(m.group("str"))
-        elif m.group("open"):
-            if len(pending) != 1 or pending[0].startswith('"'):
+    scope, pending, items = [], [], []
+    for kind, val in _conf_tokens(text):
+        if kind in ("word", "str", "dir"):
+            pending.append((kind, val))
+        elif kind == "{":
+            if len(pending) != 1 or pending[0][0] != "word":
                 return Parsed(False, None, "bad scope")
-            scope.append(pending[0].lower())
+            scope.append(pending[0][1].lower())
             pending = []
             if len(scope) > 32:
                 return Parsed(False, None, "too deep")
-        elif m.group("close"):
+        elif kind == "}":
             if not scope or pending:
                 return Parsed(False, None, "unbalanced")
             scope.pop()
-        elif m.group("semi"):
+        else:  # ";"
             if not pending:
                 continue  # `};` cierra un ámbito
-            words = [w for w in pending if not w.startswith('"')]
-            values = [w[1:-1] for w in pending if w.startswith('"')]
-            pending = []
-            if words and words[0].startswith("\x01"):
-                items.append(("#" + words[0][1:].lower(), " ".join(words[1:] + values)))
+            if pending[0][0] == "dir":
+                items.append((pending[0][1], " ".join(v for _k, v in pending[1:])))
+                pending = []
                 continue
+            words = [v for k, v in pending if k == "word"]
+            values = [v for k, v in pending if k == "str"]
+            pending = []
             if len(words) > 1:
                 return Parsed(False, None, "bad directive")
             key = "::".join(scope + ([words[0].lower()] if words else []))
@@ -251,18 +276,23 @@ def apt_conf(text: str) -> Parsed:
     return Parsed(True, tuple(sorted(set(items))))
 
 
-def _conf_dangerous(item: tuple) -> bool:
+def _conf_risk(item: tuple) -> str | None:
+    """crit: ejecuta órdenes, se salta firmas o redirige binarios/fuentes; high: cambia cómo actúa dpkg."""
     key, value = item
     v = _yes(value)
     if key.startswith("#include"):
-        return True
+        return "crit"
     if key in _DANGER_TRUE:
-        return v is True
+        return "crit" if v is True else None
     if key.startswith("acquire::") and key.endswith(_DANGER_FALSE_SUFFIX):
-        return v is False
+        return "crit" if v is False else None
     if key.endswith(_HOOK_SUFFIX) or key.startswith(_DANGER_PREFIX):
-        return True
-    return False
+        return "crit"
+    if key.startswith(_HIGH_PREFIX):
+        return "high"
+    if key.startswith("acquire::") and key.endswith("::check-valid-until") and v is False:
+        return "med"
+    return None
 
 
 # ── systemd ──────────────────────────────────────────────────────────────────
@@ -272,20 +302,27 @@ _UNIT_SENSITIVE = {
     "ambientcapabilities", "capabilityboundingset", "dynamicuser", "rootdirectory", "rootimage",
     "listenstream", "listendatagram", "listenseqpacket", "listenfifo", "listennetlink", "accept",
     "unit", "pathchanged", "pathmodified", "pathexists", "pathexistsglob", "directorynotempty",
-    "oncalendar", "onbootsec", "onactivesec", "onunitactivesec", "onstartupsec", "what", "where",
+    "oncalendar", "onbootsec", "onactivesec", "onunitactivesec", "onunitinactivesec", "onstartupsec",
+    "onclockchange", "ontimezonechange", "what", "where",
+    # dependencias que arrancan otra unidad (persistencia sin tocar Exec*)
+    "wants", "requires", "requisite", "bindsto", "upholds", "onfailure", "onsuccess",
+    # dónde y con qué se ejecuta
+    "execsearchpath", "bindpaths", "bindreadonlypaths", "temporaryfilesystem", "mountimages",
+    "extensionimages", "extensiondirectories", "workingdirectory", "umask", "setcredential", "loadcredential",
 }
 
 
 @_safe
 def systemd_unit(text: str) -> Parsed:
     """(sección, clave, valor) en orden: dos `ExecStartPre` cuentan, y en orden."""
-    items, section, buf = [], None, ""
+    items, section, parts = [], None, []
     for raw in text.splitlines():
-        line = buf + raw.strip()
-        buf = ""
-        if line.endswith("\\"):
-            buf = line[:-1] + " "
+        piece = raw.strip()
+        if piece.endswith("\\"):
+            parts.append(piece[:-1])
             continue
+        line = " ".join(parts + [piece]) if parts else piece
+        parts = []
         if not line or line[0] in "#;":
             continue
         if line.startswith("[") and line.endswith("]"):
@@ -295,7 +332,7 @@ def systemd_unit(text: str) -> Parsed:
         if not sep or not k.strip() or section is None:
             return Parsed(False, None, "bad line")
         items.append((section, k.strip().lower(), " ".join(v.split())))
-    if buf:
+    if parts:
         return Parsed(False, None, "dangling continuation")
     return Parsed(True, tuple(items))
 
@@ -307,8 +344,36 @@ def _unit_sensitive(item: tuple) -> bool:
 
 
 # ── SSH: authorized_keys ─────────────────────────────────────────────────────
-_KEY_TYPE = re.compile(r"^(ssh-(?:rsa|dss|ed25519)|ecdsa-sha2-nistp\d+|sk-(?:ssh-ed25519|ecdsa-sha2-nistp256)@openssh\.com"
-                       r"|ssh-(?:rsa|ed25519)-cert-v01@openssh\.com)$")
+_KEY_TOKEN = re.compile(r"^[a-z0-9][a-z0-9.-]*(?:@[a-z0-9.-]+)?$")
+
+
+def _blob(b64: str) -> tuple[str, str] | None:
+    """(tipo declarado dentro del blob, huella) si `b64` es una clave pública SSH; None si no."""
+    try:
+        blob = base64.b64decode(b64, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    if len(blob) < 16:
+        return None
+    n = int.from_bytes(blob[:4], "big")
+    if not 0 < n <= 64 or len(blob) < 4 + n:
+        return None
+    try:
+        kind = blob[4:4 + n].decode("ascii")
+    except UnicodeDecodeError:
+        return None
+    return kind, "SHA256:" + base64.b64encode(hashlib.sha256(blob).digest()).decode().rstrip("=")
+
+
+def _key_at(parts: list[str]) -> tuple[str, str] | None:
+    """Si `parts` empieza por «tipo blob» y el blob declara ese mismo tipo, (tipo, huella). Así se reconoce
+    cualquier tipo que sshd acepte (certificados, sk-, los futuros) sin depender de una lista."""
+    if len(parts) < 2 or not _KEY_TOKEN.match(parts[0]):
+        return None
+    found = _blob(parts[1])
+    if found and found[0] == parts[0]:
+        return parts[0], found[1]
+    return None
 
 
 def _split_options(line: str) -> tuple[str, str]:
@@ -327,16 +392,6 @@ def _split_options(line: str) -> tuple[str, str]:
     return line, ""
 
 
-def _fingerprint(blob_b64: str) -> str | None:
-    try:
-        blob = base64.b64decode(blob_b64, validate=True)
-    except (binascii.Error, ValueError):
-        return None
-    if len(blob) < 16:
-        return None
-    return "SHA256:" + base64.b64encode(hashlib.sha256(blob).digest()).decode().rstrip("=")
-
-
 @_safe
 def authorized_keys(text: str) -> Parsed:
     """Claves que sshd aceptará, por huella, con sus opciones. Una línea que no es una clave también cuenta
@@ -347,30 +402,29 @@ def authorized_keys(text: str) -> Parsed:
         if not line or line.startswith("#"):
             continue
         opts = ""
-        first = line.split(None, 1)[0]
-        if not _KEY_TYPE.match(first):
-            opts, line = _split_options(line)
-        parts = line.split()
-        fp = _fingerprint(parts[1]) if len(parts) >= 2 and _KEY_TYPE.match(parts[0]) else None
-        if fp:
-            keys.add(("key", parts[0], fp, ",".join(sorted(o.strip() for o in _split_csv(opts)))))
+        key = _key_at(line.split())
+        if key is None:
+            opts, rest = _split_options(line)
+            key = _key_at(rest.split())
+        if key:
+            keys.add(("key", key[0], key[1], ",".join(sorted(o.strip() for o in _split_csv(opts)))))
         else:
             keys.add(("raw", hashlib.sha256(raw.strip().encode()).hexdigest()[:16], "", ""))
     return Parsed(True, tuple(sorted(keys)))
 
 
 def _split_csv(opts: str) -> list[str]:
-    out, cur, quoted = [], "", False
+    out, cur, quoted = [], [], False
     for c in opts:
         if c == '"':
             quoted = not quoted
         if c == "," and not quoted:
-            out.append(cur)
-            cur = ""
+            out.append("".join(cur))
+            cur = []
         else:
-            cur += c
+            cur.append(c)
     if cur:
-        out.append(cur)
+        out.append("".join(cur))
     return [o for o in out if o.strip()]
 
 
@@ -467,14 +521,21 @@ def classify(group: str, before: Parsed | None, after: Parsed | None) -> Change 
             return Change("med", tr("APT repository options changed: {repos}", repos=_short(added)), added, removed)
         return Change("low", tr("APT repository removed: {repos}", repos=_short(removed)), added, removed)
     if group == "apt_conf":
-        danger = [i for i in added if _conf_dangerous(i)]
-        if danger:
-            return Change("crit", tr("APT setting that runs commands or skips signatures: {items}",
-                                     items=_short(danger)), added, removed)
+        risks = {i: _conf_risk(i) for i in added}
+        for sev in ("crit", "high", "med"):
+            hit = [i for i, r in risks.items() if r == sev]
+            if hit and sev == "crit":
+                return Change("crit", tr("APT setting that runs commands or skips signatures: {items}",
+                                         items=_short(hit)), added, removed)
+            if hit:
+                return Change(sev, tr("APT setting that changes how packages are installed: {items}",
+                                      items=_short(hit)), added, removed)
         return Change("low", tr("APT setting changed: {items}", items=_short(added or removed)), added, removed)
     if group == "systemd":
         if after is None:
             return Change("med", tr("systemd unit removed"), added, removed)
+        if before is None:  # una unidad o un drop-in nuevos: candidatos a persistencia aunque no lleven Exec*
+            return Change("high", tr("new systemd unit or drop-in: {items}", items=_short(added)), added, removed)
         sens = [i for i in added if _unit_sensitive(i)] + [i for i in removed if _unit_sensitive(i)]
         if sens:
             return Change("high", tr("what systemd runs changed: {items}", items=_short(sens)), added, removed)
@@ -487,8 +548,9 @@ def classify(group: str, before: Parsed | None, after: Parsed | None) -> Change 
             return Change(sev, tr("new SSH key accepted: {keys}", keys=_short(new_keys)), added, removed)
         if new_keys:
             return Change("high", tr("SSH key options changed: {keys}", keys=_short(new_keys)), added, removed)
-        if added:
-            return Change("med", tr("unrecognized line in authorized_keys"), added, removed)
+        if added:  # sshd no la toma por clave, pero en el fichero de root nada debería aparecer sin más
+            return Change("high" if group == "authorized_keys_root" else "med",
+                          tr("unrecognized line in authorized_keys"), added, removed)
         return Change("low", tr("SSH key removed: {keys}", keys=_short(removed)), added, removed)
     if group in ("sudoers", "sudoers_d", "ld_preload"):
         if added:

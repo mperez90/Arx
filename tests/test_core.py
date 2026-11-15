@@ -10150,7 +10150,8 @@ class ConfigSemanticsTests(unittest.TestCase):
         restricted = 'command="/usr/bin/backup",no-pty ' + self.KEY + "\n"
         self.assertEqual(self._cl("authorized_keys_root", restricted, self.KEY + "\n").sev, "high")
         self.assertEqual(self._cl("authorized_keys_root", self.KEY + "\n", "").sev, "low")
-        self.assertEqual(self._cl("authorized_keys_root", "", "esto no es una clave\n").sev, "med")
+        self.assertEqual(self._cl("authorized_keys_root", "", "esto no es una clave\n").sev, "high")
+        self.assertEqual(self._cl("authorized_keys_users", "", "esto no es una clave\n").sev, "med")
 
     def test_fingerprint_matches_openssh(self):
         if not shutil.which("ssh-keygen"):
