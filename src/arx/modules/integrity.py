@@ -340,6 +340,12 @@ def migrate(sealed_groups: dict[str, str], now: dict[str, dict], legacy_now: dic
             # la bóveda guarda exactamente lo sellado: se reconstruye fichero a fichero y se juzga por significado
             for p, (data, meta) in copies.items():
                 cur = now.get(p) or {}
+                if "link" in cur:
+                    # las versiones anteriores leían a través del enlace: la copia es el contenido del destino.
+                    # Si sigue siendo el mismo, el enlace es lo sellado (un alias como syslog.service).
+                    if _read_target(p) == data:
+                        adopted[p] = cur
+                        continue
                 full = {"mode": meta.get("mode", cur.get("mode")), "uid": cur.get("uid"), "gid": cur.get("gid")}
                 adopted[p] = state_from(p, _new_group(p, now), data, full)
             rebuilt_groups.add(g)
@@ -357,6 +363,18 @@ def migrate(sealed_groups: dict[str, str], now: dict[str, dict], legacy_now: dic
         else:
             adopted[path] = s  # el grupo no cambió: lo de ahora es lo sellado
     return adopted, sorted(changed_groups), sorted(newly)
+
+
+def _read_target(path: str) -> bytes | None:
+    """Contenido al que apunta un enlace (como lo leían las versiones anteriores), sin bloquearse."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError:
+        return None
+    with os.fdopen(fd, "rb") as f:
+        if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+            return None
+        return f.read(cfgsem.MAX_TEXT + 1)
 
 
 def _new_group(path: str, now: dict[str, dict]) -> str:

@@ -10380,6 +10380,20 @@ class IntegrityFileTests(unittest.TestCase):
         found = self._drift_legacy(base)
         self.assertEqual([(f["sev"], f["target"]["file"]) for f in found], [("high", "cron")])
 
+    def test_a_unit_alias_link_survives_a_migration_that_rebuilds_its_group(self):
+        """HZ#1 de la pista I: al actualizar rc2 → 0.0.9 los alias (syslog.service → rsyslog.service) salían como
+        enlaces nuevos high, porque la base vieja leía a través del enlace y la bóveda guarda el contenido."""
+        sd = os.path.join(self.d, "systemd")
+        real = self._file("systemd", "systemd/rsyslog.service", "[Service]\nExecStart=/usr/sbin/rsyslogd\n")
+        alias = f"{sd}/syslog.service"
+        os.symlink(real, alias)
+        self.layout["systemd"].append(alias)
+        other = self._file("systemd", "systemd/web.service", "[Service]\nExecStart=/usr/bin/web\n")
+        base = self._legacy_base()
+        self._file("systemd", "systemd/web.service", "[Service]\nExecStart=/usr/bin/web --v2\n")  # el grupo cambia
+        found = self._drift_legacy(base)
+        self.assertEqual([(f["sev"], f["target"]["path"]) for f in found], [("high", other)])
+
     def test_files_never_watched_before_are_adopted_and_said_once(self):
         self._file("passwd", "passwd", "root:x:0:0::/root:/bin/bash\n")
         base = self._legacy_base()
