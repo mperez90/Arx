@@ -43,8 +43,11 @@ class FakeNft:
     def __init__(self):
         self.calls: list = []
         self.table = True
-        self.sets = {n: [] for n in ("seen4", "seen6", "denied4", "denied6", "ok4", "ok6", "scan4", "scan6")}
+        self.sets = {n: [] for n in ("seen4", "seen6", "denied4", "denied6", "ok4", "ok6", "scan4", "scan6",
+                                     "novel4", "novel6")}
         self.watched: set = set()
+        self.watched_obs: set = set()      # servicios en vigilancia «observar» (sin corte)
+        self.loaded: list = []             # texto de cada `nft -f`
         self.declared_sets: list = []      # lo que Arx ha ido creando: el listado de la tabla lo refleja
         self.chains: dict = {}
         self.fail_lists = False
@@ -86,7 +89,10 @@ class FakeNft:
             if self.fail_lists or not self.table:
                 return _R(1, "")
             name = args[4]
-            elems = ([f'"{p}"' for p in sorted(self.watched)] if name == "watched2" else self.sets.get(name, []))
+            def show(p):  # nft imprime el cgroup como ruta si existe y como número si ya no
+                return p if p.isdigit() else f'"{p}"'
+            elems = ([show(p) for p in sorted(self.watched)] if name == "watched2" else
+                     [show(p) for p in sorted(self.watched_obs)] if name == "watched_obs" else self.sets.get(name, []))
             body = f"\t\telements = {{ {', '.join(elems)} }}\n" if elems else ""
             return _R(0, f"table inet arx {{\n\tset {name} {{\n{body}\t}}\n}}\n")
         if args[0] == "get":
@@ -100,12 +106,26 @@ class FakeNft:
             self.chains.setdefault(args[4], [])
         elif args[0] == "add" and args[1] == "rule":
             self.chains.setdefault(args[4], []).append(" ".join(args[5:]))
-        if args[0] == "-f":  # recarga de un servicio fijado: vuelve a quedar en watched2
-            self.watched.add("system.slice/" + os.path.basename(args[1]).removesuffix(".nft"))
+        if args[0] == "-f":  # recarga de un servicio fijado, o la carga de los de «observar»
+            try:
+                text = open(args[1]).read()
+            except OSError:
+                text = ""
+            self.loaded.append((os.path.basename(args[1]), text))
+            if "watched_obs" in text:
+                for line in text.splitlines():
+                    if "watched_obs" in line:
+                        self.watched_obs.add(line.split('"')[1])
+            else:
+                self.watched.add("system.slice/" + os.path.basename(args[1]).removesuffix(".nft"))
+        if args[0] == "flush" and args[1] == "set":
+            self.sets[args[4]] = []
         if args[0] == "delete" and args[1] == "element":
             name = args[4]
             target = " ".join(args[5:]).strip("{} ")
             self.sets[name] = [e for e in self.sets.get(name, []) if not e.startswith(target.split(" timeout")[0])]
+            self.watched_obs.discard(target)
+            self.watched.discard(target)
         return _R(0, "")
 
 
@@ -120,6 +140,8 @@ class _Sweeps(unittest.TestCase):
         self.now = [1000.0]
         self.enforce = False
         self.pinned: list = []
+        self.files_dir = os.path.join(tempfile.mkdtemp(), "arx-files")
+        self.cgroup_ids: dict = {}
         self.running = [f"system.slice/{n}.service" for n in SVC]
         profile._reset_cadence()
         response._tracking.update(ok_until=0.0, epoch=0)
@@ -132,9 +154,10 @@ class _Sweeps(unittest.TestCase):
                 (profile, "_updates", lambda *a, **k: []), (profile, "_exec_events", lambda *a, **k: []),
                 (profile, "_dns_events", lambda *a, **k: []), (profile, "_library_events", lambda *a, **k: []),
                 (profile, "_read_events", lambda *a, **k: []), (profile, "_doc_review_later", lambda *a: None),
-                (profile, "_cgroup_exists", lambda path: True), (profile, "_cgroup_id", lambda path: None),
+                (profile, "_cgroup_exists", lambda path: True),
+                (profile, "_cgroup_id", lambda path: self.cgroup_ids.get(path)),
                 (profile, "_pin", lambda path, s: self.pinned.append(path) or True),
-                (profile, "_files_dir", lambda: __import__("pathlib").Path("/x/arx-files")),
+                (profile, "_files_dir", lambda: __import__("pathlib").Path(self.files_dir)),
                 (provenance, "system_root", lambda: ""),
                 (profile.time, "monotonic", lambda: self.now[0]),
                 (profile.subprocess, "run", self.fake.run)]:
@@ -285,6 +308,153 @@ class EnforceBudgetTests(_Sweeps):
         self.p._cadence.pop("housekeeping", None)
         self.sweep(2 * STEP)
         self.assertEqual([c for c in self.fake.calls if c[1:2] == ["-f"]], [])
+
+
+class ObserveNoveltyTests(_Sweeps):
+    """P0 de arx-98: sin --enforce, un destino nuevo de un servicio vigilado no puede tardar 300 s (rc2: 30 s)."""
+
+    def setUp(self):
+        super().setUp()
+        self.enforce = False
+        self.sweep(0)
+        st = self.p.load()
+        for i, name in enumerate(SVC):  # tres servicios ya vigilados, con un destino permitido
+            s = st["subjects"][f"system.slice/{name}.service"]
+            s.update(status="watching", mode="fixed", watching_since="2026-11-01T00:00:00+00:00",
+                     dest={"tcp|104.20.23.0/24|443": {"first": "2026-10-01T00:00:00+00:00", "n": 9}})
+            self.cgroup_ids[f"system.slice/{name}.service"] = str(100 + i)
+        self.p._save(st)
+        self.fake.calls.clear()
+
+    def test_the_kernel_is_told_what_is_normal_for_every_watched_service_in_one_process(self):
+        self.sweep(STEP)
+        self.assertEqual(self.fake.watched_obs, {f"system.slice/{n}.service" for n in SVC})
+        loads = [name for name, text in self.fake.loaded if "watched_obs" in text]
+        self.assertEqual(loads, ["observe.nft"])  # una sola carga para todos
+        text = next(t for n, t in self.fake.loaded if n == "observe.nft")
+        self.assertIn('add element inet arx ok4 { "system.slice/app.service" . tcp . 104.20.23.0/24 . 443 }', text)
+        self.assertNotIn("watched2", text)  # nada de lo que corta
+
+    def test_the_rule_that_notices_a_novel_destination_never_drops(self):
+        self.sweep(STEP)
+        rules = " ".join(self.fake.chains.get("output", []))
+        self.assertIn("@watched_obs", rules)
+        self.assertIn("add @novel4", rules)
+        self.assertIn("add @novel6", rules)
+        novel = [r for r in self.fake.chains["output"] if "@novel" in r]
+        self.assertTrue(novel and all("drop" not in r for r in novel), novel)
+        self.assertIn("set novel4 ", self.fake.structure)
+        self.assertIn("set watched_obs ", self.fake.structure)
+
+    def test_a_novel_destination_is_reported_in_the_next_sweep(self):
+        self.sweep(STEP)
+        self.fake.sets["novel4"].append(self.elem("app", "203.0.113.50", 4444))  # el kernel lo ve entre dos barridos
+        found = self.sweep(2 * STEP)
+        hits = [f for f in found if "203.0.113.50" in str(f.get("detail"))]
+        self.assertEqual(len(hits), 1, found)
+        self.assertEqual((hits[0]["sev"], hits[0]["kind"]), ("high", "egress_profile"))
+
+    def test_it_does_not_wait_for_what_is_learned(self):
+        self.sweep(STEP)
+        reads = self.fake.reads("seen4")
+        self.fake.sets["novel4"].append(self.elem("db", "203.0.113.51", 8080))
+        found = self.sweep(2 * STEP)
+        self.assertTrue(any("203.0.113.51" in str(f.get("detail")) for f in found))
+        self.assertEqual(self.fake.reads("seen4"), reads)  # `seen` sigue su ritmo de 300 s
+
+    def test_what_the_profile_already_allows_is_not_a_finding(self):
+        """El kernel compara por intervalo; la comprobación del perfil de Arx es la que manda."""
+        self.sweep(STEP)
+        self.fake.sets["novel4"].append(self.elem("app", "104.20.23.200", 443))  # dentro de la red permitida
+        found = self.sweep(2 * STEP)
+        self.assertFalse([f for f in found if "104.20.23.200" in str(f.get("detail"))], found)
+
+    def test_the_novel_set_is_emptied_after_each_read_so_it_never_grows(self):
+        self.sweep(STEP)
+        for i in range(50):
+            self.fake.sets["novel4"].append(self.elem("app", f"203.0.113.{i}", 4444))
+        self.sweep(2 * STEP)
+        self.assertEqual(self.fake.sets["novel4"], [])
+        self.assertEqual(self.fake.count("nft", "flush", "set", "inet", "arx", "novel4"), 1)
+
+    def test_a_service_still_being_learned_is_not_reported(self):
+        self.running.append("system.slice/fresh.service")
+        self.sweep(STEP)
+        self.fake.sets["novel4"].append(self.elem("fresh", "198.51.100.9", 443))
+        found = self.sweep(2 * STEP)
+        self.assertFalse([f for f in found if "198.51.100.9" in str(f.get("detail"))])
+
+    def test_a_restarted_service_is_loaded_again_at_once(self):
+        self.sweep(STEP)
+        self.fake.loaded.clear()
+        self.cgroup_ids["system.slice/db.service"] = "999"  # systemd le dio otro cgroup
+        self.sweep(2 * STEP)
+        loads = [t for n, t in self.fake.loaded if n == "observe.nft"]
+        self.assertEqual(len(loads), 1)
+        self.assertIn("db.service", loads[0])
+        self.assertNotIn("app.service", loads[0])  # solo el que cambió
+        self.fake.loaded.clear()
+        self.sweep(3 * STEP)
+        self.assertEqual(self.fake.loaded, [])  # y no se repite
+
+    def test_a_novel_destination_of_a_service_that_restarted_is_still_attributed_to_it(self):
+        """Si el servicio se reinició antes del barrido, el kernel lo anota con su cgroup viejo, como número."""
+        self.sweep(STEP)
+        self.cgroup_ids["system.slice/app.service"] = "777"  # reinició: nuevo cgroup
+        self.sweep(2 * STEP)
+        self.fake.sets["novel4"].append('100 . tcp . 203.0.113.60 . 4444 timeout 10m expires 9m')  # el viejo, ya muerto
+        found = self.sweep(3 * STEP)
+        hits = [f for f in found if "203.0.113.60" in str(f.get("detail"))]
+        self.assertEqual(len(hits), 1, found)
+        self.assertIn("system.slice/app.service", hits[0]["item"])
+
+    def test_a_flushed_table_gets_every_watched_service_loaded_again(self):
+        self.sweep(STEP)
+        self.fake.loaded.clear()
+        self.fake.table = False
+        self.fake.watched_obs.clear()
+        self.fake.declared_sets.clear()
+        self.fake.chains.clear()
+        self.sweep(2 * STEP)
+        self.assertEqual(self.fake.watched_obs, {f"system.slice/{n}.service" for n in SVC})
+
+    def test_the_budget_of_processes_is_the_same_as_without_the_novelty_sets(self):
+        self.sweep(STEP)
+        self.fake.calls.clear()
+        for i in range(2, 42):
+            self.sweep(i * STEP)
+        self.assertLessEqual(self.fake.processes() / 40, 4.0, self.fake.calls[:12])
+        self.assertEqual(self.fake.reads("novel4"), 40)  # cada barrido: es el que da la latencia
+        self.assertLessEqual(self.fake.reads("seen4"), 5)
+
+    def test_with_enforce_the_services_are_cut_not_merely_noticed(self):
+        """En enforce los servicios van a `watched2` (con corte); `watched_obs` ya no se carga ni se lee."""
+        self.enforce = True
+        st = self.p.load()
+        for name in SVC:
+            st["subjects"][f"system.slice/{name}.service"]["enforced"] = True
+        self.p._save(st)
+        self.fake.loaded.clear()
+        self.fake.calls.clear()
+        self.sweep(2 * STEP)
+        self.assertEqual([n for n, t in self.fake.loaded if "watched_obs" in t], [])
+        self.assertEqual(self.fake.reads("novel4"), 0)
+
+    def test_dead_cgroups_are_also_cleaned_from_the_observe_set(self):
+        self.sweep(STEP)
+        self.fake.watched_obs.add("4242")  # un cgroup que ya no existe sale como número en el listado
+        for i in range(2, 14):
+            self.sweep(i * STEP)
+        self.assertTrue(any(c[:5] == ["nft", "delete", "element", "inet", "arx"] and c[5] == "watched_obs"
+                            for c in self.fake.calls), self.fake.calls[:5])
+
+    def test_accepting_a_destination_loads_the_service_again_so_the_kernel_stops_noticing_it(self):
+        self.sweep(STEP)
+        self.fake.loaded.clear()
+        self.p.accept("system.slice/app.service|tcp|203.0.113.50|4444")
+        self.sweep(2 * STEP)
+        text = next(t for n, t in self.fake.loaded if n == "observe.nft")
+        self.assertIn("203.0.113.0/24", text)
 
 
 class TheSweepEndsItsReadingBeforeTheResponses(unittest.TestCase):
