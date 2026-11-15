@@ -5870,6 +5870,11 @@ class SelfProtectionTests(unittest.TestCase):
         p = mock.patch.object(service, "_runs_from_package", return_value=True)
         p.start()
         self.addCleanup(p.stop)
+        # sin el arx.md5sums del host que corre las pruebas (en una VM con Arx instalado lo habría): estas pruebas
+        # ejercen el respaldo con `dpkg --verify`; la comprobación en proceso va en test_self_check_md5.py
+        p = mock.patch.object(service.provenance, "DPKG_INFO", os.path.join(self.d, "no-dpkg-info"))
+        p.start()
+        self.addCleanup(p.stop)
 
     def _check(self, dpkg="", dropins=(), rc=0):
         class R:
@@ -9982,7 +9987,8 @@ class AuditdAlwaysInstalledTests(unittest.TestCase):
     def test_the_installer_resolves_it_and_asks_about_the_program_once(self):
         import subprocess
         text = self.read("packaging/install.sh")
-        self.assertIn("apt-get install -f -y", text)
+        self.assertIn('apt-get install -y -qq -o DPkg::Lock::Timeout=120 "$DEB"', text)  # B75: un solo paso de apt
+        self.assertNotIn("dpkg -i", text)
         self.assertIn("systemctl enable --now auditd", text)
         self.assertIn("arx telemetry ask || true", text)
         self.assertEqual(subprocess.run(["sh", "-n", os.path.join(self.ROOT, "packaging/install.sh")]).returncode, 0)

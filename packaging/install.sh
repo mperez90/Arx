@@ -28,6 +28,10 @@ trap 'rm -rf "$TMP"' EXIT
 
 if [ -n "${ARX_DEB_PATH:-}" ]; then
   DEB="$ARX_DEB_PATH"
+  if [ ! -f "$DEB" ]; then
+    echo "✗ ARX_DEB_PATH does not point to a file: $DEB"
+    exit 1
+  fi
 else
   DEB="$TMP/arx.deb"
   URL="${ARX_DEB_URL:-https://github.com/mperez90/Arx/releases/latest/download/arx_all.deb}"
@@ -50,11 +54,26 @@ else
 fi
 
 echo "Installing…"
-# dpkg -i falla si faltan sus dependencias (python3, auditd); apt las resuelve e instala.
-# Silenciamos su salida (el postinst) para no duplicar el mensaje de pasos de abajo.
-if ! dpkg -i "$DEB" >/dev/null 2>&1; then
-  apt-get update -qq
-  apt-get install -f -y
+# Las dependencias (python3, auditd) y el paquete, en un solo paso de apt. Su salida y la del postinst (que ya
+# trae su propio mensaje de pasos) van a un registro que solo se enseña si algo falla: un único mensaje final.
+# apt toma el .deb de un directorio que su usuario de descarga puede leer (si no, avisa de que lo hace como root)
+# y solo trata de «fichero» lo que empieza por «/» o «./».
+chmod 755 "$TMP"
+[ "$DEB" = "$TMP/arx.deb" ] || cp "$DEB" "$TMP/arx.deb"
+DEB="$TMP/arx.deb"
+chmod 644 "$DEB"
+LOG="$TMP/apt.log"
+# DEBIAN_FRONTEND: sin preguntas. NEEDRESTART_MODE=l: instalar Arx no reinicia servicios que no son suyos.
+# DPkg::Lock::Timeout: en una máquina recién creada, cloud-init o unattended-upgrades pueden tener el cerrojo.
+export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l
+have() { [ "$(dpkg-query -W -f='${Status}' "$1" 2>/dev/null)" = "install ok installed" ]; }
+if ! have python3 || ! have auditd; then
+  apt-get update -qq >>"$LOG" 2>&1 || true  # sin lista de paquetes apt no resuelve las dependencias
+fi
+if ! apt-get install -y -qq -o DPkg::Lock::Timeout=120 "$DEB" >>"$LOG" 2>&1; then
+  cat "$LOG" >&2
+  echo "✗ Arx could not be installed (the output of apt is above)." >&2
+  exit 1
 fi
 
 # auditd viene siempre con Arx: sin él no hay avisos de ficheros de identidad, señuelos ni lecturas
