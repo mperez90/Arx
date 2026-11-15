@@ -14,17 +14,18 @@ Se salta si los fixtures privados no están (p. ej. en CI pública).
 Ejecutar:  python3 -m pytest tests/test_adv_migration.py -q
 """
 import glob
-import hashlib
 import os
 import sys
 import tarfile
+os.environ.setdefault("ARX_LANG", "es")  # antes de importar Arx
 import tempfile
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-FIXTURE_DIR = "/Users/mpz/Desktop/Arx/DevelopDocs/pruebas-reales/vps-final-pre-reinstalacion-2026-11-14"
-TARBALLS = sorted(glob.glob(os.path.join(FIXTURE_DIR, "*.tar.gz")))
+# Fixtures privados (bases selladas reales, fuera del repo público): ruta por entorno, nunca escrita aquí.
+FIXTURE_DIR = os.environ.get("ARX_MIGRATION_FIXTURES", "")
+TARBALLS = sorted(glob.glob(os.path.join(FIXTURE_DIR, "*.tar.gz"))) if FIXTURE_DIR else []
 
 
 def _new_group(path: str, legacy_key: str) -> str:
