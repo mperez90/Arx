@@ -10477,6 +10477,31 @@ class IntegrityFileTests(unittest.TestCase):
         self.assertIn(hook, found[0]["detail"].split("—")[1])
         self.assertNotIn(pkg_hook, found[0]["detail"].split("—")[1])
 
+    def test_a_restore_never_quarantines_arx_itself(self):
+        """Autorizar el pendiente de grupo de rc2 («cambió systemd_units») habría puesto en cuarentena las unidades de
+        Arx: instaladas después de sellar, no estaban en la bóveda y parecían intrusas."""
+        unit = self._file("systemd", "systemd/arx.service", "[Service]\nExecStart=/usr/bin/arx guard\n")
+        intruder = self._file("systemd", "systemd/evil.service", "[Service]\nExecStart=/tmp/x\n")
+        self.r.config.write_json(self.r.config.state_dir() / "self.json", {unit: "x"})
+        quarantined = []
+        with mock.patch.object(self.r, "quarantine_file", lambda p, source=None: quarantined.append(p) or "q"):
+            self.r._restore_from_vault("systemd_units", current_files=[unit, intruder])
+            self.assertEqual(quarantined, [intruder])
+            self.assertIn("Arx", self.r._restore_from_vault("systemd", only=unit))
+        self.assertEqual(quarantined, [intruder])
+
+    def test_migrating_drops_stale_group_pendings_and_ignores_arx_own_files(self):
+        self._file("passwd", "passwd", "root:x:0:0::/root:/bin/bash\n")
+        base = self._legacy_base()
+        unit = self._file("systemd", "systemd/arx.service", "[Service]\nExecStart=/usr/bin/arx guard\n")
+        self.r.config.write_json(self.r.config.state_dir() / "self.json", {unit: "x"})
+        self.r._save_pending([{"id": "e6f668", "kind": "integrity", "target": {"file": "passwd"},
+                               "detail": "passwd changed since the baseline was sealed"},
+                              {"id": "aaaaaa", "kind": "listen_ports", "target": {}, "detail": "otro"}])
+        found = self._drift_legacy(base, layout={"passwd": self.layout["passwd"]})
+        self.assertEqual([p["id"] for p in self.r.list_pending()], ["aaaaaa"])
+        self.assertEqual([(f["kind"], f["sev"]) for f in found], [("integrity_watch_added", "med")])  # no high por Arx
+
     def test_files_never_watched_before_are_adopted_and_said_once(self):
         self._file("passwd", "passwd", "root:x:0:0::/root:/bin/bash\n")
         base = self._legacy_base()

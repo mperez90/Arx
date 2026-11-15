@@ -2103,4 +2103,6 @@ ES = {
         '{n} de ellos ejecutan órdenes o dan confianza y no son de ningún paquete: {files}',
     'the installed version is not served by a signed repository':
         'la versión instalada no la sirve ningún repositorio firmado',
+    "'{path}' belongs to Arx itself: it is not restored or quarantined":
+        "'{path}' es del propio Arx: no se restaura ni se pone en cuarentena",
 }

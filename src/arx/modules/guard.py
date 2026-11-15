@@ -122,6 +122,20 @@ def _own_artifacts() -> tuple[dict[str, str], set[str]]:
     return own, skip
 
 
+def _adopt_old_arx_dropins(now_files: dict) -> None:
+    """Los drop-ins de vigilancia que escribió una versión anterior (sin manifiesto de piezas propias) se
+    reconocen por su contenido exacto y se registran como de Arx."""
+    for path in now_files:
+        if not path.endswith("/" + profile.DROPIN) or path in integrity.own_artifacts():
+            continue
+        try:
+            text = open(path, encoding="utf-8").read()
+        except OSError:
+            continue
+        if provenance._is_arx_dropin(path, text):
+            integrity.register_own(path, text)
+
+
 def _package_wrote(path: str) -> bool:
     """¿El fichero es de un paquete de un repositorio firmado, y el dpkg que lo escribió es el auténtico?
     Solo entonces un cambio que solo hizo dpkg es una actualización y no un hallazgo. Ante cualquier duda, no."""
@@ -165,8 +179,15 @@ def _integrity_drift(base: dict, include_suid: bool) -> list[dict]:
                                                          legacy_hash=baseline.legacy_group_hash)
         baseline.adopt_integrity_files(files, replace=True)
         base["integrity_files"] = files
+        _adopt_old_arx_dropins(now_files)  # los escribió una versión que aún no los registraba
+        own_now, skip_now = _own_artifacts()
+        clean = set(integrity.legacy_groups()) - set(pending_groups)
+        response.drop_pending(lambda p: p.get("kind") == "integrity" and not (p.get("target") or {}).get("path")
+                              and (p.get("target") or {}).get("file") in clean,
+                              "superseded by per-file integrity: that group showed no real change")
         if newly:
-            risky = integrity.risky_preexisting(newly, now_files, owner=pkgdb.owner)
+            risky = integrity.risky_preexisting(newly, now_files, owner=pkgdb.owner,
+                                                own=set(own_now) | skip_now)
             detail = tr("Arx now also watches {n} configuration file(s); what was already there "
                         "was taken as known: {files}", n=len(newly), files=", ".join(newly[:10]))
             if risky:

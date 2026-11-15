@@ -407,13 +407,13 @@ def legacy_groups() -> dict[str, list[str]]:
     }
 
 
-def risky_preexisting(paths: list[str], now: dict[str, dict], owner=None) -> list[str]:
+def risky_preexisting(paths: list[str], now: dict[str, dict], owner=None, own=()) -> list[str]:
     """De lo que se empieza a vigilar al migrar, lo que ejecuta órdenes o da confianza (crit/high si fuera
-    nuevo) y no pertenece a ningún paquete: persistencia que pudo plantarse antes de que Arx mirara."""
-    out = []
+    nuevo) y no pertenece a ningún paquete ni a Arx: persistencia que pudo plantarse antes de que Arx mirara."""
+    out, own = [], set(own)
     for p in paths:
         s = now.get(p)
-        if not s:
+        if not s or p in own:
             continue
         ch = cfgsem.classify(s["g"], None, _parsed(s)) if "link" not in s else cfgsem.Change("high", "link")
         if ch is None or ch.sev not in ("crit", "high"):

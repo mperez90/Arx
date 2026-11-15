@@ -31,6 +31,7 @@ host destino. Fuera de eso se decide y se registra el plan, nunca se finge hecho
 """
 from __future__ import annotations
 
+import glob
 import hashlib
 import ipaddress
 import os
@@ -840,6 +841,9 @@ def _restore_from_vault(key: str, current_files: list[str] | None = None, only: 
     `current_files` se puede inyectar en pruebas; por defecto se deriva de la clave.
     """
     manifest = config.read_json(_vault_manifest_path(), {})
+    own = _arx_own_paths()
+    if only is not None and only in own:
+        return tr("'{path}' belongs to Arx itself: it is not restored or quarantined", path=only)
     if only is not None:  # B77: la alerta es de un fichero; se restaura ese y nada más
         current_files = [only] if os.path.lexists(only) else []
         known = {only: manifest[only]} if only in manifest and not only.startswith(str(_vault_dir())) else {}
@@ -849,6 +853,9 @@ def _restore_from_vault(key: str, current_files: list[str] | None = None, only: 
             current_files = baseline.integrity_paths().get(key, [])
         known = {p: m for p, m in manifest.items()
                  if m.get("key") == key and not p.startswith(str(_vault_dir()))}
+    # las piezas de Arx nunca: instaladas después de sellar parecerían intrusas y se pondrían en cuarentena
+    known = {p: m for p, m in known.items() if p not in own}
+    current_files = [p for p in current_files if p not in own]
     restored, quarantined = [], []
     for path, meta in known.items():
         bak = _vault_dir() / f"{hashlib.sha1(path.encode()).hexdigest()[:12]}.bak"
@@ -1528,6 +1535,29 @@ def _add_pending(finding: dict, plan: dict) -> str:
 
 def list_pending() -> list[dict]:
     return _load_pending()
+
+
+def drop_pending(pred, reason: str) -> list[str]:
+    """Retira los pendientes que ya no tienen sentido (y lo deja registrado). Devuelve sus ids."""
+    with config.locked():
+        pend = _load_pending()
+        gone = [p for p in pend if pred(p)]
+        if gone:
+            _save_pending([p for p in pend if not pred(p)])
+    for p in gone:
+        record({"kind": "tier2_superseded", "detail": p.get("detail"), "id": p.get("id"), "reason": reason})
+    return [p.get("id") for p in gone]
+
+
+def _arx_own_paths() -> set[str]:
+    """Ficheros de Arx en el sistema (sus unidades, sus drop-ins): una restauración jamás los toca."""
+    from arx.modules import integrity, service  # perezoso: ambos importan este módulo
+    own = set((config.read_json(config.state_dir() / "self.json", {}) or {}).keys())
+    own.update(integrity.own_artifacts())
+    own.update(service._units())
+    for d in service.DROPIN_DIRS:
+        own.update(glob.glob(f"{d}/*"))
+    return own
 
 
 def authorize_pending(pid: str) -> dict | None:
