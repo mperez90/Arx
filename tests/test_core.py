@@ -10346,6 +10346,39 @@ class IntegrityFileTests(unittest.TestCase):
         self.assertEqual(open(a).read(), "0 1 * * * root /bin/a\n")
         self.assertEqual(open(b).read(), "0 2 * * * root /bin/b2\n")  # lo demás no se toca
 
+    def test_the_periodic_sweep_rereads_only_what_changed(self):
+        """B78 (lab de I): releer ~100 ficheros cada 30 s costaba un 2-3 % de CPU en reposo."""
+        a = self._file("cron", "cron.d/a", "0 1 * * * root /bin/a\n")
+        self._file("cron", "cron.d/b", "0 2 * * * root /bin/b\n")
+        self.i.clear_cache()
+        reads = []
+        real = self.i._read_safely
+        with mock.patch.object(self.i, "_read_safely", lambda p: reads.append(p) or real(p)):
+            self.i.snapshot(cached=True)
+            self.assertEqual(len(reads), 2)
+            self.i.snapshot(cached=True)
+            self.assertEqual(len(reads), 2)  # nada cambió: nada se relee
+            st = os.stat(a)
+            self._file("cron", "cron.d/a", "* * * * * root /tmp/x\n")
+            os.utime(a, ns=(st.st_atime_ns, st.st_mtime_ns))  # touch -r: la fecha vuelve, ctime no
+            now, _ = self.i.snapshot(cached=True)
+            self.assertEqual(reads[-1], a)
+            self.assertIn("/tmp/x", str(now[a]["canon"]))
+
+    def test_an_audit_write_or_the_hourly_recheck_forces_a_reread(self):
+        a = self._file("cron", "cron.d/a", "0 1 * * * root /bin/a\n")
+        self.i.clear_cache()
+        self.i.cached_state(a, "cron", now=100.0)
+        reads = []
+        real = self.i._read_safely
+        with mock.patch.object(self.i, "_read_safely", lambda p: reads.append(p) or real(p)):
+            self.i.cached_state(a, "cron", writers=lambda p, since: [], now=200.0)
+            self.assertEqual(reads, [])
+            self.i.cached_state(a, "cron", writers=lambda p, since: [{"exe": "/usr/bin/sed"}], now=210.0)
+            self.assertEqual(reads, [a])  # auditd vio una escritura
+            self.i.cached_state(a, "cron", now=210.0 + self.i.FULL_RECHECK_S)
+            self.assertEqual(reads, [a, a])  # la relectura de cada hora
+
     # ── migración desde la huella por grupo (R4) ──
     def _legacy_base(self):
         with mock.patch.object(self.i, "legacy_groups", lambda: self.layout), \

@@ -148,7 +148,8 @@ def _integrity_drift(base: dict, include_suid: bool) -> list[dict]:
     if not sealed:
         return []  # una base sin nada sellado (formato antiguo): no hay contra qué comparar
     findings: list[dict] = []
-    now_files, overflow = integrity.snapshot()
+    sensors.poll_writers()  # la autoría al día antes de comparar (y para invalidar la caché)
+    now_files, overflow = integrity.snapshot(cached=True, writers=sensors.writers_of)
     for g in overflow:
         findings.append({"sev": "high", "kind": "integrity", "set": "integrity", "item": g,
                          "detail": tr("too many files in {group}: only the first {n} are watched", group=g,
@@ -196,7 +197,6 @@ def _integrity_drift(base: dict, include_suid: bool) -> list[dict]:
                                                    f"integrity|cambió {g} desde el sellado de la línea base|"
                                                    f"{legacy_now.get(g)}"))
     own, skip = _own_artifacts()
-    sensors.poll_writers()  # la autoría al día antes de comparar
     found, adopt = integrity.drift(files, now_files, own, vault_read=response.vault_copy,
                                    skip=skip | skip_legacy, writers=sensors.writers_of,
                                    package_wrote=_package_wrote)

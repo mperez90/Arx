@@ -26,6 +26,7 @@ from arx.modules import cfgsem
 
 MAX_FILES_PER_GROUP = 2_000
 MAX_HASH = 64 << 20   # se hashea entero hasta aquí: añadir detrás del primer MB no puede pasar inadvertido
+FULL_RECHECK_S = 3600  # aunque nada parezca cambiar, todo se relee y se rehashea al menos una vez por hora
 MAX_DIFF_LINES = 40
 OWN_MANIFEST = "own-artifacts.json"
 
@@ -150,8 +151,46 @@ def _tupled(x):
     return x
 
 
-def snapshot() -> tuple[dict[str, dict], list[str]]:
-    """({ruta: estado}, grupos que superaron el límite de ficheros)."""
+# Caché por fichero para el barrido de cada 30 s: releer, hashear y analizar ~100 ficheros cada vez costaba un 2-3 %
+# de CPU en reposo. Un fichero se relee si cambia su lstat (con ctime, que un `touch -r` no puede devolver a su
+# valor), si auditd vio que alguien lo escribió, o si pasó FULL_RECHECK_S desde la última lectura completa.
+_cache: dict[str, tuple[tuple, dict, float]] = {}
+
+
+def _stat_key(path: str) -> tuple | None:
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_mode, st.st_uid, st.st_gid)
+
+
+def clear_cache() -> None:
+    _cache.clear()
+
+
+def cached_state(path: str, group: str, writers=None, now: float | None = None) -> dict | None:
+    """Como `state`, pero sin releer lo que no cambió. `writers(path, since)` invalida si auditd vio una escritura."""
+    now = time.monotonic() if now is None else now
+    key = _stat_key(path)
+    if key is None:
+        _cache.pop(path, None)
+        return None
+    hit = _cache.get(path)
+    if hit and hit[0] == key and hit[1].get("g") == group and now - hit[2] < FULL_RECHECK_S:
+        if not (writers and writers(path, hit[1].get("at"))):
+            return hit[1]
+    s = state(path, group)
+    if s is not None:
+        _cache[path] = (key, s, now)
+    else:
+        _cache.pop(path, None)
+    return s
+
+
+def snapshot(cached: bool = False, writers=None) -> tuple[dict[str, dict], list[str]]:
+    """({ruta: estado}, grupos que superaron el límite de ficheros). `cached` para el barrido periódico; al sellar o
+    aceptar se lee todo de nuevo."""
     out, overflow = {}, []
     for group, paths in groups().items():
         existing = sorted({p for p in paths if os.path.lexists(p)})
@@ -159,9 +198,12 @@ def snapshot() -> tuple[dict[str, dict], list[str]]:
             overflow.append(group)
             existing = existing[:MAX_FILES_PER_GROUP]
         for p in existing:
-            s = state(p, group)
+            s = cached_state(p, group, writers) if cached else state(p, group)
             if s is not None:
                 out[p] = s
+    if cached:
+        for p in [p for p in _cache if p not in out]:
+            _cache.pop(p, None)  # lo que ya no se vigila no ocupa memoria
     return out, overflow
 
 
