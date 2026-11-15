@@ -227,6 +227,30 @@ def integrity_paths() -> dict[str, list[str]]:
     return out
 
 
+def legacy_fingerprint() -> dict:
+    """Huella por grupo, tal como la sellaban las versiones anteriores (sin el conjunto SUID)."""
+    return integrity_fingerprint(include_suid=False)
+
+
+def legacy_group_hash(group: str, contents: dict[str, bytes]) -> str | None:
+    """La huella de grupo que darían estos contenidos: sirve para saber si la copia de la bóveda es
+    exactamente lo que se selló."""
+    if not contents:
+        return None
+    texts = {p: d.decode("utf-8", "replace") for p, d in contents.items()}
+    if group in ("authorized_keys_root", "sudoers", "passwd", "ld_preload"):
+        return _h(next(iter(texts.values())))
+    return _h("\0\0".join(f"{p}\0{d}" for p, d in sorted(texts.items())))
+
+
+def mark_integrity_pending(groups: list[str]) -> None:
+    with config.locked("baseline"):
+        b = load()
+        if b:
+            b["meta"]["integrity_pending"] = sorted(set(groups))
+            save(b)
+
+
 def integrity_fingerprint(include_suid: bool = True) -> dict:
     fp: dict = {}
     singles = {"authorized_keys_root", "sudoers", "passwd", "ld_preload"}
@@ -271,6 +295,9 @@ def fold(baseline: dict, snap: dict, check_integrity: bool = True) -> dict:
         g["sum"] += val
         g["n"] += 1
     fp = integrity_fingerprint()
+    if "integrity_files" not in baseline:  # B77: estado por fichero, desde la primera muestra
+        from arx.modules import integrity
+        baseline["integrity_files"] = integrity.snapshot()[0]
     if not baseline.get("integrity"):
         baseline["integrity"] = fp
     elif check_integrity and fp != baseline["integrity"]:
@@ -401,18 +428,66 @@ def adopt_suid_scope(scope: list[str], adopt: list[str]) -> None:
         save(b)
 
 
+def adopt_integrity_files(states: dict, drop=(), replace: bool = False) -> None:
+    """Incorpora estados de ficheros a la base (piezas de Arx, migración, aceptación)."""
+    with config.locked("baseline"):
+        b = load()
+        if not b:
+            return
+        files = {} if replace else b.setdefault("integrity_files", {})
+        files.update(states)
+        for p in drop:
+            files.pop(p, None)
+        b["integrity_files"] = files
+        b["meta"]["updated"] = _now()
+        save(b)
+
+
+def _accept_integrity_path(b: dict, path: str) -> bool:
+    """Acepta el estado actual de un fichero vigilado (o su desaparición) y renueva su copia buena."""
+    from arx.modules import integrity, response
+    group = next((g for g, ps in integrity.groups().items() if path in ps), None)
+    files = b.setdefault("integrity_files", {})
+    if group is None and path not in files:
+        return False
+    group = group or files[path].get("g")
+    s = integrity.state(path, group)
+    if s is None:
+        files.pop(path, None)
+    else:
+        files[path] = s
+        if os.path.isfile(path) and not os.path.islink(path):
+            response.backup_critical({group: [path]})
+    b["integrity"] = {**integrity_fingerprint(include_suid=False),
+                      **({"suid_set": b["integrity"]["suid_set"]} if "suid_set" in b.get("integrity", {}) else {})}
+    b["meta"]["updated"] = _now()
+    save(b)
+    return True
+
+
 def accept(key: str, item: str) -> bool:
     """Incorpora a la base un cambio legítimo (p. ej. instalaste nginx → 'tcp 80 all')."""
     with config.locked("baseline"):
         b = load()
+        if key == "integrity" and b and item.startswith("/"):  # B77: un fichero concreto
+            return _accept_integrity_path(b, item)
         if key == "integrity" and b:  # un cambio legítimo: la nueva huella y la nueva copia buena
             current = integrity_fingerprint().get(item)
             if current is None:
                 return False
             b.setdefault("integrity", {})[item] = current
+            pending = b["meta"].get("integrity_pending") or []
+            if item in pending:
+                b["meta"]["integrity_pending"] = [g for g in pending if g != item]
+            from arx.modules import integrity, response
+            legacy = set(integrity.legacy_groups().get(item, []))
+            if "integrity_files" in b:  # el grupo aceptado pasa a vigilarse fichero a fichero
+                now_files, _overflow = integrity.snapshot()
+                b["integrity_files"].update({p: s for p, s in now_files.items() if p in legacy})
+                for p in [p for p in b["integrity_files"] if p in legacy and p not in now_files]:
+                    b["integrity_files"].pop(p)
             b["meta"]["updated"] = _now()
             save(b)
-            from arx.modules import response
             response.backup_critical({item: integrity_paths().get(item, [])})
             return True
         if key in ("uid0_accounts", "intel_allow") and b:  # jamás se aprenden solas: nacen al aceptar
@@ -475,8 +550,9 @@ def run(samples: int = 1, interval: int = 0, seal: bool = False, status: bool = 
             baseline["meta"]["suid_scope"] = list(users.get("suid_scope") or ["/"])
         save(baseline)
         # Respaldo de los ficheros críticos al sellar: sin copia buena no hay restauración.
-        from arx.modules import response
+        from arx.modules import integrity, response
         n = response.backup_critical(integrity_paths())
+        n += response.backup_critical(integrity.existing())  # B77: también lo que antes no se vigilaba
         # La pista de escaneo (nft scan4/6) nace con el sellado: debe estar activa
         # ANTES del primer ataque, no en la primera respuesta.
         tracked = response.ensure_nft_tracking()

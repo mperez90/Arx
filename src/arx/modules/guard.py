@@ -19,7 +19,9 @@ con el análisis del motor si lo hubo. Nada se repite cada barrido.
 """
 from __future__ import annotations
 
+import glob
 import json
+import os
 import sys
 import threading
 import time
@@ -28,7 +30,7 @@ from datetime import datetime, timezone
 from arx import config, consensus, engine, notify, redact, telemetry
 from arx import license as lic
 from arx.i18n import lang, tr
-from arx.modules import (baseline, canaries, dnswatch, execwatch, filewatch, fleet, profile, provenance, recon, response, sandbox,
+from arx.modules import (baseline, canaries, dnswatch, execwatch, filewatch, fleet, integrity, profile, provenance, recon, response, sandbox,
                          sensors, service, telegram, vaccines)
 
 SYSTEM_PROMPT = (
@@ -67,7 +69,6 @@ ENRICH_SWEEP_BUDGET_S = 10   # análisis estático por barrido: nunca retrasa la
 
 
 # ── integridad ───────────────────────────────────────────────────────────────
-_LATE_WATCHES = ("apt_sources", "apt_keys")  # vigilancias que una base sellada antes no tenía
 _CRIT_INTEGRITY = ("authorized_keys_root", "authorized_keys_users", "sudoers", "sudoers_d", "ld_preload",
                    "apt_sources", "apt_keys")
 
@@ -78,50 +79,105 @@ def _integrity_finding(k: str, detail: str, fp_key: str) -> dict:
             "target": {"file": k}, "set": "integrity", "item": k}
 
 
-def _integrity_drift(base: dict, include_suid: bool) -> list[dict]:
-    """Compara la huella actual de ficheros críticos contra la sellada en la base.
+def _own_artifacts() -> tuple[dict[str, str], set[str]]:
+    """({ruta: contenido esperado} de lo que escribió Arx, rutas que vigila su propia comprobación).
 
-    Un grupo que no existía al sellar y aparece (el primer `authorized_keys` de root, un primer cron.d)
-    es justo lo que planta un intruso: antes no se miraba, solo se comparaba lo sellado. La única
-    excepción, una vez: las vigilancias que una base sellada por una versión anterior no tenía."""
+    Las unidades de Arx las vigila `service.self_check` (manipulación = crit): aquí se saltan para no avisar
+    dos veces. Sus drop-ins de vigilancia y los enlaces que habilitan sus unidades se comprueban aquí contra lo
+    esperado: si coinciden, no son un hallazgo (B73)."""
+    from arx.modules import service
+    self_units = config.read_json(config.state_dir() / "self.json", {}) or {}
+    skip = set(self_units)
+    for d in service.DROPIN_DIRS:
+        skip.update(glob.glob(f"{d}/*"))
+    own = dict(integrity.own_artifacts())
+    names = {os.path.basename(p): p for p in service._units()}
+    for d in integrity._SYSTEMD_DIRS:
+        for link in glob.glob(f"{d}/*.wants/*") + glob.glob(f"{d}/*.requires/*"):
+            target = names.get(os.path.basename(link))
+            try:
+                if target and os.readlink(link) == target and target in self_units:
+                    own[link] = "link:" + target
+            except OSError:
+                continue
+    return own, skip
+
+
+def _integrity_drift(base: dict, include_suid: bool) -> list[dict]:
+    """Ficheros críticos contra la base sellada, fichero a fichero (B77).
+
+    Una base sellada por una versión anterior solo tiene la huella por grupo: se migra la primera vez. Lo
+    que sigue igual se adopta en silencio; un grupo que ya había cambiado conserva su aviso de grupo hasta que
+    alguien lo acepte; y lo que antes no se vigilaba (drop-ins, `.wants`, `authorized_keys2`…) se adopta y se
+    dice una vez, para que alguien lo revise."""
     sealed = base.get("integrity") or {}
     if not sealed:
         return []  # una base sin nada sellado (formato antiguo): no hay contra qué comparar
-    now = baseline.integrity_fingerprint(include_suid=include_suid)
-    late = (base.get("meta") or {}).get("late_watches")
-    findings = []
-    for k in sorted(set(now) - set(sealed) - {"suid_set"}):
-        if k in _LATE_WATCHES and not late:
-            if baseline.accept("integrity", k):  # se adopta lo que hay, y se dice
-                sealed[k] = now[k]
-                response.record({"kind": "integrity_watch_added", "detail": k})
-            continue
-        findings.append(_integrity_finding(k, tr("{k} appeared since the baseline was sealed", k=k),
-                                           f"integrity|apareció {k}|{now[k]}"))
-    if not late:
-        baseline.mark_late_watches()
-        base.setdefault("meta", {})["late_watches"] = True
+    findings: list[dict] = []
+    now_files, overflow = integrity.snapshot()
+    for g in overflow:
+        findings.append({"sev": "high", "kind": "integrity", "set": "integrity", "item": g,
+                         "detail": tr("too many files in {group}: only the first {n} are watched", group=g,
+                                      n=integrity.MAX_FILES_PER_GROUP),
+                         "why": tr("thousands of files where there are usually a few can hide one"),
+                         "fp_key": f"integrity|overflow|{g}", "target": {"file": g}})
+    files = base.get("integrity_files")
+    pending_groups: list[str] = []
+    if files is None:
+        legacy_now = baseline.legacy_fingerprint()
+        files, pending_groups, newly = integrity.migrate(sealed, now_files, legacy_now,
+                                                         vault=response.vault_entries(),
+                                                         legacy_hash=baseline.legacy_group_hash)
+        baseline.adopt_integrity_files(files, replace=True)
+        base["integrity_files"] = files
+        if newly:
+            findings.append({"sev": "med", "kind": "integrity_watch_added", "set": "integrity",
+                             "item": ",".join(newly[:20]),
+                             "detail": tr("Arx now also watches {n} configuration file(s); what was already there "
+                                          "was taken as known: {files}", n=len(newly), files=", ".join(newly[:10])),
+                             "why": tr("they were there before Arx looked at them: review them once; any change "
+                                       "from now on is reported"),
+                             "fp_key": f"integrity_watch_added|{len(newly)}|{newly[0]}"})
+    else:
+        legacy_now = None
+    # grupos de una base antigua que ya habían cambiado: su aviso de siempre, hasta que se acepten
+    pending = [g for g in (pending_groups or base.get("meta", {}).get("integrity_pending") or [])
+               if g in sealed]
+    if pending_groups:
+        base.setdefault("meta", {})["integrity_pending"] = pending_groups
+        baseline.mark_integrity_pending(pending_groups)
+    skip_legacy = set()
+    if pending:
+        legacy_now = legacy_now or baseline.legacy_fingerprint()
+        lg = integrity.legacy_groups()
+        for g in pending:
+            skip_legacy.update(lg.get(g, []))
+            if legacy_now.get(g) != sealed.get(g):
+                findings.append(_integrity_finding(g, tr("{k} changed since the baseline was sealed", k=g),
+                                                   f"integrity|cambió {g} desde el sellado de la línea base|"
+                                                   f"{legacy_now.get(g)}"))
+    own, skip = _own_artifacts()
+    found, adopt = integrity.drift(files, now_files, own, vault_read=response.vault_copy,
+                                   skip=skip | skip_legacy)
+    if adopt:
+        baseline.adopt_integrity_files(adopt)
+        files.update(adopt)
+        for path in adopt:
+            response.record({"kind": "own_artifact_adopted", "detail": path})
+    findings += found
     known_suid = (base.get("sets") or {}).get("suid_binaries")
     if include_suid and "suid_set" in sealed and known_suid is not None:
         grew, known_suid = _suid_scope_grew(base, known_suid)
         findings += grew
-    for k, v in sealed.items():
-        if k == "suid_set":
-            if k in now and now[k] != v:
-                if known_suid is not None:
-                    findings += _new_suid(known_suid)
-                else:  # base antigua, sin la lista: al menos el aviso genérico
-                    findings.append(_integrity_finding(k, tr("{k} changed since the baseline was sealed", k=k),
-                                                       f"integrity|cambió {k} desde el sellado de la línea base|{now[k]}"))
-            continue
-        if k not in now:
-            findings.append(_integrity_finding(k, tr("{k} disappeared since the baseline was sealed", k=k),
-                                               f"integrity|desapareció {k}"))
-        elif now[k] != v:
-            # la huella lleva el contenido: si no, una 2.ª modificación distinta del mismo fichero
-            # cae en la misma entrada y queda totalmente silenciada (B51, prueba real F2)
-            findings.append(_integrity_finding(k, tr("{k} changed since the baseline was sealed", k=k),
-                                               f"integrity|cambió {k} desde el sellado de la línea base|{now[k]}"))
+    if include_suid and "suid_set" in sealed:
+        now_suid = baseline.suid_fingerprint()
+        if now_suid and now_suid != sealed["suid_set"]:
+            if known_suid is not None:
+                findings += _new_suid(known_suid)
+            else:  # base antigua, sin la lista: al menos el aviso genérico
+                findings.append(_integrity_finding("suid_set", tr("{k} changed since the baseline was sealed",
+                                                                  k="suid_set"),
+                                                   f"integrity|cambió suid_set desde el sellado de la línea base|{now_suid}"))
     return findings
 
 

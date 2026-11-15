@@ -457,11 +457,13 @@ def classify(group: str, before: Parsed | None, after: Parsed | None) -> Change 
         if added:
             new_uris = {r[1] for r in added} - {r[1] for r in removed}
             if new_uris:
+                # La prueba de procedencia confía en lo que llega firmado de un repositorio: uno nuevo es una
+                # fuente de confianza nueva, la vía de entrada de un paquete envenenado que pasaría por bueno.
                 unsigned = [r for r in added if not r[4]]
                 if unsigned:
-                    return Change("high", tr("new APT repository, accepted with any key the system trusts: {repos}",
+                    return Change("crit", tr("new APT repository, accepted with any key the system trusts: {repos}",
                                              repos=_short(unsigned)), added, removed)
-                return Change("high", tr("new APT repository: {repos}", repos=_short(added)), added, removed)
+                return Change("crit", tr("new APT repository: {repos}", repos=_short(added)), added, removed)
             return Change("med", tr("APT repository options changed: {repos}", repos=_short(added)), added, removed)
         return Change("low", tr("APT repository removed: {repos}", repos=_short(removed)), added, removed)
     if group == "apt_conf":
@@ -502,6 +504,6 @@ def classify(group: str, before: Parsed | None, after: Parsed | None) -> Change 
                       added, removed)
     if group == "apt_keys":
         if added:
-            return Change("high", tr("new APT signing key"), added, removed)
+            return Change("crit", tr("new APT signing key"), added, removed)
         return Change("low", tr("APT signing key removed"), added, removed)
     return Change("high", tr("{group} changed", group=group), added, removed)

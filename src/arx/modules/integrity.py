@@ -1,0 +1,368 @@
+"""Integridad de la configuración crítica, fichero a fichero (B77) y con conocimiento de las piezas de Arx (B73).
+
+Antes: un hash por grupo de ficheros. Un `sources.list` vacío nuevo cambiaba «apt_sources» igual que un
+repositorio sin firma, y la alerta no decía qué fichero, qué cambió ni cómo. Ahora cada fichero tiene su
+estado (contenido, significado según `cfgsem`, permisos, dueño, destino si es un enlace) y se compara por
+separado: la alerta dice qué fichero, qué significa el cambio y trae el diff contra la copia buena.
+
+Lo que escribe el propio Arx (sus unidades de systemd y sus drop-ins) está en un manifiesto con su contenido
+esperado: si coincide, no es un hallazgo; si no coincide, alguien ha tocado a Arx.
+
+Todo lo que se lee lo controla un atacante: sin seguir enlaces al leer, sin bloquearse en un FIFO, con
+límite de tamaño y de número de ficheros.
+"""
+from __future__ import annotations
+
+import difflib
+import glob
+import hashlib
+import os
+import stat
+
+from arx import config, redact
+from arx.i18n import tr
+from arx.modules import cfgsem
+
+MAX_FILES_PER_GROUP = 2_000
+MAX_DIFF_LINES = 40
+OWN_MANIFEST = "own-artifacts.json"
+
+_SYSTEMD_DIRS = ("/etc/systemd/system", "/usr/local/lib/systemd/system")
+_UNIT_EXT = (".service", ".timer", ".socket", ".path", ".mount", ".automount", ".target")
+
+
+def _systemd_paths() -> list[str]:
+    out = []
+    for d in _SYSTEMD_DIRS:
+        for ext in _UNIT_EXT:
+            out += glob.glob(f"{d}/*{ext}")
+        out += glob.glob(f"{d}/*.d/*.conf")           # drop-ins: persistencia clásica (ExecStartPre=…)
+        out += glob.glob(f"{d}/*.wants/*") + glob.glob(f"{d}/*.requires/*")  # enlaces que habilitan
+    for d in ("/etc/systemd/system-generators", "/usr/local/lib/systemd/system-generators"):
+        out += glob.glob(f"{d}/*")
+    return out
+
+
+def groups() -> dict[str, list[str]]:
+    """Grupo → rutas candidatas (existan o no). El grupo decide cómo se entiende el contenido."""
+    home_keys = [f"{h}/.ssh/{n}" for h in glob.glob("/home/*") for n in ("authorized_keys", "authorized_keys2")]
+    return {
+        "authorized_keys_root": ["/root/.ssh/authorized_keys", "/root/.ssh/authorized_keys2"],
+        "authorized_keys_users": home_keys,
+        "sudoers": ["/etc/sudoers"],
+        "sudoers_d": glob.glob("/etc/sudoers.d/*"),
+        "passwd": ["/etc/passwd"],
+        "ld_preload": ["/etc/ld.so.preload"],
+        "cron": ["/etc/crontab", *glob.glob("/etc/cron.d/*"), *glob.glob("/var/spool/cron/crontabs/*"),
+                 *(p for d in ("hourly", "daily", "weekly", "monthly") for p in glob.glob(f"/etc/cron.{d}/*"))],
+        "systemd": _systemd_paths(),
+        "apt_sources": ["/etc/apt/sources.list", *glob.glob("/etc/apt/sources.list.d/*")],
+        "apt_conf": ["/etc/apt/apt.conf", *glob.glob("/etc/apt/apt.conf.d/*")],
+        "apt_keys": ["/etc/apt/trusted.gpg", *glob.glob("/etc/apt/trusted.gpg.d/*"), *glob.glob("/etc/apt/keyrings/*")],
+    }
+
+
+def _read_safely(path: str) -> tuple[dict | None, bytes | None]:
+    """(metadatos, contenido) sin seguir enlaces ni bloquearse. (None, None) si no existe."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None, None
+    meta = {"mode": stat.S_IMODE(st.st_mode), "uid": st.st_uid, "gid": st.st_gid}
+    if stat.S_ISLNK(st.st_mode):
+        try:
+            meta["link"] = os.readlink(path)
+        except OSError:
+            meta["link"] = "?"
+        return meta, None
+    if not stat.S_ISREG(st.st_mode):
+        meta["special"] = stat.S_IFMT(st.st_mode)  # un FIFO o un dispositivo donde va configuración
+        return meta, None
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        return meta, None
+    with os.fdopen(fd, "rb") as f:
+        fst = os.fstat(f.fileno())
+        if not stat.S_ISREG(fst.st_mode):
+            return meta, None
+        data = f.read(cfgsem.MAX_TEXT + 1)
+    return meta, data
+
+
+def state_from(path: str, group: str, data: bytes, meta: dict) -> dict:
+    """Estado de unos bytes conocidos (la copia de la bóveda), con los metadatos que se le den."""
+    if group == "apt_keys":
+        parsed = cfgsem.analyze(group, data)
+    else:
+        parsed = cfgsem.analyze(group, data.decode("utf-8", errors="replace"), deb822=path.endswith(".sources"))
+    out = {"g": group, **meta, "sha": hashlib.sha256(data).hexdigest(), "ok": parsed.ok,
+           "canon": _jsonable(parsed.canon) if parsed.ok else None}
+    if not parsed.ok:
+        out["reason"] = parsed.reason
+    return out
+
+
+def state(path: str, group: str) -> dict | None:
+    """Estado de un fichero vigilado, apto para JSON. None si no existe."""
+    meta, data = _read_safely(path)
+    if meta is None:
+        return None
+    out = {"g": group, **meta}
+    if data is None:
+        out["sha"] = None
+        out["ok"] = "link" in meta  # un enlace se compara por su destino; lo especial no se entiende
+        out["canon"] = None
+        return out
+    out["sha"] = hashlib.sha256(data).hexdigest()
+    if group == "apt_keys":
+        parsed = cfgsem.analyze(group, data)
+    else:
+        text = data.decode("utf-8", errors="replace")
+        parsed = cfgsem.analyze(group, text, deb822=path.endswith(".sources"))
+    out["ok"] = parsed.ok
+    out["canon"] = _jsonable(parsed.canon) if parsed.ok else None
+    if not parsed.ok:
+        out["reason"] = parsed.reason
+    return out
+
+
+def _jsonable(x):
+    if isinstance(x, (tuple, list)):
+        return [_jsonable(i) for i in x]
+    return x
+
+
+def _tupled(x):
+    if isinstance(x, list):
+        return tuple(_tupled(i) for i in x)
+    return x
+
+
+def snapshot() -> tuple[dict[str, dict], list[str]]:
+    """({ruta: estado}, grupos que superaron el límite de ficheros)."""
+    out, overflow = {}, []
+    for group, paths in groups().items():
+        existing = sorted({p for p in paths if os.path.lexists(p)})
+        if len(existing) > MAX_FILES_PER_GROUP:
+            overflow.append(group)
+            existing = existing[:MAX_FILES_PER_GROUP]
+        for p in existing:
+            s = state(p, group)
+            if s is not None:
+                out[p] = s
+    return out, overflow
+
+
+# ── piezas propias de Arx (B73) ──────────────────────────────────────────────
+def _own_path():
+    return config.state_dir() / OWN_MANIFEST
+
+
+def own_artifacts() -> dict[str, str]:
+    """{ruta: sha256 esperado} de lo que Arx escribió en el sistema."""
+    data = config.read_json(_own_path(), {})
+    return {p: h for p, h in data.items() if isinstance(p, str) and isinstance(h, str)}
+
+
+def register_own(path: str, content: str | bytes) -> None:
+    raw = content.encode() if isinstance(content, str) else content
+    data = own_artifacts()
+    data[path] = hashlib.sha256(raw).hexdigest()
+    config.write_json(_own_path(), data)
+
+
+def forget_own(path: str) -> None:
+    data = own_artifacts()
+    if data.pop(path, None) is not None:
+        config.write_json(_own_path(), data)
+
+
+# ── comparación ──────────────────────────────────────────────────────────────
+def _parsed(s: dict | None) -> cfgsem.Parsed | None:
+    if s is None:
+        return None
+    if s.get("ok") and s.get("canon") is not None:
+        return cfgsem.Parsed(True, _tupled(s["canon"]))
+    if s.get("ok"):
+        return cfgsem.Parsed(True, ())
+    return cfgsem.Parsed(False, None, s.get("reason", "unreadable"))
+
+
+def _loosened(before: dict, after: dict) -> bool:
+    """¿Ahora puede escribirlo alguien más, o cambió de dueño?"""
+    if before.get("uid") != after.get("uid") or before.get("gid") != after.get("gid"):
+        return True
+    return bool((after.get("mode", 0) & 0o022) & ~(before.get("mode", 0) & 0o022))
+
+
+def unified_diff(path: str, good: bytes | None, now: bytes | None) -> str:
+    """Diff redactado y acotado entre la copia buena y lo que hay ahora (vacío si no se puede)."""
+    if good is None and now is None:
+        return ""
+    a = (good or b"").decode("utf-8", errors="replace").splitlines()
+    b = (now or b"").decode("utf-8", errors="replace").splitlines()
+    lines = list(difflib.unified_diff(a, b, f"{path} (sellado)", f"{path} (ahora)", lineterm="", n=1))
+    if len(lines) > MAX_DIFF_LINES:
+        lines = lines[:MAX_DIFF_LINES] + [tr("… ({n} more lines)", n=len(lines) - MAX_DIFF_LINES)]
+    return redact.scrub("\n".join(lines))
+
+
+def existing() -> dict[str, list[str]]:
+    """Grupo → ficheros regulares que existen (para la copia buena en la bóveda)."""
+    out = {}
+    for group, paths in groups().items():
+        files = sorted({p for p in paths if os.path.isfile(p) and not os.path.islink(p)})[:MAX_FILES_PER_GROUP]
+        if files:
+            out[group] = files
+    return out
+
+
+def drift(sealed: dict[str, dict], now: dict[str, dict], own: dict[str, str] | None = None,
+          vault_read=None, skip=()) -> tuple[list[dict], dict[str, dict]]:
+    """(hallazgos, adopciones) del estado actual contra el sellado, fichero a fichero.
+
+    `adopciones` son las piezas propias de Arx que coinciden con lo esperado: el llamador las incorpora a la
+    base sin alertar. `vault_read(path) -> bytes|None` da la copia buena para el diff."""
+    own = own or {}
+    skip = set(skip)
+    findings, adopt = [], {}
+    for path in sorted(set(sealed) | set(now)):
+        if path in skip:
+            continue
+        b, a = sealed.get(path), now.get(path)
+        if b and a and all(b.get(k) == a.get(k) for k in ("sha", "link", "mode", "uid", "gid", "special")):
+            continue
+        group = (a or b)["g"]
+        if path in own:
+            want = own[path]
+            got = ("link:" + str(a.get("link"))) if a is not None and "link" in a else (a or {}).get("sha")
+            if a is not None and got == want and not _loosened(b or a, a):
+                adopt[path] = a
+                continue
+            findings.append(_finding("crit", group, path, a,
+                                     tr("an Arx file was altered or removed: {path}", path=path),
+                                     tr("someone changed Arx itself: it could be switched off or turned against you"),
+                                     kind="self_tamper"))
+            continue
+        if b and a and b.get("sha") == a.get("sha") and b.get("link") == a.get("link"):
+            if _loosened(b, a):
+                findings.append(_finding("high", group, path, a,
+                                         tr("permissions or owner of {path} changed (now {mode:o}, uid {uid})",
+                                            path=path, mode=a.get("mode", 0), uid=a.get("uid")),
+                                         tr("someone else can now write a critical file")))
+            continue
+        if (a and "special" in a) or (b and "special" in b):
+            findings.append(_finding("high", group, path, a, tr("{path} is no longer a regular file", path=path),
+                                     tr("a FIFO or device where configuration should be can block or fool readers")))
+            continue
+        if (a and "link" in a) or (b and "link" in b):
+            if a is None:
+                sev, msg = "low", tr("link removed: {path}", path=path)
+            else:
+                sev = "high" if group == "systemd" else "med"
+                msg = tr("link {path} → {target}", path=path, target=a.get("link"))
+            findings.append(_finding(sev, group, path, a, msg, tr("a link here enables or redirects configuration")))
+            continue
+        change = cfgsem.classify(group, _parsed(b), _parsed(a))
+        if change is None:
+            if b and a and not b.get("ok") and not a.get("ok"):
+                change = cfgsem.Change("high", tr("the file can no longer be understood ({why}): review it by hand",
+                                                  why=a.get("reason", "?")))
+            else:
+                continue  # mismo significado: formato, comentarios, un fichero vacío
+        f = _finding(change.sev, group, path, a, f"{path}: {change.summary}",
+                     tr("critical file altered → possible tampering or persistence"))
+        if vault_read is not None:
+            try:
+                good = vault_read(path)
+                _meta, cur = _read_safely(path)
+                diff = unified_diff(path, good, cur)
+                if diff:
+                    f["diff"] = diff
+            except Exception:  # noqa: BLE001 - el diff es ayuda, nunca bloquea la alerta
+                pass
+        findings.append(f)
+    return findings, adopt
+
+
+def _finding(sev: str, group: str, path: str, now: dict | None, detail: str, why: str,
+             kind: str = "integrity") -> dict:
+    tag = (now or {}).get("sha") or (now or {}).get("link") or "gone"
+    return {"sev": sev, "kind": kind, "detail": detail, "why": why,
+            "fp_key": f"integrity|{path}|{tag}",
+            "target": {"file": group, "path": path}, "set": "integrity", "item": path}
+
+
+# ── migración desde la huella por grupo ──────────────────────────────────────
+def legacy_groups() -> dict[str, list[str]]:
+    """Los grupos tal como los sellaban las versiones anteriores (para migrar sin falsas alarmas)."""
+    return {
+        "authorized_keys_root": ["/root/.ssh/authorized_keys"],
+        "sudoers": ["/etc/sudoers"],
+        "passwd": ["/etc/passwd"],
+        "ld_preload": ["/etc/ld.so.preload"],
+        "authorized_keys_users": glob.glob("/home/*/.ssh/authorized_keys"),
+        "sudoers_d": glob.glob("/etc/sudoers.d/*"),
+        "cron": ["/etc/crontab", *glob.glob("/etc/cron.d/*"), *glob.glob("/var/spool/cron/crontabs/*")],
+        "systemd_units": glob.glob("/etc/systemd/system/*.service") + glob.glob("/etc/systemd/system/*.timer"),
+        "apt_sources": ["/etc/apt/sources.list", *glob.glob("/etc/apt/sources.list.d/*"),
+                        *glob.glob("/etc/apt/apt.conf.d/*")],
+        "apt_keys": ["/etc/apt/trusted.gpg", *glob.glob("/etc/apt/trusted.gpg.d/*"),
+                     *glob.glob("/etc/apt/keyrings/*")],
+    }
+
+
+def migrate(sealed_groups: dict[str, str], now: dict[str, dict], legacy_now: dict[str, str],
+            vault: dict[str, tuple[bytes, dict]] | None = None, legacy_hash=None) -> tuple[dict, list[str], list[str]]:
+    """De la huella por grupo al estado por fichero.
+
+    Un grupo cuya huella sigue igual que al sellar se adopta tal cual (fichero a fichero, en silencio). Uno que
+    cambió conserva el aviso de grupo de siempre hasta que alguien lo acepte. Lo que antes no se vigilaba
+    (drop-ins, `.wants`, `authorized_keys2`, `cron.daily`…) se adopta y se dice, para que se revise una vez.
+    Devuelve (estado adoptado, grupos antiguos que cambiaron, rutas recién vigiladas)."""
+    covered: dict[str, str] = {}
+    for g, paths in legacy_groups().items():
+        for p in paths:
+            covered[p] = g
+    adopted, changed_groups, newly, rebuilt_groups = {}, [], [], set()
+    vault = vault or {}
+    by_group: dict[str, dict[str, tuple[bytes, dict]]] = {}
+    for p, (data, meta) in vault.items():
+        g = covered.get(p)
+        if g:
+            by_group.setdefault(g, {})[p] = (data, meta)
+    for g, h in sealed_groups.items():
+        if g == "suid_set" or legacy_now.get(g) == h:
+            continue
+        copies = by_group.get(g, {})
+        if legacy_hash and copies and legacy_hash(g, {p: d for p, (d, _m) in copies.items()}) == h:
+            # la bóveda guarda exactamente lo sellado: se reconstruye fichero a fichero y se juzga por significado
+            for p, (data, meta) in copies.items():
+                cur = now.get(p) or {}
+                full = {"mode": meta.get("mode", cur.get("mode")), "uid": cur.get("uid"), "gid": cur.get("gid")}
+                adopted[p] = state_from(p, _new_group(p, now), data, full)
+            rebuilt_groups.add(g)
+            continue
+        changed_groups.append(g)
+    for path, s in now.items():
+        old = covered.get(path)
+        if old is None or old not in sealed_groups:
+            adopted[path] = s  # nunca se vigiló (o la base no tenía ese grupo): se adopta y se dice
+            newly.append(path)
+        elif old in changed_groups or path in adopted:
+            continue  # pendiente de aceptar, o ya reconstruido desde la bóveda
+        elif old in rebuilt_groups:
+            continue  # no estaba en lo sellado: es nuevo, lo juzga la comparación
+        else:
+            adopted[path] = s  # el grupo no cambió: lo de ahora es lo sellado
+    return adopted, sorted(changed_groups), sorted(newly)
+
+
+def _new_group(path: str, now: dict[str, dict]) -> str:
+    if path in now:
+        return now[path]["g"]
+    for g, paths in groups().items():
+        if path in paths:
+            return g
+    return "apt_conf" if path.startswith("/etc/apt/apt.conf") else "systemd" if "/systemd/" in path else "apt_sources"

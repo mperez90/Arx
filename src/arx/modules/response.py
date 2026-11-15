@@ -797,7 +797,30 @@ def _drop_suid(path: str) -> str:
               "chmod u+s", path=printable(path))
 
 
-def _restore_from_vault(key: str, current_files: list[str] | None = None) -> str:
+def vault_copy(path: str) -> bytes | None:
+    """La copia buena de un fichero vigilado, si la hay (para el diff de una alerta)."""
+    manifest = config.read_json(_vault_manifest_path(), {})
+    if path not in manifest or path.startswith(str(_vault_dir())):
+        return None
+    try:
+        return open(_vault_dir() / f"{hashlib.sha1(path.encode()).hexdigest()[:12]}.bak", "rb").read()
+    except OSError:
+        return None
+
+
+def vault_entries() -> dict[str, tuple[bytes, dict]]:
+    """{ruta: (copia buena, {"mode": …})} de los ficheros respaldados (sin la cuarentena)."""
+    out = {}
+    for path, meta in config.read_json(_vault_manifest_path(), {}).items():
+        if path.startswith(str(_vault_dir())) or "quarantined_from" in meta:
+            continue
+        data = vault_copy(path)
+        if data is not None:
+            out[path] = (data, {"mode": meta.get("mode")})
+    return out
+
+
+def _restore_from_vault(key: str, current_files: list[str] | None = None, only: str | None = None) -> str:
     """Restaura el estado sellado de una clave de integridad desde el vault.
 
     Dos casos, ambos con evidencia preservada:
@@ -810,12 +833,16 @@ def _restore_from_vault(key: str, current_files: list[str] | None = None) -> str
     Lo intacto no se toca: restaurar ficheros que no cambiaron sería ruido forense.
     `current_files` se puede inyectar en pruebas; por defecto se deriva de la clave.
     """
-    if current_files is None:
-        from arx.modules import baseline  # perezoso: baseline importa response (gancho de sellado)
-        current_files = baseline.integrity_paths().get(key, [])
     manifest = config.read_json(_vault_manifest_path(), {})
-    known = {p: m for p, m in manifest.items()
-             if m.get("key") == key and not p.startswith(str(_vault_dir()))}
+    if only is not None:  # B77: la alerta es de un fichero; se restaura ese y nada más
+        current_files = [only] if os.path.lexists(only) else []
+        known = {only: manifest[only]} if only in manifest and not only.startswith(str(_vault_dir())) else {}
+    else:
+        if current_files is None:
+            from arx.modules import baseline  # perezoso: baseline importa response (gancho de sellado)
+            current_files = baseline.integrity_paths().get(key, [])
+        known = {p: m for p, m in manifest.items()
+                 if m.get("key") == key and not p.startswith(str(_vault_dir()))}
     restored, quarantined = [], []
     for path, meta in known.items():
         bak = _vault_dir() / f"{hashlib.sha1(path.encode()).hexdigest()[:12]}.bak"
@@ -1270,6 +1297,8 @@ def _execute_tier2(finding: dict) -> str:
     kind, target = finding.get("kind"), finding.get("target") or {}
     if not _is_linux_root():
         return tr("ready to run on the target (requires Linux + root)")
+    if kind == "integrity" and target.get("path"):
+        return _restore_from_vault(str(target.get("file") or ""), only=str(target["path"]))
     if kind == "integrity" and target.get("file"):
         return _restore_from_vault(str(target["file"]))
     if kind == "login_users" and target.get("user"):

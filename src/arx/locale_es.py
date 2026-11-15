@@ -2026,4 +2026,32 @@ ES = {
         'clave de firma de APT retirada',
     '{group} changed':
         'cambió {group}',
+    '… ({n} more lines)':
+        '… ({n} líneas más)',
+    'an Arx file was altered or removed: {path}':
+        'un fichero de Arx fue alterado o borrado: {path}',
+    'someone changed Arx itself: it could be switched off or turned against you':
+        'alguien cambió el propio Arx: podrían apagarlo o volverlo contra ti',
+    'permissions or owner of {path} changed (now {mode:o}, uid {uid})':
+        'cambiaron los permisos o el dueño de {path} (ahora {mode:o}, uid {uid})',
+    'someone else can now write a critical file':
+        'ahora alguien más puede escribir un fichero crítico',
+    '{path} is no longer a regular file':
+        '{path} ya no es un fichero normal',
+    'a FIFO or device where configuration should be can block or fool readers':
+        'un FIFO o un dispositivo donde debería haber configuración puede bloquear o engañar a quien la lee',
+    'link removed: {path}':
+        'enlace retirado: {path}',
+    'link {path} → {target}':
+        'enlace {path} → {target}',
+    'a link here enables or redirects configuration':
+        'un enlace aquí habilita o redirige configuración',
+    'too many files in {group}: only the first {n} are watched':
+        'demasiados ficheros en {group}: solo se vigilan los {n} primeros',
+    'thousands of files where there are usually a few can hide one':
+        'miles de ficheros donde suele haber pocos pueden esconder uno',
+    'Arx now also watches {n} configuration file(s); what was already there was taken as known: {files}':
+        'Arx vigila ahora también {n} fichero(s) de configuración; lo que ya había se tomó como conocido: {files}',
+    'they were there before Arx looked at them: review them once; any change from now on is reported':
+        'estaban antes de que Arx los mirara: revísalos una vez; cualquier cambio a partir de ahora se avisa',
 }

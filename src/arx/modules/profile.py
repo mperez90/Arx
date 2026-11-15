@@ -706,12 +706,17 @@ def _pin(path: str, s: dict) -> bool:
         f.write(nft_text(path, s))
     d = os.path.join(SYSTEMD_DIR, f"{unit}.d")
     os.makedirs(d, exist_ok=True)
+    text = dropin_text(file)
     with open(os.path.join(d, DROPIN), "w", encoding="utf-8") as f:
-        f.write(dropin_text(file))
+        f.write(text)
+    from arx.modules import integrity
+    integrity.register_own(os.path.join(d, DROPIN), text)  # B73: lo escribió Arx, no es un intruso
     return _nft("-f", file)
 
 
 def _unpin(unit: str) -> None:
+    from arx.modules import integrity
+    integrity.forget_own(os.path.join(SYSTEMD_DIR, f"{unit}.d", DROPIN))
     for p in (os.path.join(SYSTEMD_DIR, f"{unit}.d", DROPIN), str(_files_dir() / f"{unit}.nft")):
         try:
             os.unlink(p)
