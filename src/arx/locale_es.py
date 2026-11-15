@@ -2064,4 +2064,6 @@ ES = {
         'por {exe} (pid {pid}, uid {uid}{session})',
     '{n} of them run commands or grant trust and belong to no package: {files}':
         '{n} de ellos ejecutan órdenes o dan confianza y no son de ningún paquete: {files}',
+    'the installed version is not served by a signed repository':
+        'la versión instalada no la sirve ningún repositorio firmado',
 }

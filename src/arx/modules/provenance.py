@@ -169,8 +169,12 @@ def _trusted_yes_urls() -> list[str]:
     return urls
 
 
-def signed_origin(pkg: str) -> tuple[bool, str]:
+def signed_origin(pkg: str, installed_only: bool = False) -> tuple[bool, str]:
     """¿El paquete instalado vino de un repositorio firmado? (sí/no, de dónde).
+
+    `installed_only`: solo cuenta si la versión INSTALADA está en un repositorio firmado. Sin esa exigencia,
+    un `.deb` local con el nombre de un paquete que algún repositorio sirve pasaría por firmado (HZ#7 de Q);
+    para aceptar un cambio de configuración sin alerta, eso no basta.
 
     Que el repo ya no liste la versión instalada (publicó una más nueva y este host aún no actualiza)
     NO la convierte en un .deb suelto: apt verificó su firma cuando la instaló (B43, prueba real F2:
@@ -199,13 +203,15 @@ def signed_origin(pkg: str) -> tuple[bool, str]:
         signed = [s for s in installed_src if is_signed(s)]
         if signed:
             return True, signed[0]
+        if installed_only:
+            return False, tr("the installed version is not served by a signed repository")
         if any(is_signed(s) for s in any_src):
             return True, tr("signed repository; the installed version is no longer listed "
                             "(an upgrade is pending)")
         if not any(s != "/var/lib/dpkg/status" for s in any_src):
             return False, tr("installed from a local package, not from a repository")
         return False, tr("its repository is marked trusted=yes: apt does not check its signature")
-    return _cached(("origin", pkg), look)
+    return _cached(("origin", pkg, installed_only), look)
 
 
 def source_package(pkg: str) -> str:

@@ -21,9 +21,10 @@ import sys
 import unittest
 from unittest import mock
 
+os.environ["ARX_LANG"] = "es"  # antes de importar Arx
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from arx.modules import guard, integrity, pkgdb, provenance  # noqa: E402
+from arx.modules import guard, pkgdb, provenance  # noqa: E402
 
 DPKG_SIGNED = ("dpkg:\n  Installed: 1.22.6\n  Candidate: 1.22.6\n  Version table:\n"
                " *** 1.22.6 500\n        500 http://deb.debian.org/debian trixie/main amd64 Packages\n"

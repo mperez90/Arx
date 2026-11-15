@@ -110,7 +110,10 @@ def _package_wrote(path: str) -> bool:
         pkg = pkgdb.owner(path)
         if not pkg or provenance.intact(integrity.DPKG, "dpkg") is not True:
             return False
-        return bool(provenance.signed_origin("dpkg")[0] and provenance.signed_origin(pkg)[0])
+        # la versión INSTALADA de ambos tiene que venir de un repositorio firmado: un .deb local con el nombre de
+        # un paquete de repositorio no basta (HZ#7)
+        return bool(provenance.signed_origin("dpkg", installed_only=True)[0]
+                    and provenance.signed_origin(pkg, installed_only=True)[0])
     except Exception:  # noqa: BLE001 - sin respuesta de dpkg no se rebaja nada
         return False
 

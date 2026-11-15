@@ -10513,7 +10513,7 @@ class IntegrityAttributionTests(unittest.TestCase):
         for owner, intact, origin, want in cases:
             with mock.patch.object(pkgdb, "owner", lambda p, o=owner: o), \
                  mock.patch.object(provenance, "intact", lambda p, k, v=intact: v), \
-                 mock.patch.object(provenance, "signed_origin", lambda k, o=origin: o):
+                 mock.patch.object(provenance, "signed_origin", lambda k, installed_only=False, o=origin: o):
                 self.assertEqual(self.g._package_wrote("/etc/nginx/nginx.conf"), want, (owner, intact, origin))
         with mock.patch.object(pkgdb, "owner", side_effect=pkgdb.NoAnswer("x")):
             self.assertFalse(self.g._package_wrote("/etc/x"))
