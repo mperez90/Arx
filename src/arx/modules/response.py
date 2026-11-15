@@ -156,6 +156,12 @@ def classify(finding: dict) -> dict:
         return {"tier": 0, "action": tr("log and watch (new system binary)"),
                 "reversible": True, "why": tr("low-confidence signal: it does not justify "
                                               "suspending anything")}
+    if kind == "login_users":
+        # root, cuentas de sistema y la última de administración no se bloquean: no se ofrece lo que no se ejecutaría
+        user = str((finding.get("target") or {}).get("user") or "").partition("@")[0]
+        reason = _session_only_reason(user) if user else None
+        if reason:
+            return _session_plan(reason)
     tier, action, reversible, why = _PLAN.get(
         finding.get("kind", ""), (0, tr("log and watch"), True, tr("weak signal; observe first"))
     )
@@ -952,6 +958,37 @@ def _leaves_no_admin(user: str) -> bool:
     return user in admins and not any(_can_log_in(a) for a in admins - {user})
 
 
+def _session_only_reason(user: str) -> str | None:
+    """Por qué la cuenta NO se puede bloquear pero SÍ se puede responder a un acceso nuevo suyo: «system» (root y las
+    cuentas de sistema, que no se bloquean nunca) o «last_admin» (bloquearla te dejaría fuera del servidor).
+
+    Para esas cuentas el Tier 2 no ofrece bloquearlas (no se ejecutaría): ofrece bloquear el origen del acceso y cerrar
+    esa sesión. None para cualquier otra, o si no se puede saber (se queda con el plan de siempre)."""
+    import pwd
+
+    if not _USERNAME_RE.fullmatch(user):
+        return None
+    try:
+        uid = pwd.getpwnam(user).pw_uid
+    except KeyError:
+        return None
+    if user == "root" or uid < 1000:
+        return "system"
+    if _is_linux_root() and _leaves_no_admin(user):
+        return "last_admin"
+    return None
+
+
+def _session_plan(reason: str) -> dict:
+    why = (tr("it is the last administration account with access: locking it would lock you out of the server. An "
+              "unknown access to it is answered by blocking where it comes from (the block expires on its own) and "
+              "closing that session. It needs your word") if reason == "last_admin" else
+           tr("root and system accounts are never locked: an unknown access to one is answered by blocking where it "
+              "comes from (the block expires on its own) and closing that session. It needs your word"))
+    return {"tier": 2, "reversible": False, "why": why,
+            "action": tr("block the origin IP and close that session (the account itself is not locked)")}
+
+
 def _lock_account(user: str, finding: dict, allow_uid0: bool = False) -> tuple[bool, str]:
     """Bloquea los accesos NUEVOS de una cuenta y devuelve (bloqueada, explicación).
 
@@ -1068,9 +1105,10 @@ def _close_sessions(uid: int) -> tuple[list[dict], list[int]]:
     return [p for pid, p in closed.items() if pid not in alive], alive
 
 
-def _block_origin(origin: str, user: str, cfg: dict | None) -> str | None:
+def _block_origin(origin: str, user: str, cfg: dict | None, locked: bool = True) -> str | None:
     """También se cierra la IP de origen: con una credencial robada, el atacante probaría otra
-    cuenta. Esto sí expira (una IP cambia de manos) y respeta a quien nunca se bloquea."""
+    cuenta. Esto sí expira (una IP cambia de manos) y respeta a quien nunca se bloquea.
+    `locked` False: la cuenta no se bloqueó (root, última de administración), solo se cerró esa sesión."""
     try:
         ipaddress.ip_address(origin)
     except ValueError:
@@ -1078,6 +1116,9 @@ def _block_origin(origin: str, user: str, cfg: dict | None) -> str | None:
     f = {"kind": "auth_bruteforce", "sev": "high", "target": {"ip": origin}, "origin_of": user,
          "fp_key": f"auth_bruteforce|origen de la cuenta bloqueada {user}: {origin}",
          "detail": tr("origin of locked account {user}: {origin}", user=user, origin=origin)}
+    if not locked:
+        f["fp_key"] = f"auth_bruteforce|origen de la sesión cerrada de {user}: {origin}"
+        f["detail"] = tr("origin of the session closed for {user}: {origin}", user=user, origin=origin)
     reason = protected_reason(f, cfg)
     if reason:
         return tr("its IP {origin} is not blocked: {reason}", origin=origin, reason=reason)
@@ -1112,6 +1153,129 @@ def _identity_summary(rep: dict) -> str:
         lines.append(tr("  Your call:  arx unlock {user}   ·   if it was legitimate, then:  arx "
                         "accept", user=rep['user']))
     return "\n".join(lines)
+
+
+def _ppid_map() -> dict[int, int]:
+    """{pid: pid del padre} de todo lo que corre, de una sola lectura de /proc."""
+    out: dict[int, int] = {}
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return out
+    for name in entries:
+        if not name.isdigit():
+            continue
+        try:
+            with open(f"/proc/{name}/stat", "rb") as f:
+                out[int(name)] = int(f.read().rpartition(b")")[2].split()[1])
+        except (OSError, IndexError, ValueError):
+            continue
+    return out
+
+
+def _tree(roots: set[int]) -> set[int]:
+    """Los procesos dados y todo lo que nació de ellos (su shell, lo que lanzó esa shell…)."""
+    children: dict[int, list[int]] = {}
+    for pid, ppid in _ppid_map().items():
+        children.setdefault(ppid, []).append(pid)
+    seen, todo = set(roots), list(roots)
+    while todo:
+        for child in children.get(todo.pop(), ()):
+            if child not in seen:
+                seen.add(child)
+                todo.append(child)
+    return seen
+
+
+def _pid_alive(pid: int) -> bool:
+    return os.path.isdir(f"/proc/{pid}") and not _is_zombie(pid)
+
+
+def _ssh_session_pids(user: str, uid: int, origin: str) -> set[int]:
+    """Los procesos de sshd que sostienen una conexión ESTABLECIDA de esa cuenta desde ese origen. Nunca el que
+    escucha (no es dueño de ninguna conexión establecida) ni las sesiones de otro origen u otra cuenta."""
+    if not origin:
+        return set()
+    return {c["pid"] for c in recon.connection_owners()
+            if c.get("remote_ip") == origin and c.get("state") == "ESTABLISHED"
+            and (c.get("exe") or "").rsplit("/", 1)[-1] in _SSHD_EXES
+            and isinstance(c.get("pid"), int) and _sshd_serves(c["pid"], user, uid)}
+
+
+def _close_ssh_session(user: str, origin: str) -> tuple[list[dict], list[int]]:
+    """Cierra UNA sesión: el sshd de esa conexión y lo que nació de él, nada más. Devuelve (cerrados, supervivientes).
+
+    Para root no se puede cerrar «todo lo de la cuenta» (compartiría uid con el sistema entero); la sesión sí
+    es separable. SIGSTOP antes de SIGKILL, como en `_close_sessions`, para que nada se reproduzca mientras se recorre.
+    Jamás el proceso 1, Arx ni su padre."""
+    import pwd
+
+    try:
+        uid = pwd.getpwnam(user).pw_uid
+    except KeyError:
+        return [], []
+    spared = {1, os.getpid(), os.getppid()}
+    closed: dict[int, dict] = {}
+    for _ in range(3):
+        roots = _ssh_session_pids(user, uid, origin) - spared
+        if not roots:
+            break
+        pids = _tree(roots) - spared
+        for pid in pids:
+            closed.setdefault(pid, {"pid": pid, "cmd": printable(_proc_title(pid).strip())})
+        for sig in (signal.SIGSTOP, signal.SIGKILL):
+            for pid in sorted(pids):
+                try:
+                    os.kill(pid, sig)
+                except OSError:
+                    continue
+        time.sleep(0.2)
+    alive = [pid for pid in closed if _pid_alive(pid)]
+    return [p for pid, p in closed.items() if pid not in alive], alive
+
+
+def _session_summary(rep: dict) -> str:
+    lines = [tr("Account '{user}': not locked, only that session is closed", user=rep["user"]),
+             tr("  Why not the account: it is the last administration account with access, and locking it would "
+                "lock you out") if rep["reason"] == "last_admin" else
+             tr("  Why not the account: root and system accounts are never locked"),
+             tr("  Detected: {detail}", detail=rep["detail"]),
+             tr("  Decided by: {decided_by}", decided_by=rep["decided_by"])]
+    if rep["origin_block"]:
+        lines.append(f"  {rep['origin_block']}")
+    elif not rep["origin"]:
+        lines.append(tr("  No origin blocked: this login has no usable IP"))
+    if rep["closed"] or rep["survivors"]:
+        cmds = [p["cmd"] or f"pid {p['pid']}" for p in rep["closed"]]
+        lines.append(tr("  Sessions and processes closed: {n}. A closed session cannot be recovered.", n=len(cmds)))
+        lines += [f"    · {c[:70]}" for c in cmds[:8]]
+        if len(cmds) > 8:
+            lines.append(tr("    · and {v} more (arx forensics)", v=len(cmds) - 8))
+        if rep["survivors"]:
+            lines.append(tr("  ⚠ STILL ALIVE: {v}. Check them by hand.", v=rep["survivors"][:8]))
+    elif rep["origin"]:
+        lines.append(tr("  No live session from {origin} was found to close", origin=rep["origin"]))
+    lines.append(tr("  This does not cover what is already installed as root or reached through other doors: "
+                    "review it (arx forensics)."))
+    if rep["origin"]:
+        lines.append(tr("  If it was you:  arx unblock {origin}", origin=rep["origin"]))
+    return "\n".join(lines)
+
+
+def contain_session(finding: dict, decided_by: str, reason: str, cfg: dict | None = None) -> dict:
+    """Para root, las cuentas de sistema y la última de administración: bloquea el ORIGEN del acceso (caduca solo) y
+    cierra esa sesión. La cuenta no se toca. Solo lo ejecuta una persona con su palabra (Tier 2): el modelo nunca
+    llega aquí, ni con --enforce (ver `apply_verdicts`)."""
+    user, _, origin = str((finding.get("target") or {}).get("user") or "").partition("@")
+    block = _block_origin(origin, user, cfg, locked=False)  # primero el origen: que no vuelva a entrar mientras se cierra
+    closed, survivors = _close_ssh_session(user, origin)
+    rep = {"user": user, "origin": origin, "reason": reason, "decided_by": decided_by,
+           "detail": finding.get("detail"), "origin_block": block, "closed": closed, "survivors": survivors}
+    rep["summary"] = _session_summary(rep)
+    record({"kind": "session_closed", "sev": finding.get("sev"), "detail": finding.get("detail"),
+            "result": rep["summary"], "decided_by": decided_by, "closed": closed, "survivors": survivors,
+            "origin_block": block})
+    return rep
 
 
 def contain_identity(finding: dict, decided_by: str, verdict: dict | None = None,
@@ -1236,6 +1400,11 @@ def apply_verdicts(pairs: list[tuple[dict, dict]], verdicts: list[dict], enforce
                 reports.append(rep)
                 continue
             rep = contain_identity(finding, decided, v, cfg)
+            if not rep["locked"] and _session_only_reason(user):
+                # el modelo nunca actúa sobre root ni la última cuenta de administración, ni con --enforce: eso
+                # solo lo hace una persona con su palabra (`arx authorize`), y se le dice cómo
+                rep["summary"] += tr("\n  To block its origin and close that session:  arx authorize {v}",
+                                     v=v["id"][:6])
             if rep["locked"]:
                 config.write_json(_llm_locks_path(), _recent_llm_locks(now) + [_iso(now)])
                 _save_pending([p for p in _load_pending() if p["id"] != v["id"][:6]])
@@ -1302,7 +1471,11 @@ def _execute_tier2(finding: dict) -> str:
     if kind == "integrity" and target.get("file"):
         return _restore_from_vault(str(target["file"]))
     if kind == "login_users" and target.get("user"):
-        return contain_identity(finding, tr("you, with your authorization word"))["summary"]
+        by = tr("you, with your authorization word")
+        reason = _session_only_reason(str(target["user"]).partition("@")[0])
+        if reason:  # root, de sistema o la última de administración: origen + esa sesión, la cuenta no se toca
+            return contain_session(finding, by, reason, config.load_config())["summary"]
+        return contain_identity(finding, by)["summary"]
     if kind in ("listen_ports", "port_scan", "auth_bruteforce", "reverse_shell", "intel_ip"):
         # reapareció tras expirar y decidiste tú: la misma contención, otra hora
         cfg = config.load_config()

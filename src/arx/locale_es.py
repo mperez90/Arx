@@ -1281,6 +1281,37 @@ ES = {
         "origen de la cuenta bloqueada {user}: {origin}",
     "its IP {origin} is not blocked: {reason}":
         "su IP {origin} no se bloquea: {reason}",
+    "block the origin IP and close that session (the account itself is not locked)":
+        "bloquear la IP de origen y cerrar esa sesión (la cuenta en sí no se bloquea)",
+    "it is the last administration account with access: locking it would lock you out of the server. An unknown "
+    "access to it is answered by blocking where it comes from (the block expires on its own) and closing that "
+    "session. It needs your word":
+        "es la última cuenta de administración con acceso: bloquearla te dejaría fuera del servidor. Un acceso "
+        "desconocido a ella se responde bloqueando de dónde viene (el bloqueo caduca solo) y cerrando esa sesión. "
+        "Necesita tu palabra",
+    "root and system accounts are never locked: an unknown access to one is answered by blocking where it comes "
+    "from (the block expires on its own) and closing that session. It needs your word":
+        "root y las cuentas de sistema no se bloquean nunca: un acceso desconocido a una se responde bloqueando de "
+        "dónde viene (el bloqueo caduca solo) y cerrando esa sesión. Necesita tu palabra",
+    "origin of the session closed for {user}: {origin}":
+        "origen de la sesión cerrada de {user}: {origin}",
+    "Account '{user}': not locked, only that session is closed":
+        "Cuenta '{user}': no se bloquea, solo se cierra esa sesión",
+    "  Why not the account: it is the last administration account with access, and locking it would lock you out":
+        "  Por qué no la cuenta: es la última cuenta de administración con acceso, y bloquearla te dejaría fuera",
+    "  Why not the account: root and system accounts are never locked":
+        "  Por qué no la cuenta: root y las cuentas de sistema no se bloquean nunca",
+    "  No origin blocked: this login has no usable IP":
+        "  No se bloquea ningún origen: acceso sin IP utilizable",
+    "  No live session from {origin} was found to close":
+        "  No se encontró ninguna sesión viva desde {origin} que cerrar",
+    "  This does not cover what is already installed as root or reached through other doors: review it (arx "
+    "forensics).":
+        "  Esto no cubre lo que ya esté instalado como root o alcanzado por otras puertas: revísalo (arx forensics).",
+    "  If it was you:  arx unblock {origin}":
+        "  Si eras tú:  arx unblock {origin}",
+    "\n  To block its origin and close that session:  arx authorize {v}":
+        "\n  Para bloquear su origen y cerrar esa sesión:  arx authorize {v}",
     "Account '{user}': ":
         "Cuenta '{user}': ",
     "ALL ACCESS CLOSED":

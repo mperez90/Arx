@@ -1933,13 +1933,25 @@ class IdentityActuatorTests(unittest.TestCase):
         self.assertIn("arx unlock mallory", res)
 
     def test_nothing_is_closed_if_the_account_cannot_be_locked(self):
-        """Cortar la sesión a quien no se le puede impedir volver solo le avisa."""
+        """Cortar la sesión a quien no se le puede impedir volver solo le avisa: por la vía del bloqueo de cuenta (la
+        del modelo) no se cierra ni se bloquea nada."""
         self._pwuid(1001)
         self._patch(self.r, "_leaves_no_admin", lambda u: True)
-        res = self.r._execute_tier2(self._login("mallory@198.51.100.9"))
+        res = self.r.contain_identity(self._login("mallory@198.51.100.9"), "t")["summary"]
         self.assertIn("última cuenta de administración", res)
         self.assertEqual(self.closed, [])
         self.assertFalse(any("usermod" in c or "198.51.100.9" in c for c in self._flat()))
+
+    def test_authorizing_the_last_admin_blocks_the_origin_and_closes_that_session_not_the_account(self):
+        """B75: sí se puede impedir que vuelva desde ese origen, así que con la palabra humana se hace."""
+        self._pwuid(1001)
+        self._patch(self.r, "_leaves_no_admin", lambda u: True)
+        self._patch(self.r.recon, "connection_owners", lambda: [])
+        res = self.r._execute_tier2(self._login("mallory@198.51.100.9"))
+        self.assertIn("última cuenta de administración", res)
+        self.assertEqual(self.closed, [])
+        self.assertFalse(any("usermod" in c for c in self._flat()))
+        self.assertTrue(any("198.51.100.9" in c and "block_ipv4" in c for c in self._flat()))
 
     def test_lock_never_expires(self):
         self._pwuid(1001)
@@ -2058,12 +2070,23 @@ class IdentityActuatorTests(unittest.TestCase):
 
     def test_never_locks_root_or_system(self):
         self._pwuid(0)
-        res = self.r._execute_tier2(self._login("root"))
+        res = self.r.contain_identity(self._login("root"), "t")["summary"]  # el bloqueo de cuenta (lo que usa el modelo)
         self.assertIn("jamás se bloquea", res)
         self.assertEqual(self.calls, [])
         self._pwuid(120)  # cuenta de servicio
-        self.assertIn("sistema", self.r._execute_tier2(self._login("mysql")))
+        self.assertIn("sistema", self.r.contain_identity(self._login("mysql"), "t")["summary"])
         self.assertEqual(self.closed, [])
+
+    def test_authorizing_root_or_system_never_locks_the_account(self):
+        """B75: a root el Tier 2 le ofrece origen + esa sesión (lo que sí se ejecuta); la cuenta no se toca."""
+        self._pwuid(0)
+        res = self.r._execute_tier2(self._login("root"))
+        self.assertIn("no se bloquea", res)
+        self.assertEqual(self.calls, [])  # sin IP no hay origen que bloquear, y nada de usermod
+        self._pwuid(120)
+        self.assertIn("sistema", self.r._execute_tier2(self._login("mysql")))
+        self.assertEqual(self.closed, [])  # no se cierra «todo lo de la cuenta»
+        self.assertFalse(any("usermod" in c for c in self._flat()))
 
     def test_invalid_username_is_rejected(self):
         self._pwuid(1001)
