@@ -16,6 +16,8 @@ fail() { echo "[FAIL] $1"; FAILED=1; }
 check() { local d="$1"; shift; if "$@"; then pass "$d"; else fail "$d"; fi; }
 step() { echo; echo "══ $1 ══"; }
 v() { limactl shell "$VM" sudo "$@"; }
+mode_is() { v sh -c "arx status 2>/dev/null | grep -q 'mode .*$1'"; }
+wait_for() { local n="$1"; shift; local i; for i in $(seq "$n"); do "$@" && return 0; sleep 2; done; return 1; }
 
 v systemctl is-active -q arx || { echo "Arx no está activo en $VM" >&2; exit 2; }
 echo "# latencia de un destino nuevo en $VM · $(v sh -c '. /etc/os-release; echo "$PRETTY_NAME · $(nft --version)"')"
@@ -66,12 +68,15 @@ v bash -c 'arx recon >/dev/null; arx learn >/dev/null; arx learn >/dev/null; arx
 v python3 -c "import json; p = '/etc/arx/config.json'; c = json.load(open(p)); c.update(profile_observe_days=0.003, profile_jitter_days=0); json.dump(c, open(p, 'w'))"
 v systemctl enable --now arxlat >/dev/null 2>&1
 v arx service install >/dev/null 2>&1       # sin --enforce: observar
-check "el servicio de Arx queda activo en observar" v sh -c 'systemctl is-active -q arx && arx status | grep -q "mode .*observe"'
+check "el servicio de Arx queda activo en observar" wait_for 45 mode_is observe
 watching() { v python3 -c "
 import json, sys
-st = json.load(open('/var/lib/arx/profiles.json')).get('subjects', {})
+try:
+    st = json.load(open('/var/lib/arx/profiles.json')).get('subjects', {})
+except (OSError, ValueError):
+    sys.exit(1)
 s = st.get('system.slice/arxlat.service')
-sys.exit(0 if s and s.get('status') == 'watching' else 1)"; }
+sys.exit(0 if s and s.get('status') == 'watching' else 1)" 2>/dev/null; }
 echo "esperando a que arxlat.service pase a vigilado (~5 min)…"
 for i in $(seq 60); do watching && break; sleep 10; done
 check "arxlat.service pasó a «vigilado»" watching
@@ -112,6 +117,8 @@ check "observar no cortó nada: el destino sigue contestando" v sh -c 'test "$(w
 
 step "ENFORCE: otro destino nuevo (puerto 9103) se corta y se avisa a tiempo"
 v arx service install --enforce >/dev/null 2>&1
+v systemctl restart arx   # `install` sobre un servicio activo reescribe la unit pero no lo reinicia
+check "el servicio de Arx pasó a enforce (protect)" wait_for 45 mode_is protect
 sleep 100   # que el barrido lo cargue con corte
 H0=$(v sh -c 'cat /tmp/arxlat-hits-9103 2>/dev/null | wc -l' | tr -d ' ')
 L2=$(measure 9103 | tail -1)
