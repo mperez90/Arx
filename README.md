@@ -193,8 +193,9 @@ Read these before you rely on it.
   a flagged login locked. It can't pick another account, reach root or lock you out of the host,
   and `arx unlock` undoes the lock, but not the closed sessions.
 - **Without journald, `auth.log` can be forged.** Any local user can write to it with `logger`, and
-  that could get an IP blocked for an hour. Hosts with journald, which is nearly all of them, read
-  from it instead, where that doesn't work.
+  that could get an IP blocked for an hour or raise a false login alert. Arx never learns known logins
+  from it. Hosts with journald, which is nearly all of them, read from the journal instead, and only
+  trust lines written by the sshd binary itself.
 - **Root can blind Arx.** Stopping or crashing the service sends an alert through your channels, but an
   attacker who is already root can suppress it: freeze the process, override its unit at runtime, or cut
   its network first. A silent Arx isn't proof of a quiet server.
