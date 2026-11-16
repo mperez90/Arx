@@ -61,6 +61,8 @@ LIBS_MIN_S = 60       # entre un intento y el siguiente, aunque el cgroup no par
 # cada barrido de 30 s (B78/A#4). Lo que vigila el kernel (cortes, escaneos) sí; lo que se aprende y se limpia, no.
 SEEN_EVERY_S = 300    # destinos vistos: aprender un destino nuevo tarda como mucho esto (o un servicio nuevo, al instante)
 NOVEL_TIMEOUT = "10m"  # lo que se sale de lo permitido, en «observar»: se lee cada barrido y se vacía
+NOVEL_SIZE = 4096      # lleno, el kernel deja de anotar y en «observar» no hay corte: se avisa antes (HZ#2 de Q)
+NOVEL_ALARM = NOVEL_SIZE * 3 // 4
 HOUSEKEEPING_EVERY_S = 300  # elementos de cgroups muertos y ¿siguen cargados los servicios fijados? (un flush o un
 #                             reinicio de nftables se ve al momento, por la tabla)
 SETUP_EVERY_S = 300   # estructura de la pista (sets y reglas); la tabla se comprueba en cada barrido
@@ -130,7 +132,7 @@ def _save(st: dict) -> None:
 _cadence: dict[str, float] = {}  # cuándo se hizo cada cosa «de vez en cuando» (reloj monotónico)
 _pins_epoch: list = [None]       # época de la tabla de nft con la que se comprobaron los servicios fijados
 _denied_seen: list = [0]         # cuántos cortes había en el barrido anterior
-_obs_pinned: dict = {}           # servicio → su cgroup cuando se cargó en «observar»
+_obs_pinned: dict = {}           # servicio → (su cgroup, lo permitido) cuando se cargó en «observar»
 _obs_epoch: list = [None]        # época de la tabla con la que se cargaron
 
 
@@ -241,7 +243,7 @@ def _setup_structure(response) -> bool:
         if f"set novel{fam} " not in listing:
             novel_key = _KEY + [addr, "daddr", ".", "th", "dport"]
             cmds.append(["add", "set", "inet", "arx", f"novel{fam}", "{", "typeof", *novel_key, ";",
-                         "flags", "dynamic,timeout;", "timeout", f"{NOVEL_TIMEOUT};", "size", "4096;", "}"])
+                         "flags", "dynamic,timeout;", "timeout", f"{NOVEL_TIMEOUT};", "size", f"{NOVEL_SIZE};", "}"])
     new = ["meta", "oifname", "!=", "lo", "ct", "state", "new", "ct", "direction", "original",
            "meta", "l4proto", "{", "tcp,", "udp", "}"]
     for fam, addr in (("4", "ip"), ("6", "ip6")):
@@ -280,14 +282,29 @@ def _observe_pin(items: list) -> None:
     with open(file, "w", encoding="utf-8") as f:
         f.write("".join(nft_text(path, s, "watched_obs") for path, s, _ in items))
     if _nft("-f", file):
-        for path, _, cid in items:
-            _obs_pinned[path] = cid
+        for path, s, cid in items:
+            _obs_pinned[path] = (cid, _allowed(s))
+
+
+def _element_key(cg: str, proto: str, ip: str, port: int) -> str:
+    return f'{cg if cg.isdigit() else chr(34) + cg + chr(34)} . {proto} . {ip} . {port}'
+
+
+def _forget_read(set_name: str, found: list) -> None:
+    """Quita del conjunto SOLO lo leído: vaciarlo entero borraría sin leer lo que el kernel anotó entre la lectura y
+    el vaciado, y una conexión de un disparo no vuelve a anotarse (HZ#1 de Q). Una sola orden; si falla (un elemento
+    caducó entretanto), uno a uno."""
+    keys = [_element_key(*e) for e in found]
+    if not keys or _nft("delete", "element", "inet", "arx", set_name, "{ " + ", ".join(keys) + " }"):
+        return
+    for k in keys:
+        _nft("delete", "element", "inet", "arx", set_name, "{ " + k + " }")
 
 
 def _novel_findings(subjects: dict) -> list[dict]:
     """Lo que un servicio vigilado abrió fuera de lo permitido desde el barrido anterior (el kernel lo anotó en
-    `novel4/6`): el aviso de «observar», en ≤ 1 barrido. El perfil de Arx decide (el kernel solo propone), y el
-    conjunto se vacía tras leerlo para que no crezca."""
+    `novel4/6`): el aviso de «observar», en ≤ 1 barrido. El perfil de Arx decide (el kernel solo propone), y lo
+    leído se quita del conjunto para que no crezca."""
     by_id = {i: p for p, s in subjects.items() for i in s.get("ids") or []}
     out = []
     for fam in ("4", "6"):
@@ -298,8 +315,16 @@ def _novel_findings(subjects: dict) -> list[dict]:
             if s and s["status"] == "watching" and not s.get("enforced") and not _OBSERVE_ONLY.match(s["unit"]) \
                     and not _covered(s, proto, ip, port):
                 out.append(_finding_denied(path, proto, ip, port, enforced=False))
-        if found:
-            _nft("flush", "set", "inet", "arx", f"novel{fam}")
+        if len(found) >= NOVEL_ALARM:  # casi lleno en un barrido: lo que no quepa no se anota y nada lo corta
+            units = sorted({(by_id.get(cg) or cg).rsplit("/", 1)[-1] for cg, *_ in found})
+            out.append({"sev": "high", "kind": "egress_profile",
+                        "detail": tr("{n} new destinations in one sweep from {units}: beyond {max} the kernel "
+                                     "stops noting them in observe mode", n=len(found),
+                                     units=", ".join(units[:5]), max=NOVEL_SIZE),
+                        "why": tr("a flood of connections can hide the one that matters"),
+                        "fp_key": f"egress_profile|novel_overflow|{fam}",
+                        "target": {"units": units[:5], "count": len(found)}})
+        _forget_read(f"novel{fam}", found)
     return out
 
 
@@ -1034,7 +1059,9 @@ def sweep(enforce: bool = False, cfg: dict | None = None, now: datetime | None =
             if cid and cid not in s.setdefault("ids", []):
                 s["ids"] = (s["ids"] + [cid])[-ID_HISTORY:]
             if not enforce and not s.get("enforced") and cid and _cgroup_exists(path) \
-                    and _obs_pinned.get(path) != cid:  # nuevo, o reiniciado con otro cgroup
+                    and _obs_pinned.get(path) != (cid, _allowed(s)):
+                # nuevo, reiniciado con otro cgroup, o con lo permitido cambiado: un `arx accept` corre en la CLI,
+                # otro proceso, y lo aprendido llega del disco (HZ#12)
                 obs.append((path, s, cid))
             if enforce and not s.get("enforced") and _cgroup_exists(path):
                 s["enforced"] = _pin(path, s)
@@ -1574,7 +1601,6 @@ def accept(item: str) -> bool:
         st.get("reported", {}).pop(item, None)
         if s.get("enforced"):
             _pin(path, s)
-        _obs_pinned.pop(path, None)  # en «observar», el kernel vuelve a cargar lo permitido del servicio
         _save(st)
     return True
 

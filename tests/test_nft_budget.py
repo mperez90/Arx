@@ -51,6 +51,8 @@ class FakeNft:
         self.declared_sets: list = []      # lo que Arx ha ido creando: el listado de la tabla lo refleja
         self.chains: dict = {}
         self.fail_lists = False
+        self.after_list: dict = {}         # set → elementos que el kernel anota justo después de listarlo
+        self.fail_batch_delete = False
 
     @property
     def structure(self) -> str:
@@ -94,6 +96,8 @@ class FakeNft:
             elems = ([show(p) for p in sorted(self.watched)] if name == "watched2" else
                      [show(p) for p in sorted(self.watched_obs)] if name == "watched_obs" else self.sets.get(name, []))
             body = f"\t\telements = {{ {', '.join(elems)} }}\n" if elems else ""
+            late = self.after_list.pop(name, [])  # la carrera: llega entre la lectura y lo siguiente
+            self.sets.setdefault(name, []).extend(late)
             return _R(0, f"table inet arx {{\n\tset {name} {{\n{body}\t}}\n}}\n")
         if args[0] == "get":
             return _R(1, "")
@@ -122,10 +126,14 @@ class FakeNft:
             self.sets[args[4]] = []
         if args[0] == "delete" and args[1] == "element":
             name = args[4]
-            target = " ".join(args[5:]).strip("{} ")
-            self.sets[name] = [e for e in self.sets.get(name, []) if not e.startswith(target.split(" timeout")[0])]
-            self.watched_obs.discard(target)
-            self.watched.discard(target)
+            targets = [t.strip() for t in " ".join(args[5:]).strip("{} ").split(", ")]
+            if len(targets) > 1 and self.fail_batch_delete:
+                return _R(1, "")
+            for target in targets:
+                self.sets[name] = [e for e in self.sets.get(name, [])
+                                   if e.split(" timeout")[0] != target.split(" timeout")[0]]
+                self.watched_obs.discard(target)
+                self.watched.discard(target)
         return _R(0, "")
 
 
@@ -375,7 +383,45 @@ class ObserveNoveltyTests(_Sweeps):
             self.fake.sets["novel4"].append(self.elem("app", f"203.0.113.{i}", 4444))
         self.sweep(2 * STEP)
         self.assertEqual(self.fake.sets["novel4"], [])
-        self.assertEqual(self.fake.count("nft", "flush", "set", "inet", "arx", "novel4"), 1)
+        self.assertEqual(self.fake.count("nft", "delete", "element", "inet", "arx", "novel4"), 1)  # una orden
+        self.assertEqual(self.fake.count("nft", "flush", "set", "inet", "arx", "novel4"), 0)
+
+    def test_what_the_kernel_notes_between_the_read_and_the_cleanup_is_not_lost(self):
+        """HZ#1 de Q: vaciar el conjunto entero borraba sin leer lo anotado entre la lectura y el vaciado."""
+        self.sweep(STEP)
+        self.fake.sets["novel4"].append(self.elem("app", "203.0.113.60", 4444))
+        self.fake.after_list["novel4"] = [self.elem("db", "198.51.100.7", 53)]  # una conexión de un disparo
+        first = self.sweep(2 * STEP)
+        self.assertTrue(any("203.0.113.60" in str(f.get("detail")) for f in first))
+        self.assertEqual(self.fake.sets["novel4"], [self.elem("db", "198.51.100.7", 53)])
+        second = self.sweep(3 * STEP)
+        self.assertTrue(any("198.51.100.7" in str(f.get("detail")) for f in second), second)
+
+    def test_if_the_one_order_cleanup_fails_each_read_element_is_removed_alone(self):
+        self.sweep(STEP)
+        self.fake.fail_batch_delete = True
+        for i in range(3):
+            self.fake.sets["novel4"].append(self.elem("app", f"203.0.113.{i}", 4444))
+        self.sweep(2 * STEP)
+        self.assertEqual(self.fake.sets["novel4"], [])
+
+    def test_a_novel_set_close_to_full_is_itself_a_finding(self):
+        """HZ#2 de Q: lleno, el kernel deja de anotar y en «observar» nada lo corta."""
+        self.sweep(STEP)
+        for i in range(self.p.NOVEL_ALARM):
+            self.fake.sets["novel4"].append(self.elem("app", f"10.{i // 65536}.{i // 256 % 256}.{i % 256}", 4444))
+        found = self.sweep(2 * STEP)
+        over = [f for f in found if "novel_overflow" in f.get("fp_key", "")]
+        self.assertEqual(len(over), 1)
+        self.assertEqual(over[0]["sev"], "high")
+        self.assertIn("app.service", over[0]["detail"])
+
+    def test_a_handful_of_novel_destinations_is_not_an_overflow(self):
+        self.sweep(STEP)
+        for i in range(20):
+            self.fake.sets["novel4"].append(self.elem("app", f"203.0.113.{i}", 4444))
+        found = self.sweep(2 * STEP)
+        self.assertFalse([f for f in found if "novel_overflow" in f.get("fp_key", "")])
 
     def test_a_service_still_being_learned_is_not_reported(self):
         self.running.append("system.slice/fresh.service")
@@ -455,6 +501,26 @@ class ObserveNoveltyTests(_Sweeps):
         self.sweep(2 * STEP)
         text = next(t for n, t in self.fake.loaded if n == "observe.nft")
         self.assertIn("203.0.113.0/24", text)
+
+    def test_a_destination_accepted_by_another_process_is_loaded_too(self):
+        """HZ#12: `arx accept` corre en la CLI; el daemon solo ve el perfil en disco."""
+        self.sweep(STEP)
+        self.fake.loaded.clear()
+        st = self.p.load()
+        st["subjects"]["system.slice/app.service"]["dest"]["tcp|203.0.113.0/24|4444"] = {
+            "first": "2026-11-15T00:00:00+00:00", "n": 0, "accepted": True}
+        self.p._save(st)
+        self.sweep(2 * STEP)
+        text = next(t for n, t in self.fake.loaded if n == "observe.nft")
+        self.assertIn("203.0.113.0/24", text)
+        self.assertNotIn("system.slice/db.service", text)  # solo el servicio que cambió
+
+    def test_nothing_changed_nothing_is_loaded_again(self):
+        self.sweep(STEP)
+        self.fake.loaded.clear()
+        for i in range(2, 6):
+            self.sweep(i * STEP)
+        self.assertEqual([n for n, _ in self.fake.loaded if n == "observe.nft"], [])
 
 
 class TheSweepEndsItsReadingBeforeTheResponses(unittest.TestCase):
