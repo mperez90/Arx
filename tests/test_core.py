@@ -8749,7 +8749,7 @@ class BehaviorWatchTests(unittest.TestCase):
         self._sweep(0)
         self._sweep(11)
         self.sets["seen4"] = 'elements = { "system.slice/sshd.service" . tcp . 203.0.113.66 . 4444 timeout 1d }'
-        found = self._sweep(11.01)
+        found = self._sweep(11 + (self.p.SEEN_EVERY_S + 60) / 86400)  # la siguiente lectura de lo aprendido
         self.assertEqual(len(found), 1)
         self.assertIn("would be cut", found[0]["detail"])
         self.assertEqual(self.pinned, [])

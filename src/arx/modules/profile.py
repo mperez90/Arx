@@ -59,7 +59,11 @@ LIBS_RETRY_S = (120, 600, 3600, 6 * 3600)
 LIBS_MIN_S = 60       # entre un intento y el siguiente, aunque el cgroup no pare de cambiar
 # nft cuesta ~2 ms de CPU por elemento de cgroup de un set (recorre /sys/fs/cgroup por cada uno): lo caro no se lee
 # cada barrido de 30 s (B78/A#4). Lo que vigila el kernel (cortes, escaneos) sí; lo que se aprende y se limpia, no.
-SEEN_EVERY_S = 300    # destinos vistos: aprender un destino nuevo tarda como mucho esto (o un servicio nuevo, al instante)
+# destinos vistos: aprender un destino nuevo tarda como mucho esto (o un servicio nuevo, al instante). Solo sirve para
+# aprender y de respaldo: en «observar» avisa `novel` y con --enforce, `denied`, ambos en cada barrido. Cada lectura
+# cuesta ~8 ms de CPU por elemento (piloto A: tailscaled en aprendizaje, ~200 destinos STUN por ventana, 1,7 s cada
+# lectura = 0,6 % de CPU cada 300 s); cada 900 s, la tercera parte.
+SEEN_EVERY_S = 900
 NOVEL_TIMEOUT = "10m"  # lo que se sale de lo permitido, en «observar»: se lee cada barrido y se vacía
 NOVEL_SIZE = 4096      # lleno, el kernel deja de anotar y en «observar» no hay corte: se avisa antes (HZ#2 de Q)
 NOVEL_ALARM = NOVEL_SIZE * 3 // 4

@@ -207,7 +207,9 @@ class IdleBudgetTests(_Sweeps):
         self.assertLessEqual(whole, 2 * 5, whole)  # al empezar y cada 300 s (la estructura de Arx y la de la pista)
 
     def test_what_is_learned_is_read_every_five_minutes_and_the_sweep_still_sees_what_it_must_each_time(self):
-        for i in range(40):
+        """Lo aprendido, cada SEEN_EVERY_S (15 min desde el piloto A); lo que vigila el kernel, cada barrido."""
+        sweeps = 4 * self.p.SEEN_EVERY_S // STEP
+        for i in range(sweeps):
             self.sweep(i * STEP)
         self.assertLessEqual(self.fake.reads("seen4"), 5)
         self.assertGreaterEqual(self.fake.reads("seen4"), 4)
@@ -226,13 +228,14 @@ class IdleBudgetTests(_Sweeps):
         lectura siguiente solo trae lo de su ventana, y lo que vuelve a abrirse se cuenta otra vez."""
         self.sweep(0)
         self.fake.sets["seen4"].append(self.elem("app", "203.0.113.7", 8443))
-        for i in range(1, 12):
+        window = self.p.SEEN_EVERY_S // STEP + 2
+        for i in range(1, window):
             self.sweep(i * STEP)
         self.assertEqual(self.fake.sets["seen4"], [])
         n1 = self.subject("app")["dest"]["tcp|203.0.113.0/24|8443"]["n"]
         self.assertEqual(n1, 1)  # leído una vez, no una vez por lectura durante un día
         self.fake.sets["seen4"].append(self.elem("app", "203.0.113.7", 8443))  # la vuelve a abrir
-        for i in range(12, 24):
+        for i in range(window, 2 * window):
             self.sweep(i * STEP)
         self.assertEqual(self.subject("app")["dest"]["tcp|203.0.113.0/24|8443"]["n"], 2)
 
@@ -244,7 +247,7 @@ class IdleBudgetTests(_Sweeps):
         st["subjects"]["system.slice/app.service"].setdefault("ids", []).append("4242")
         self.p._save(st)
         self.fake.sets["seen4"].append('4242 . tcp . 203.0.113.8 . 8443 timeout 1d expires 23h')
-        for i in range(1, 12):
+        for i in range(1, self.p.SEEN_EVERY_S // STEP + 2):
             self.sweep(i * STEP)
         self.assertIn("tcp|203.0.113.0/24|8443", self.subject("app")["dest"])
         self.assertEqual(self.fake.sets["seen4"], [])
@@ -253,13 +256,13 @@ class IdleBudgetTests(_Sweeps):
         self.sweep(0)
         self.fake.sets["seen4"].append(self.elem("app", "203.0.113.7", 8443))  # lo ve el kernel en el segundo 100
         learned_at = None
-        for i in range(1, 25):
+        for i in range(1, self.p.SEEN_EVERY_S // STEP + 3):
             self.sweep(i * STEP)
             if "tcp|203.0.113.0/24|8443" in self.subject("app")["dest"]:
                 learned_at = i * STEP
                 break
         self.assertIsNotNone(learned_at)
-        self.assertLessEqual(learned_at, 300 + STEP)
+        self.assertLessEqual(learned_at, self.p.SEEN_EVERY_S + STEP)
 
     def test_a_new_service_is_read_at_once_not_after_five_minutes(self):
         self.sweep(0)
