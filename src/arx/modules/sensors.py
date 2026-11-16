@@ -528,11 +528,19 @@ def collect_events() -> list[dict]:
 
 # ── auth.log / secure: fuerza bruta SSH + anti-forense (cierra GAP L2) ───────
 AUTH_LOGS = ["/var/log/auth.log", "/var/log/secure"]  # Debian/Ubuntu · RHEL/Fedora
+# sshd escribe el nombre de usuario que manda el cliente tal cual: `ssh "x from 192.0.2.1 port 1"@host` deja
+# «Failed password for invalid user x from 192.0.2.1 port 1 from <su IP> port N ssh2». El origen de verdad es el ÚLTIMO
+# «from <ip> port <n>», el que pone sshd al final (antes se tomaba el primero: el atacante elegía a qué IP se le
+# atribuían los fallos, y con --enforce Arx bloqueaba la del administrador).
 AUTH_FAIL_RE = re.compile(
-    r"Failed password for (?:invalid user )?(\S+) from ([0-9a-fA-F.:]+)")
-# `who` solo ve sesiones con terminal: un `ssh -T`, un `scp` o un túnel no aparecen en él.
-AUTH_OK_RE = re.compile(
-    r"Accepted [\w/@.-]+ for (\S+) from ([0-9a-fA-F.:]+)")
+    r"Failed password for (?:invalid user )?(.*) from ([0-9a-fA-F.:]+) port \d+(?: ssh2)?\s*$")
+# `who` solo ve sesiones con terminal: un `ssh -T`, un `scp` o un túnel no aparecen en él. Un acceso aceptado es la
+# línea ENTERA de sshd, anclada: «Invalid user Accepted publickey for root from 203.0.113.9 port 1 from …» (un nombre
+# de usuario que manda cualquiera, sin cuenta) no es un acceso de root, ni para avisar ni para aprenderlo.
+AUTH_OK_RE = re.compile(  # línea del journal (`-o cat`): el mensaje de sshd, desde el principio
+    r"^Accepted [\w/@.-]+ for (\S+) from ([0-9a-fA-F.:]+) port \d+\b")
+AUTH_OK_FILE_RE = re.compile(  # línea de auth.log: tras «sshd[pid]: »
+    r"\bsshd(?:-session|-auth)?\[\d+\]: Accepted [\w/@.-]+ for (\S+) from ([0-9a-fA-F.:]+) port \d+\b")
 AUTH_WINDOW_S = 600     # 10 min de memoria
 AUTH_THRESHOLD = 6      # fallos desde una misma IP dentro de la ventana
 
@@ -559,8 +567,17 @@ def login_finding(item: str) -> dict:
 
 
 def accepted_logins(path: str | None = None, limit: int = 16 * 1024 * 1024) -> set[str]:
-    """`cuenta@origen` de los accesos aceptados en auth.log. Lo usa el aprendizaje: si solo
-    aprendiera de `who`, cada `ssh -T`, `scp` o Ansible legítimo saldría como acceso nuevo."""
+    """`cuenta@origen` de los accesos aceptados. Lo usa el aprendizaje: si solo aprendiera de `who`, cada `ssh -T`,
+    `scp` o Ansible legítimo saldría como acceso nuevo.
+
+    Con journald, de él y solo de lo que escribió un binario de sshd (`_EXE`), aunque haya auth.log: rsyslog escribe
+    allí lo que le llegue, y un `logger -t sshd` de cualquier usuario metería un «Accepted … for root from <su IP>»
+    que la base sellaría como conocido (HZ#M4-1 de Q). El fichero, solo sin journald."""
+    if path is None and shutil.which("journalctl") and os.path.exists(JOURNAL_SOCKET):
+        text = recon._run(["journalctl", "--no-pager", "-q", "-o", "cat", "--since", "-30d", *_journal_match()],
+                          timeout=30)
+        if text is not None:
+            return {f"{m.group(1)}@{m.group(2)}" for line in text.splitlines() if (m := AUTH_OK_RE.match(line))}
     path = path or next((p for p in AUTH_LOGS if os.path.exists(p)), None)
     text = ""
     if path:
@@ -570,10 +587,7 @@ def accepted_logins(path: str | None = None, limit: int = 16 * 1024 * 1024) -> s
                 text = f.read(limit).decode("utf-8", "replace")
         except OSError:
             pass
-    elif shutil.which("journalctl"):  # sin auth.log (Debian 12, instalación mínima)
-        text = recon._run(["journalctl", "--no-pager", "-q", "-o", "cat", "--since", "-30d",
-                           "_COMM=sshd", "_COMM=sshd-session", "_COMM=sshd-auth"], timeout=30) or ""
-    return {f"{m.group(1)}@{m.group(2)}" for m in AUTH_OK_RE.finditer(text)}
+    return {f"{m.group(1)}@{m.group(2)}" for line in text.splitlines() if (m := AUTH_OK_FILE_RE.search(line))}
 
 
 def detect_uid0_accounts(known=(), accounts: list | None = None) -> list[dict]:
@@ -607,19 +621,122 @@ def _log_vanished(path: str | None) -> dict | None:
             "why": tr("deleting the authentication log is anti-forensic: someone is wiping traces")}
 
 
+# `_COMM` lo puede imitar cualquier usuario con un binario llamado `sshd`. `_EXE` (el /proc/<pid>/exe que anota
+# journald) no: solo vale lo que escribió un binario de sshd de verdad. Cuáles son depende de la distribución y de la
+# versión (OpenSSH 10 separa `sshd-session` y `sshd-auth`), así que no se adivinan: salen de la lista de ficheros del
+# paquete, de las rutas que el propio sshd lleva compiladas y, solo si existen, de las conocidas.
+JOURNAL_SOCKET = "/run/systemd/journal/socket"
+DPKG_SSHD_LIST = "/var/lib/dpkg/info/openssh-server.list"
+SSHD_BINARY: str | None = None  # None: el de `PATH` (o /usr/sbin/sshd)
+SSHD_EXE_CANDIDATES = ("/usr/sbin/sshd", "/usr/lib/openssh/sshd-session", "/usr/lib/openssh/sshd-auth",
+                       "/usr/libexec/openssh/sshd-session", "/usr/libexec/openssh/sshd-auth",
+                       "/usr/lib/ssh/sshd-session", "/usr/lib/ssh/sshd-auth",
+                       "/usr/sbin/sshd-session", "/usr/sbin/sshd-auth")
+_SSHD_NAMES = ("sshd", "sshd-session", "sshd-auth")
+_COMPILED_EXE = re.compile(rb"/[\w./+-]+/sshd(?:-session|-auth)?(?=\x00)")
+_sshd_exes_cache: list = [None]  # [(clave de ficheros, (rutas, helpers que sshd menciona))]
+
+
+def clear_sshd_exes_cache() -> None:
+    _sshd_exes_cache[0] = None
+
+
+def _sshd_binary() -> str | None:
+    if SSHD_BINARY is not None:
+        return SSHD_BINARY if os.path.isfile(SSHD_BINARY) else None
+    return shutil.which("sshd") or ("/usr/sbin/sshd" if os.path.isfile("/usr/sbin/sshd") else None)
+
+
+def _file_key(path: str | None) -> tuple | None:
+    try:
+        st = os.stat(path) if path else None
+    except OSError:
+        return None
+    return (st.st_ino, st.st_size, st.st_mtime_ns) if st else None
+
+
+def _discover_sshd_exes() -> tuple[list[str], list[str]]:
+    """(binarios de sshd que existen, helpers que el binario de sshd menciona: `sshd-session`, `sshd-auth`)."""
+    found: list[str] = []
+
+    def add(path: str) -> None:
+        if os.path.basename(path) in _SSHD_NAMES and os.path.isfile(path):
+            for p in (path, os.path.realpath(path)):
+                if p not in found:
+                    found.append(p)
+
+    try:
+        with open(DPKG_SSHD_LIST, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                add(line.strip())
+    except OSError:
+        pass
+    binary, mentions = _sshd_binary(), []
+    if binary:
+        add(binary)
+        try:
+            with open(binary, "rb") as f:
+                data = f.read(16 << 20)
+        except OSError:
+            data = b""
+        for m in _COMPILED_EXE.finditer(data):
+            add(m.group(0).decode("ascii", "replace"))
+        mentions = [n for n in ("sshd-session", "sshd-auth") if n.encode() in data]
+    for path in SSHD_EXE_CANDIDATES:
+        add(path)
+    return found, mentions
+
+
+def _sshd_discovery() -> tuple[list[str], list[str]]:
+    key = (_file_key(_sshd_binary()), _file_key(DPKG_SSHD_LIST))
+    hit = _sshd_exes_cache[0]
+    if hit and hit[0] == key:
+        return hit[1]
+    found = _discover_sshd_exes()
+    _sshd_exes_cache[0] = (key, found)
+    return found
+
+
+def sshd_exes() -> list[str]:
+    """Los binarios de sshd de este host, con la variante «(deleted)» de lo que un paquete actualizó sin que sshd se
+    reiniciara (`/proc/<pid>/exe` lo dice así)."""
+    found, _ = _sshd_discovery()
+    return found + [p + " (deleted)" for p in found]
+
+
+def sshd_exes_filter() -> list[str] | None:
+    """Los `_EXE` con los que filtrar el journal, o None si no se puede fijar el emisor sin arriesgarse a quedar
+    ciego: sin ningún binario de sshd, o con un sshd que menciona `sshd-session`/`sshd-auth` cuyo binario no aparece
+    en ningún sitio conocido (sus líneas llevarían otro `_EXE` y no se verían ni los accesos ni los fallos)."""
+    found, mentions = _sshd_discovery()
+    if not found:
+        return None
+    names = {os.path.basename(p) for p in found}
+    if any(m not in names for m in mentions):
+        return None
+    return sshd_exes()
+
+
+def _journal_match() -> list[str]:
+    """Los filtros del journal para las líneas de sshd: el nombre del proceso y, si se sabe, el binario."""
+    match = ["_COMM=sshd", "_COMM=sshd-session", "_COMM=sshd-auth"]  # OpenSSH 10 separa la parte de antes de autenticar
+    exes = sshd_exes_filter()
+    return match + [f"_EXE={p}" for p in exes] if exes else match
+
+
 def _journal_sshd_lines() -> list[str] | None:
     """Líneas nuevas de sshd según journald, o None si aquí no se puede.
 
-    Mejor que el fichero: `_COMM` lo pone el kernel, así que un `logger` de cualquier usuario no
-    las falsifica, y en Debian 12 o una instalación mínima no existe auth.log.
+    Mejor que el fichero: un `logger` de cualquier usuario no las falsifica, y en Debian 12 o una instalación mínima
+    no existe auth.log. `_COMM` sí se puede imitar (prctl): por eso se exige también el `_EXE` del binario de sshd.
 
     El cursor inicial se toma con el MISMO filtro: journalctl avanza dos pasos desde el cursor, y
     si este no casa con el filtro se come la primera línea que sí casa (era justo el `Accepted`).
     """
-    if not (shutil.which("journalctl") and os.path.exists("/run/systemd/journal/socket")):
+    if not (shutil.which("journalctl") and os.path.exists(JOURNAL_SOCKET)):
         return None
     base = ["journalctl", "--no-pager", "-q", "-o", "cat"]
-    match = ["_COMM=sshd", "_COMM=sshd-session", "_COMM=sshd-auth"]  # OpenSSH 10 separa la parte de antes de autenticar
+    match = _journal_match()
     cursor = config.state_dir() / "journal-sshd.cursor"
     fresh = config.state_dir() / "journal-sshd.fresh"  # sshd aún no había escrito nada
     try:
@@ -670,7 +787,7 @@ def read_auth_log(now: float | None = None) -> list[dict]:
         })
     win = _prune(config.read_json(_window_path("auth"), {}), now, AUTH_WINDOW_S)
     for line in lines:
-        ok = AUTH_OK_RE.search(line)
+        ok = AUTH_OK_RE.match(line) if journal is not None else AUTH_OK_FILE_RE.search(line)
         if ok:
             events.append(login_finding(f"{ok.group(1)}@{ok.group(2)}"))
             continue

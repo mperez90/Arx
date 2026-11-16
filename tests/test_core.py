@@ -3091,13 +3091,60 @@ class LoginSensorTests(unittest.TestCase):
         self.b, self.g, self.s = baseline, guard, sensors
         self.log = os.path.join(self.d, "auth.log")
         open(self.log, "w").write("inicio\n")
-        p = mock.patch.object(sensors, "AUTH_LOGS", [self.log])
-        p.start()
-        self.addCleanup(p.stop)
+        for name, value in (("AUTH_LOGS", [self.log]), ("JOURNAL_SOCKET", os.path.join(self.d, "sin-journald"))):
+            p = mock.patch.object(sensors, name, value)  # sin journald: el fichero, aquí y en la CI
+            p.start()
+            self.addCleanup(p.stop)
 
     def _append(self, line):
         with open(self.log, "a") as f:
             f.write(line + "\n")
+
+    INJECTED = "Invalid user Accepted publickey for root from 203.0.113.9 port 1 from 198.51.100.4 port 5555"
+
+    def test_a_username_sent_by_anyone_is_not_a_login_nor_learned(self):
+        """Sin cuenta, `ssh "Accepted publickey for root from 203.0.113.9 port 1"@host` deja esa frase dentro de la
+        línea «Invalid user …» de sshd: no es un acceso de root, ni para avisar ni para sellarlo como conocido."""
+        self.s.read_auth_log()
+        self._append(f"Nov 16 10:00:00 h sshd[9]: {self.INJECTED}")
+        # lo que escribió de verdad OpenSSH 10.0p2 (Debian 13) con ese usuario y contraseña errónea:
+        self._append("Nov 16 10:00:01 h sshd-session[9]: Failed password for invalid user Accepted publickey for root "
+                     "from 203.0.113.9 port 1 from 127.0.0.1 port 48540 ssh2")
+        self.assertEqual([e for e in self.s.read_auth_log() if e["kind"] == "login_users"], [])
+        self.assertEqual(self.s.accepted_logins(), set())
+        with mock.patch.object(self.s, "_journal_sshd_lines", lambda: [self.INJECTED]):
+            self.assertEqual([e for e in self.s.read_auth_log() if e["kind"] == "login_users"], [])
+
+    def test_failures_count_against_the_origin_sshd_wrote_not_one_in_the_username(self):
+        """«x from 192.0.2.1 port 1» como usuario: con el primer «from» se bloqueaba la IP que eligiera el atacante
+        (la del administrador); la de verdad es la última, la que pone sshd."""
+        lines = [f"Failed password for invalid user x from 192.0.2.1 port 1 from 198.51.100.4 port {50000 + i} ssh2"
+                 for i in range(6)]
+        with mock.patch.object(self.s, "_journal_sshd_lines", lambda: lines):
+            ev = [e for e in self.s.read_auth_log() if e["kind"] == "auth_bruteforce"]
+        self.assertEqual([e["target"]["ip"] for e in ev], ["198.51.100.4"])
+
+    def test_learning_prefers_what_sshd_itself_wrote_in_the_journal(self):
+        """HZ#M4-1 de Q: con journald, un `logger -t sshd` en auth.log no se aprende; del journal, solo lo que
+        escribió un binario de sshd (`_EXE`)."""
+        self._append("Nov 16 10:00:00 h sshd[1]: Accepted publickey for root from 203.0.113.66 port 22 ssh2")  # logger
+        sock = os.path.join(self.d, "journal.socket")
+        open(sock, "w").close()
+        asked = []
+
+        def run(argv, timeout=30):
+            asked.append(argv)
+            return "Accepted publickey for ansible from 10.0.0.5 port 5 ssh2: ED25519 SHA256:x\n"
+        with mock.patch.object(self.s, "JOURNAL_SOCKET", sock), \
+                mock.patch.object(self.s.shutil, "which", lambda n: "/usr/bin/" + n), \
+                mock.patch.object(self.s, "sshd_exes_filter", lambda: ["/usr/sbin/sshd"]), \
+                mock.patch.object(self.s.recon, "_run", run):
+            self.assertEqual(self.s.accepted_logins(), {"ansible@10.0.0.5"})
+        self.assertIn("_EXE=/usr/sbin/sshd", asked[0])
+        with mock.patch.object(self.s, "JOURNAL_SOCKET", sock), \
+                mock.patch.object(self.s.shutil, "which", lambda n: "/usr/bin/" + n), \
+                mock.patch.object(self.s.recon, "_run", lambda argv, timeout=30: None):  # journal sin respuesta
+            self.assertEqual(self.s.accepted_logins(), {"root@203.0.113.66"})  # entonces, el fichero
 
     def test_accepted_login_without_terminal_is_seen(self):
         self.s.read_auth_log()
