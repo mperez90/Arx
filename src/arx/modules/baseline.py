@@ -298,6 +298,7 @@ def fold(baseline: dict, snap: dict, check_integrity: bool = True) -> dict:
     if "integrity_files" not in baseline:  # B77: estado por fichero, desde la primera muestra
         from arx.modules import integrity
         baseline["integrity_files"] = integrity.snapshot()[0]
+        baseline["meta"]["integrity_groups"] = sorted(integrity.GROUP_NAMES)  # qué se vigilaba al aprender
     if not baseline.get("integrity"):
         baseline["integrity"] = fp
     elif check_integrity and fp != baseline["integrity"]:
@@ -439,8 +440,9 @@ def adopt_suid_scope(scope: list[str], adopt: list[str]) -> None:
         save(b)
 
 
-def adopt_integrity_files(states: dict, drop=(), replace: bool = False) -> None:
-    """Incorpora estados de ficheros a la base (piezas de Arx, migración, aceptación)."""
+def adopt_integrity_files(states: dict, drop=(), replace: bool = False, groups=None) -> None:
+    """Incorpora estados de ficheros a la base (piezas de Arx, migración, aceptación). `groups`: los grupos que
+    se vigilan desde ahora (migración o grupos nuevos de una actualización)."""
     with config.locked("baseline"):
         b = load()
         if not b:
@@ -450,6 +452,8 @@ def adopt_integrity_files(states: dict, drop=(), replace: bool = False) -> None:
         for p in drop:
             files.pop(p, None)
         b["integrity_files"] = files
+        if groups is not None:
+            b["meta"]["integrity_groups"] = sorted(groups)
         b["meta"]["updated"] = _now()
         save(b)
 

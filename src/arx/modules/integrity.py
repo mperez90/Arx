@@ -46,6 +46,21 @@ def _systemd_paths() -> list[str]:
     return out
 
 
+GROUP_NAMES = ("authorized_keys_root", "authorized_keys_users", "sudoers", "sudoers_d", "passwd", "ld_preload",
+               "cron", "systemd", "apt_sources", "apt_conf", "apt_keys", "rc_local", "shell_init", "ld_conf")
+# Grupos que se vigilan desde después de la primera base por fichero (0.0.9rc3): una base de entonces no guarda
+# `meta.integrity_groups` y no los conocía. Sus ficheros no son «nuevos» al actualizar: ya estaban (piloto A).
+ADDED_AFTER_PER_FILE = frozenset({"rc_local", "shell_init", "ld_conf"})
+
+
+def known_groups(meta: dict) -> set[str]:
+    """Los grupos que vigilaba Arx cuando se selló (o se adoptó por última vez) la base."""
+    recorded = meta.get("integrity_groups")
+    if isinstance(recorded, list):
+        return set(recorded)
+    return set(GROUP_NAMES) - ADDED_AFTER_PER_FILE
+
+
 def groups() -> dict[str, list[str]]:
     """Grupo → rutas candidatas (existan o no). El grupo decide cómo se entiende el contenido."""
     home_keys = [f"{h}/.ssh/{n}" for h in glob.glob("/home/*") for n in ("authorized_keys", "authorized_keys2")]

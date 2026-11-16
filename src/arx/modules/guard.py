@@ -151,6 +151,23 @@ def _package_wrote(path: str) -> bool:
         return False
 
 
+def _watch_added(newly: list[str], now_files: dict, own: set) -> dict:
+    """Lo que Arx empieza a vigilar ya estaba ahí: se toma como conocido y se dice una vez, nombrando lo arriesgado."""
+    risky = integrity.risky_preexisting(newly, now_files, owner=pkgdb.owner, own=own)
+    detail = tr("Arx now also watches {n} configuration file(s); what was already there "
+                "was taken as known: {files}", n=len(newly), files=", ".join(newly[:10]))
+    if risky:
+        detail += " — " + tr("{n} of them run commands or grant trust and belong to no package: {files}",
+                             n=len(risky), files=", ".join(risky[:10]))
+    # med: muchos servidores tienen unidades propias de sus aplicaciones sin paquete; se nombran para
+    # revisarlas una vez (estado y resumen diario), sin una alerta alta en cada actualización
+    return {"sev": "med", "kind": "integrity_watch_added", "set": "integrity", "item": ",".join(newly[:20]),
+            "detail": detail,
+            "why": tr("they were there before Arx looked at them: review them once; any change from now on is "
+                      "reported"),
+            "fp_key": f"integrity_watch_added|{len(newly)}|{newly[0]}"}
+
+
 def _integrity_drift(base: dict, include_suid: bool) -> list[dict]:
     """Ficheros críticos contra la base sellada, fichero a fichero (B77).
 
@@ -177,8 +194,9 @@ def _integrity_drift(base: dict, include_suid: bool) -> list[dict]:
         files, pending_groups, newly = integrity.migrate(sealed, now_files, legacy_now,
                                                          vault=response.vault_entries(),
                                                          legacy_hash=baseline.legacy_group_hash)
-        baseline.adopt_integrity_files(files, replace=True)
+        baseline.adopt_integrity_files(files, replace=True, groups=integrity.GROUP_NAMES)
         base["integrity_files"] = files
+        base.setdefault("meta", {})["integrity_groups"] = sorted(integrity.GROUP_NAMES)
         _adopt_old_arx_dropins(now_files)  # los escribió una versión que aún no los registraba
         own_now, skip_now = _own_artifacts()
         clean = set(integrity.legacy_groups()) - set(pending_groups)
@@ -186,23 +204,23 @@ def _integrity_drift(base: dict, include_suid: bool) -> list[dict]:
                               and (p.get("target") or {}).get("file") in clean,
                               "superseded by per-file integrity: that group showed no real change")
         if newly:
-            risky = integrity.risky_preexisting(newly, now_files, owner=pkgdb.owner,
-                                                own=set(own_now) | skip_now)
-            detail = tr("Arx now also watches {n} configuration file(s); what was already there "
-                        "was taken as known: {files}", n=len(newly), files=", ".join(newly[:10]))
-            if risky:
-                detail += " — " + tr("{n} of them run commands or grant trust and belong to no package: {files}",
-                                     n=len(risky), files=", ".join(risky[:10]))
-            # med: muchos servidores tienen unidades propias de sus aplicaciones sin paquete; se nombran para
-            # revisarlas una vez (estado y resumen diario), sin una alerta alta en cada actualización
-            findings.append({"sev": "med", "kind": "integrity_watch_added", "set": "integrity",
-                             "item": ",".join(newly[:20]),
-                             "detail": detail,
-                             "why": tr("they were there before Arx looked at them: review them once; any change "
-                                       "from now on is reported"),
-                             "fp_key": f"integrity_watch_added|{len(newly)}|{newly[0]}"})
+            findings.append(_watch_added(newly, now_files, set(own_now) | skip_now))
     else:
         legacy_now = None
+        # una actualización que vigila grupos nuevos (rc4: rc.local, inicio de shell, ld.so.conf): lo que ya había
+        # en ellos no es «línea nueva» (piloto A: 16 high con Tier 2 al pasar de rc3 a rc4). Se adopta y se dice
+        # una vez, como en la migración; lo que cambie desde ahora se avisa como siempre
+        meta = base.setdefault("meta", {})
+        added = set(integrity.GROUP_NAMES) - integrity.known_groups(meta)
+        if added:
+            newly = sorted(p for p, st in now_files.items() if st.get("g") in added and p not in files)
+            states = {p: now_files[p] for p in newly}
+            baseline.adopt_integrity_files(states, groups=integrity.GROUP_NAMES)
+            files.update(states)
+            meta["integrity_groups"] = sorted(integrity.GROUP_NAMES)
+            if newly:
+                own_now, skip_now = _own_artifacts()
+                findings.append(_watch_added(newly, now_files, set(own_now) | skip_now))
     # grupos de una base antigua que ya habían cambiado: su aviso de siempre, hasta que se acepten
     pending = [g for g in (pending_groups or base.get("meta", {}).get("integrity_pending") or [])
                if g in sealed]
