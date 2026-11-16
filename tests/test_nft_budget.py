@@ -236,6 +236,19 @@ class IdleBudgetTests(_Sweeps):
             self.sweep(i * STEP)
         self.assertEqual(self.subject("app")["dest"]["tcp|203.0.113.0/24|8443"]["n"], 2)
 
+    def test_what_a_restarted_service_opened_is_still_learned(self):
+        """HZ#97c-1 de Q: un servicio reiniciado sale en `seen` como número; se atribuye por su historial de
+        cgroups, como en `novel` y `denied`, antes de quitarlo del kernel."""
+        self.sweep(0)
+        st = self.p.load()
+        st["subjects"]["system.slice/app.service"].setdefault("ids", []).append("4242")
+        self.p._save(st)
+        self.fake.sets["seen4"].append('4242 . tcp . 203.0.113.8 . 8443 timeout 1d expires 23h')
+        for i in range(1, 12):
+            self.sweep(i * STEP)
+        self.assertIn("tcp|203.0.113.0/24|8443", self.subject("app")["dest"])
+        self.assertEqual(self.fake.sets["seen4"], [])
+
     def test_a_new_destination_is_learned_within_five_minutes(self):
         self.sweep(0)
         self.fake.sets["seen4"].append(self.elem("app", "203.0.113.7", 8443))  # lo ve el kernel en el segundo 100

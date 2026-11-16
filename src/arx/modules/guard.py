@@ -157,12 +157,15 @@ def _watch_added(newly: list[str], now_files: dict, own: set) -> dict:
     detail = tr("Arx now also watches {n} configuration file(s); what was already there "
                 "was taken as known: {files}", n=len(newly), files=", ".join(newly[:10]))
     if risky:
+        # todos con nombre: truncar dejaría a uno sembrado detrás de diez sin revisar (HZ#1f1-1 de Q); el texto de
+        # la alerta lleva diez y el recuento, y el objetivo del incidente (arx explain) los lleva todos
+        shown = ", ".join(risky[:10]) + (tr(" (+{n} more: arx explain)", n=len(risky) - 10) if len(risky) > 10 else "")
         detail += " — " + tr("{n} of them run commands or grant trust and belong to no package: {files}",
-                             n=len(risky), files=", ".join(risky[:10]))
+                             n=len(risky), files=shown)
     # med: muchos servidores tienen unidades propias de sus aplicaciones sin paquete; se nombran para
     # revisarlas una vez (estado y resumen diario), sin una alerta alta en cada actualización
     return {"sev": "med", "kind": "integrity_watch_added", "set": "integrity", "item": ",".join(newly[:20]),
-            "detail": detail,
+            "detail": detail, "target": {"risky": risky, "files": len(newly)},
             "why": tr("they were there before Arx looked at them: review them once; any change from now on is "
                       "reported"),
             "fp_key": f"integrity_watch_added|{len(newly)}|{newly[0]}"}

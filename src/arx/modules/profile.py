@@ -997,11 +997,12 @@ def sweep(enforce: bool = False, cfg: dict | None = None, now: datetime | None =
         for fam in (("4", "6") if learn_now or _due("seen", SEEN_EVERY_S, now) else ()):
             _cadence["seen"] = now.timestamp()
             seen = _elements(f"seen{fam}")
-            # lo leído se quita: el conjunto guarda solo lo de la última ventana, no un día entero. Cada elemento
-            # cuesta ~8 ms de CPU al listarlo (piloto A: 283 elementos, 2,7 s cada 5 min, y creciendo)
-            _forget_read(f"seen{fam}", seen)
+            by_id = {i: p for p, x in subjects.items() for i in x.get("ids") or []}
             for cg, proto, ip, port in seen:
-                s = subjects.get(cg)
+                # un servicio reiniciado sale como número: se atribuye por su historial de cgroups, como en
+                # `novel` y `denied` (HZ#97c-1 de Q: lo leído ya no vuelve en la lectura siguiente)
+                path = cg if cg in subjects else by_id.get(cg)
+                s = subjects.get(path) if path else None
                 if not s:
                     continue
                 key = f"{proto}|{_net_of(ip)}|{port}"
@@ -1014,7 +1015,10 @@ def sweep(enforce: bool = False, cfg: dict | None = None, now: datetime | None =
                             s["intel"].append(ip)
                 elif not (enforce and s.get("enforced")) and not _covered(s, proto, ip, port) \
                         and not _OBSERVE_ONLY.match(s["unit"]):
-                    findings.append(_finding_denied(cg, proto, ip, port, enforced=False))
+                    findings.append(_finding_denied(path, proto, ip, port, enforced=False))
+            # lo leído se quita DESPUÉS de procesarlo: el conjunto guarda solo lo de la última ventana, no un día
+            # entero. Cada elemento cuesta ~8 ms de CPU al listarlo (piloto A: 283 elementos, 2,7 s cada 5 min)
+            _forget_read(f"seen{fam}", seen)
         for path, s in subjects.items():
             until = _parse(s.get("observe_until"))
             if s["status"] != "observing" or not until or now < until:
