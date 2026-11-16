@@ -9159,6 +9159,31 @@ class TrustTests(unittest.TestCase):
             self.assertEqual(r["result"], "fail")
             self.assertTrue(r["required"])
 
+    def test_a_missing_directory_of_the_package_is_not_a_changed_program(self):
+        """Piloto A (Debian 13): `openssh-server` trae /var/log/runit/ssh vacío; sin runit no existe, y
+        `sshd-session` salía con confianza 0. Lo que falta y no tiene huella en .md5sums no es un fichero."""
+        out = "missing     /var/log/runit\nmissing     /var/log/runit/ssh\n"
+        md5 = {"/usr/lib/openssh/sshd-session", "/usr/lib/openssh/sshd-auth", "/usr/sbin/sshd"}
+        with mock.patch.object(self.t, "_run", lambda argv, timeout=30: (0, out)), \
+                mock.patch.object(self.t, "_md5_paths", lambda pkg: md5):
+            self.assertEqual(self.t.check_files(self.F)["result"], "pass")
+        with mock.patch.object(self.t, "_run", lambda argv, timeout=30: (1, out + "missing     /usr/lib/openssh/sshd-auth\n")), \
+                mock.patch.object(self.t, "_md5_paths", lambda pkg: md5):
+            r = self.t.check_files(self.F)
+        self.assertEqual(r["result"], "fail")  # un programa que falta sigue contando
+        self.assertIn("sshd-auth", r["detail"])
+        with mock.patch.object(self.t, "_run", lambda argv, timeout=30: (0, out)), \
+                mock.patch.object(self.t, "_md5_paths", lambda pkg: None):
+            self.assertEqual(self.t.check_files(self.F)["result"], "fail")  # sin .md5sums legible: cuenta
+
+    def test_the_md5sums_paths_are_read_as_absolute_paths(self):
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(self.t, "INFO_DIR", d):
+            with open(os.path.join(d, "openssh-server.md5sums"), "w") as f:
+                f.write("0123abcd  usr/lib/openssh/sshd-session\n4567ef01  usr/sbin/sshd\n")
+            self.assertEqual(self.t._md5_paths("openssh-server:arm64"),
+                             {"/usr/lib/openssh/sshd-session", "/usr/sbin/sshd"})
+            self.assertIsNone(self.t._md5_paths("absent"))
+
     def test_dpkg_verify_ignores_config_files_but_not_programs(self):
         out = "??5??????  c /etc/xz.conf\n"
         with mock.patch.object(self.t, "_run", lambda argv, timeout=30: (0, out)):

@@ -192,7 +192,7 @@ def check_files(f: dict) -> dict:
             recognized += 1
             rest = line[len("missing"):].strip()
             is_conf, path = rest.startswith("c "), rest[2:] if rest.startswith("c ") else rest
-            if is_conf or path in conf or _absent_on_purpose(path, rules):
+            if is_conf or path in conf or _absent_on_purpose(path, rules) or _not_a_file(path, f["package"]):
                 ignored += 1
             else:
                 changed.append(path)
@@ -202,6 +202,30 @@ def check_files(f: dict) -> dict:
     if rc != 0 and not (rc == 1 and recognized and recognized == ignored):
         return _check("files_intact", "unknown", tr("dpkg --verify did not complete"), required=True)
     return _check("files_intact", "pass", tr("every file matches what dpkg installed"), required=True)
+
+
+def _md5_paths(pkg: str) -> set[str] | None:
+    """Las rutas con huella en dpkg (`.md5sums`): solo ficheros regulares. None si no se puede leer."""
+    out, read = set(), False
+    for name in (pkg, pkg.partition(":")[0]):
+        try:
+            with open(f"{INFO_DIR}/{name}.md5sums", encoding="utf-8", errors="replace") as fh:
+                read = True
+                for line in fh:
+                    _, _, rel = line.rstrip("\n").partition("  ")
+                    if rel:
+                        out.add("/" + rel.lstrip("/"))
+        except OSError:
+            continue
+    return out if read and out else None
+
+
+def _not_a_file(path: str, pkg: str) -> bool:
+    """Lo que falta no es un fichero con huella (un directorio o un enlace del paquete): no cambia su código, y
+    `dpkg --verify` tampoco comprueba su contenido. Debian 13: `openssh-server` trae `/var/log/runit/ssh`, vacío,
+    que no existe sin runit, y dejaba a `sshd-session` con confianza 0 (piloto A). Sin `.md5sums` legible, cuenta."""
+    known = _md5_paths(pkg)
+    return known is not None and path not in known
 
 
 def _conffiles(pkg: str) -> set[str]:
