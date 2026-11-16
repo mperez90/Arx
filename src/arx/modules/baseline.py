@@ -323,6 +323,15 @@ def _target_for(key: str, item: str) -> dict:
     return {}
 
 
+def _own_services() -> set[str]:
+    """Los servicios de Arx que él mismo instaló y selló (`self.json`): `arx service install` va después de
+    `learn --seal`, así que `arx.service` nunca está en la base. Si alguien cambia su unit, lo dice `self_check`
+    (crit); un servicio con el mismo nombre que Arx no selló no se salta."""
+    from arx.modules import service
+    sealed = config.read_json(config.state_dir() / "self.json", {}) or {}
+    return {os.path.basename(p) for p in service._units() if p in sealed and p.endswith(".service")}
+
+
 def compare(baseline: dict, snap: dict) -> list[dict]:
     """Desvíos de una instantánea contra la base sellada. Lo usa `guard`."""
     anomalies: list[dict] = []
@@ -331,6 +340,8 @@ def compare(baseline: dict, snap: dict) -> list[dict]:
         if key not in sets:
             continue  # la base no aprendió este conjunto (base antigua): no inundar de "nuevos"
         known = set(sets[key])
+        if key == "services":
+            known |= _own_services()
         for item in observed:
             if item not in known:
                 sev = KIND_SEV.get(key, "med")
