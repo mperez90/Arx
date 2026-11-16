@@ -28,7 +28,12 @@ from arx.i18n import tr
 from arx.modules import maintenance, pkgdb
 
 DPKG_INFO = "/var/lib/dpkg/info"
-CACHE_S = 300  # lo que depende de apt (origen firmado); lo que depende de dpkg se invalida por su generación
+# Lo que depende de apt (origen firmado) se guarda mientras no cambie el estado de apt (`_apt_generation`): con solo
+# 300 s, un hallazgo pendiente volvía a preguntar `apt-cache policy` cada 5 min (piloto A: 12 scopes/h en u24 por
+# polkitd). CACHE_S queda como tope por si algo que no se mira cambiara.
+CACHE_S = 3600
+APT_STATE = ("/var/lib/apt/lists", "/etc/apt/sources.list", "/etc/apt/sources.list.d", "/etc/apt/preferences",
+             "/etc/apt/preferences.d", "/etc/apt/trusted.gpg", "/etc/apt/trusted.gpg.d", "/etc/apt/keyrings")
 MAX_HASH_BYTES = 1024 * 1024 * 1024
 # El código real de un intérprete está en el script: verificar `python3` no dice nada del programa.
 _INTERPRETER_RE = re.compile(r"^(?:python[0-9.]*|perl[0-9.]*|ruby[0-9.]*|node(?:js)?|php[0-9.]*|"
@@ -56,13 +61,39 @@ _NET_PARENT_RE = re.compile(r"^(?:nginx|apache2|httpd|lighttpd|caddy|php-fpm[0-9
 _cache: dict = {}
 
 
+def _apt_generation() -> str | None:
+    """Identidad del estado del que depende la respuesta de apt: la base de dpkg, las listas descargadas (`apt update`
+    las reemplaza) y cada fichero de fuentes, preferencias y claves (editar uno en su sitio no cambia su directorio).
+    None si no se puede asegurar: entonces no se reutiliza nada."""
+    dpkg = pkgdb.generation()
+    if dpkg is None:
+        return None
+    parts = [dpkg]
+    for top in APT_STATE:
+        entries = [top]
+        if top != "/var/lib/apt/lists" and os.path.isdir(top):
+            try:
+                entries += sorted(os.path.join(top, n) for n in os.listdir(top))
+            except OSError:
+                return None
+        for path in entries:
+            try:
+                st = os.stat(path)
+                parts.append(f"{path}:{st.st_ino}:{st.st_size}:{st.st_mtime_ns}")
+            except FileNotFoundError:
+                parts.append(f"{path}:-")
+            except OSError:
+                return None
+    return "|".join(parts)
+
+
 def _cached(key, fn):
-    now = time.monotonic()
+    now, gen = time.monotonic(), _apt_generation()
     hit = _cache.get(key)
-    if hit and now - hit[0] < CACHE_S:
+    if hit and gen is not None and hit[2] == gen and 0 <= now - hit[0] < CACHE_S:
         return hit[1]
     value = fn()
-    _cache[key] = (now, value)
+    _cache[key] = (now, value, gen)
     return value
 
 
