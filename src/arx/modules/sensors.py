@@ -574,10 +574,10 @@ def accepted_logins(path: str | None = None, limit: int = 16 * 1024 * 1024) -> s
     allí lo que le llegue, y un `logger -t sshd` de cualquier usuario metería un «Accepted … for root from <su IP>»
     que la base sellaría como conocido (HZ#M4-1 de Q). El fichero, solo sin journald."""
     if path is None and shutil.which("journalctl") and os.path.exists(JOURNAL_SOCKET):
-        text = recon._run(["journalctl", "--no-pager", "-q", "-o", "cat", "--since", "-30d", *_journal_match()],
+        text = recon._run(["journalctl", "--no-pager", "-q", "-o", "json", "--since", "-30d", *_SSHD_COMM],
                           timeout=30)
         if text is not None:
-            return {f"{m.group(1)}@{m.group(2)}" for line in text.splitlines() if (m := AUTH_OK_RE.match(line))}
+            return {f"{m.group(1)}@{m.group(2)}" for line in _sshd_entries(text) if (m := AUTH_OK_RE.match(line))}
     path = path or next((p for p in AUTH_LOGS if os.path.exists(p)), None)
     text = ""
     if path:
@@ -659,8 +659,8 @@ def _discover_sshd_exes() -> tuple[list[str], list[str]]:
     """(binarios de sshd que existen, helpers que el binario de sshd menciona: `sshd-session`, `sshd-auth`)."""
     found: list[str] = []
 
-    def add(path: str) -> None:
-        if os.path.basename(path) in _SSHD_NAMES and os.path.isfile(path):
+    def add(path: str) -> None:  # ejecutable: la lista del paquete también trae /etc/pam.d/sshd
+        if os.path.basename(path) in _SSHD_NAMES and os.path.isfile(path) and os.access(path, os.X_OK):
             for p in (path, os.path.realpath(path)):
                 if p not in found:
                     found.append(p)
@@ -717,18 +717,40 @@ def sshd_exes_filter() -> list[str] | None:
     return sshd_exes()
 
 
-def _journal_match() -> list[str]:
-    """Los filtros del journal para las líneas de sshd: el nombre del proceso y, si se sabe, el binario."""
-    match = ["_COMM=sshd", "_COMM=sshd-session", "_COMM=sshd-auth"]  # OpenSSH 10 separa la parte de antes de autenticar
+_SSHD_COMM = ["_COMM=sshd", "_COMM=sshd-session", "_COMM=sshd-auth"]  # OpenSSH 10 separa la parte de antes de autenticar
+
+
+def _sshd_entries(out: str) -> list[str]:
+    """Los mensajes de sshd de una salida `journalctl -o json`, decidiendo por entrada con su `_EXE`.
+
+    Con los binarios de sshd fijados: un `_EXE` que no es de sshd, nunca (imita el nombre). Sin `_EXE` (el proceso murió
+    antes de que journald mirara su /proc: los cierres de los escáneres; medido en los VPS del piloto A, ~8 de cada 100
+    líneas), vale para fallos y cierres, pero NO para un acceso aceptado: ese lo escribe una sesión viva, que siempre lo
+    lleva, y sin él podría ser alguien que escribió y salió a tiempo. Sin binarios fijados, todo (como antes)."""
     exes = sshd_exes_filter()
-    return match + [f"_EXE={p}" for p in exes] if exes else match
+    lines = []
+    for raw in out.splitlines():
+        try:
+            e = json.loads(raw)
+        except ValueError:
+            continue
+        msg = e.get("MESSAGE")
+        if isinstance(msg, list):  # journald da bytes sueltos si el mensaje no es UTF-8
+            msg = bytes(b & 0xFF for b in msg if isinstance(b, int)).decode("utf-8", "replace")
+        if not isinstance(msg, str):
+            continue
+        exe = e.get("_EXE")
+        if exes is not None and (exe not in exes if exe is not None else bool(AUTH_OK_RE.match(msg))):
+            continue
+        lines.append(msg)
+    return lines
 
 
 def _journal_sshd_lines() -> list[str] | None:
     """Líneas nuevas de sshd según journald, o None si aquí no se puede.
 
     Mejor que el fichero: un `logger` de cualquier usuario no las falsifica, y en Debian 12 o una instalación mínima
-    no existe auth.log. `_COMM` sí se puede imitar (prctl): por eso se exige también el `_EXE` del binario de sshd.
+    no existe auth.log. `_COMM` sí se puede imitar (prctl): por eso cada entrada se mira con su `_EXE` (_sshd_entries).
 
     El cursor inicial se toma con el MISMO filtro: journalctl avanza dos pasos desde el cursor, y
     si este no casa con el filtro se come la primera línea que sí casa (era justo el `Accepted`).
@@ -736,7 +758,7 @@ def _journal_sshd_lines() -> list[str] | None:
     if not (shutil.which("journalctl") and os.path.exists(JOURNAL_SOCKET)):
         return None
     base = ["journalctl", "--no-pager", "-q", "-o", "cat"]
-    match = _journal_match()
+    match = _SSHD_COMM
     cursor = config.state_dir() / "journal-sshd.cursor"
     fresh = config.state_dir() / "journal-sshd.fresh"  # sshd aún no había escrito nada
     try:
@@ -750,7 +772,7 @@ def _journal_sshd_lines() -> list[str] | None:
             with os.fdopen(fd, "w") as f:
                 f.write(m.group(1) if m else "")
             return []
-        r = subprocess.run([*base, f"--cursor-file={cursor}", *match],
+        r = subprocess.run(["journalctl", "--no-pager", "-q", "-o", "json", f"--cursor-file={cursor}", *match],
                            capture_output=True, text=True, errors="replace", timeout=15)
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -758,7 +780,7 @@ def _journal_sshd_lines() -> list[str] | None:
         cursor.unlink(missing_ok=True)  # cursor inválido, journal rotado o systemd < 242
         fresh.unlink(missing_ok=True)
         return None
-    return (r.stdout or "").splitlines()
+    return _sshd_entries(r.stdout or "")
 
 
 def read_auth_log(now: float | None = None) -> list[dict]:

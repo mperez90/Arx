@@ -3134,13 +3134,16 @@ class LoginSensorTests(unittest.TestCase):
 
         def run(argv, timeout=30):
             asked.append(argv)
-            return "Accepted publickey for ansible from 10.0.0.5 port 5 ssh2: ED25519 SHA256:x\n"
+            return "".join(json.dumps(e) + "\n" for e in (
+                {"MESSAGE": "Accepted publickey for ansible from 10.0.0.5 port 5 ssh2: ED25519 SHA256:x",
+                 "_EXE": "/usr/sbin/sshd"},
+                {"MESSAGE": "Accepted publickey for root from 203.0.113.67 port 5 ssh2", "_EXE": "/tmp/sshd"}))
         with mock.patch.object(self.s, "JOURNAL_SOCKET", sock), \
                 mock.patch.object(self.s.shutil, "which", lambda n: "/usr/bin/" + n), \
                 mock.patch.object(self.s, "sshd_exes_filter", lambda: ["/usr/sbin/sshd"]), \
                 mock.patch.object(self.s.recon, "_run", run):
             self.assertEqual(self.s.accepted_logins(), {"ansible@10.0.0.5"})
-        self.assertIn("_EXE=/usr/sbin/sshd", asked[0])
+        self.assertIn("json", asked[0])
         with mock.patch.object(self.s, "JOURNAL_SOCKET", sock), \
                 mock.patch.object(self.s.shutil, "which", lambda n: "/usr/bin/" + n), \
                 mock.patch.object(self.s.recon, "_run", lambda argv, timeout=30: None):  # journal sin respuesta
@@ -3214,7 +3217,9 @@ class JournalSourceTests(unittest.TestCase):
         for obj, name, value in ((sensors.subprocess, "run", fake_run),
                                  (sensors.shutil, "which", lambda c: f"/usr/bin/{c}"),
                                  (sensors.os.path, "exists",
-                                  lambda path: path == "/run/systemd/journal/socket" or real_exists(path))):
+                                  lambda path: path == "/run/systemd/journal/socket" or real_exists(path)),
+                                 (sensors, "sshd_exes_filter",
+                                  lambda: ["/usr/sbin/sshd", "/usr/lib/openssh/sshd-session"])):
             p = mock.patch.object(obj, name, value)
             p.start()
             self.addCleanup(p.stop)
@@ -3222,6 +3227,12 @@ class JournalSourceTests(unittest.TestCase):
     def _r(self, stdout="", rc=0, stderr=""):
         import types
         return types.SimpleNamespace(stdout=stdout, stderr=stderr, returncode=rc)
+
+    @staticmethod
+    def _j(*msgs, exe="/usr/sbin/sshd"):
+        """Entradas de `journalctl -o json`; exe=None: sin `_EXE` (el proceso murió antes de que journald mirara)."""
+        return "".join(json.dumps({"MESSAGE": m, "_COMM": "sshd", **({"_EXE": exe} if exe else {})}) + "\n"
+                       for m in msgs)
 
     def _lines(self):
         return _REAL_JOURNAL()
@@ -3236,7 +3247,7 @@ class JournalSourceTests(unittest.TestCase):
         self.assertEqual((self.s.config.state_dir() / "journal-sshd.cursor").read_text(), "s=abc")
 
     def test_then_it_reads_only_what_sshd_wrote(self):
-        self.answers = [self._r("-- cursor: s=abc\n"), self._r("Failed password for x from 1.2.3.4 port 1 ssh2\n")]
+        self.answers = [self._r("-- cursor: s=abc\n"), self._r(self._j("Failed password for x from 1.2.3.4 port 1 ssh2"))]
         self._lines()
         self.assertEqual(self._lines(), ["Failed password for x from 1.2.3.4 port 1 ssh2"])
         self.assertIn("_COMM=sshd", self.seen[-1])
@@ -3251,9 +3262,33 @@ class JournalSourceTests(unittest.TestCase):
         self.assertIn("_COMM=sshd-session", self.seen[0])
 
     def test_if_sshd_had_written_nothing_the_first_line_is_not_lost(self):
-        self.answers = [self._r(""), self._r("Accepted password for ana from 1.2.3.4 port 1 ssh2\n")]
+        self.answers = [self._r(""), self._r(self._j("Accepted password for ana from 1.2.3.4 port 1 ssh2"))]
         self.assertEqual(self._lines(), [])
         self.assertEqual(self._lines(), ["Accepted password for ana from 1.2.3.4 port 1 ssh2"])
+
+    def test_each_entry_is_judged_by_the_binary_that_wrote_it(self):
+        """`_COMM=sshd` se imita (prctl): un `_EXE` que no es de sshd no cuenta. Sin `_EXE` (el proceso murió antes de
+        que journald lo mirara: los cierres de los escáneres, ~8 % en el piloto A) valen fallos y cierres, no un acceso
+        aceptado, que siempre lo escribe una sesión viva."""
+        out = (self._j("Accepted publickey for root from 203.0.113.66 port 1 ssh2", exe="/home/eve/sshd")
+               + self._j("Accepted publickey for root from 203.0.113.67 port 1 ssh2", exe=None)
+               + self._j("Failed password for root from 198.51.100.4 port 2 ssh2", exe=None)
+               + self._j("Accepted publickey for ana from 10.0.0.5 port 3 ssh2", exe="/usr/lib/openssh/sshd-session")
+               + self._j("Connection closed by 198.51.100.4 port 4", exe="/usr/sbin/sshd (deleted)"))
+        self.answers = [self._r("-- cursor: s=abc\n"), self._r(out)]
+        self._lines()
+        with mock.patch.object(self.s, "sshd_exes_filter",
+                               lambda: ["/usr/sbin/sshd", "/usr/lib/openssh/sshd-session", "/usr/sbin/sshd (deleted)"]):
+            got = self._lines()
+        self.assertEqual(got, ["Failed password for root from 198.51.100.4 port 2 ssh2",
+                               "Accepted publickey for ana from 10.0.0.5 port 3 ssh2",
+                               "Connection closed by 198.51.100.4 port 4"])
+
+    def test_a_message_that_is_not_utf8_is_still_read(self):
+        raw = json.dumps({"MESSAGE": list(b"Failed password for x\xff from 1.2.3.4 port 1 ssh2"), "_EXE": "/usr/sbin/sshd"})
+        self.answers = [self._r("-- cursor: s=abc\n"), self._r(raw + "\n")]
+        self._lines()
+        self.assertEqual(len(self._lines()), 1)
 
     def test_having_no_entries_is_not_an_error(self):
         self.answers = [self._r("", rc=1)]  # según la versión, journalctl acaba en 1 si no hay nada
