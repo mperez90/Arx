@@ -203,7 +203,7 @@ class IdleBudgetTests(_Sweeps):
         for i in range(40):
             self.sweep(i * STEP)
         self.assertEqual(self.fake.count("nft", "list", "tables"), 40)  # una por barrido, compartida
-        whole = self.fake.count("nft", "list", "table", "inet", "arx")
+        whole = self.fake.count("nft", "-t", "list", "table", "inet", "arx")
         self.assertLessEqual(whole, 2 * 5, whole)  # al empezar y cada 300 s (la estructura de Arx y la de la pista)
 
     def test_what_is_learned_is_read_every_five_minutes_and_the_sweep_still_sees_what_it_must_each_time(self):
@@ -212,6 +212,29 @@ class IdleBudgetTests(_Sweeps):
         self.assertLessEqual(self.fake.reads("seen4"), 5)
         self.assertGreaterEqual(self.fake.reads("seen4"), 4)
         self.assertEqual(self.fake.reads("denied4"), 0)  # sin --enforce no hay cortes que leer
+
+    def test_the_structure_is_never_listed_with_its_elements(self):
+        """Piloto A: `nft list table` con los elementos costaba 2,3 s de CPU (nft resuelve cada cgroup recorriendo
+        /sys/fs/cgroup); la estructura no los necesita: `-t`."""
+        for i in range(40):
+            self.sweep(i * STEP)
+        self.assertEqual(self.fake.count("nft", "list", "table", "inet", "arx"), 0)
+        self.assertGreater(self.fake.count("nft", "-t", "list", "table", "inet", "arx"), 0)
+
+    def test_what_is_learned_is_removed_from_the_kernel_once_read(self):
+        """Piloto A: `seen` guardaba un día entero (283 elementos, 2,7 s de CPU cada lectura). Lo leído se quita: la
+        lectura siguiente solo trae lo de su ventana, y lo que vuelve a abrirse se cuenta otra vez."""
+        self.sweep(0)
+        self.fake.sets["seen4"].append(self.elem("app", "203.0.113.7", 8443))
+        for i in range(1, 12):
+            self.sweep(i * STEP)
+        self.assertEqual(self.fake.sets["seen4"], [])
+        n1 = self.subject("app")["dest"]["tcp|203.0.113.0/24|8443"]["n"]
+        self.assertEqual(n1, 1)  # leído una vez, no una vez por lectura durante un día
+        self.fake.sets["seen4"].append(self.elem("app", "203.0.113.7", 8443))  # la vuelve a abrir
+        for i in range(12, 24):
+            self.sweep(i * STEP)
+        self.assertEqual(self.subject("app")["dest"]["tcp|203.0.113.0/24|8443"]["n"], 2)
 
     def test_a_new_destination_is_learned_within_five_minutes(self):
         self.sweep(0)
@@ -644,25 +667,25 @@ class MemoTests(unittest.TestCase):
 class TrackingTests(_Sweeps):
     def test_the_structure_is_checked_whole_every_five_minutes_and_at_once_if_the_table_is_gone(self):
         self.sweep(0)
-        whole = self.fake.count("nft", "list", "table", "inet", "arx")
+        whole = self.fake.count("nft", "-t", "list", "table", "inet", "arx")
         for i in range(1, 9):  # hasta el segundo 240
             self.sweep(i * STEP)
-        self.assertEqual(self.fake.count("nft", "list", "table", "inet", "arx"), whole)
+        self.assertEqual(self.fake.count("nft", "-t", "list", "table", "inet", "arx"), whole)
         self.fake.table = False
         self.sweep(9 * STEP)
-        self.assertGreater(self.fake.count("nft", "list", "table", "inet", "arx"), whole)
+        self.assertGreater(self.fake.count("nft", "-t", "list", "table", "inet", "arx"), whole)
         self.assertEqual(self.r.tracking_epoch(), 1)
         self.assertTrue(self.fake.table)
 
     def test_the_whole_structure_is_looked_at_again_after_five_minutes(self):
         self.sweep(0)
-        whole = self.fake.count("nft", "list", "table", "inet", "arx")
+        whole = self.fake.count("nft", "-t", "list", "table", "inet", "arx")
         for t, expect_more in ((120, False), (330, True)):  # solo `ensure_nft_tracking`: sin la pista del perfil
             self.now[0] = 1000.0 + t
             self.sc.begin_sweep()
             self.r.ensure_nft_tracking()
             self.sc.end_sweep()
-            now_whole = self.fake.count("nft", "list", "table", "inet", "arx")
+            now_whole = self.fake.count("nft", "-t", "list", "table", "inet", "arx")
             self.assertEqual(now_whole > whole, expect_more, t)
             whole = now_whole
 
@@ -683,9 +706,9 @@ class TrackingTests(_Sweeps):
     def test_an_action_path_never_takes_the_cheap_answer(self):
         """Bloquear una IP comprueba la estructura entera, como siempre: la ventana es solo del barrido."""
         self.sweep(0)
-        before = self.fake.count("nft", "list", "table", "inet", "arx")
+        before = self.fake.count("nft", "-t", "list", "table", "inet", "arx")
         self.r._nft_setup()
-        self.assertEqual(self.fake.count("nft", "list", "table", "inet", "arx"), before + 1)
+        self.assertEqual(self.fake.count("nft", "-t", "list", "table", "inet", "arx"), before + 1)
 
     def test_an_unreadable_table_is_not_taken_for_a_healthy_one(self):
         with mock.patch.object(self.r.subprocess, "run", side_effect=OSError("no nft")):

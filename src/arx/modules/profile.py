@@ -180,7 +180,7 @@ def _nft_raw(*args: str) -> str | None:
 def _nft_out(*args: str) -> str:
     """La salida de `nft`, «» si falla. `list set` y `list table` se leen una vez por barrido: cada lectura de un set
     con elementos de cgroup cuesta CPU en proporción a sus elementos, y la tabla los lleva todos."""
-    if args[:2] in (("list", "set"), ("list", "table")):
+    if args[:2] in (("list", "set"), ("list", "table")) or args[:3] == ("-t", "list", "table"):
         return sweepcache.memo(("nft", *args), lambda: _nft_raw(*args)) or ""
     return _nft_raw(*args) or ""
 
@@ -216,7 +216,9 @@ def setup() -> bool:
 def _setup_structure(response) -> bool:
     if not response._nft_setup():
         return False
-    listing = _nft_out("list", "table", "inet", "arx")
+    # -t: sin elementos. La estructura no los necesita, y con ellos listar la tabla costaba 2,3 s de CPU en un VPS
+    # con 280 destinos aprendidos (nft resuelve cada cgroup recorriendo /sys/fs/cgroup; piloto A)
+    listing = _nft_out("-t", "list", "table", "inet", "arx")
     output = response._nft_chain(listing, "output")
     cmds = []
     for fam, addr in (("4", "ip"), ("6", "ip6")):
@@ -994,7 +996,11 @@ def sweep(enforce: bool = False, cfg: dict | None = None, now: datetime | None =
         learn_now = bool(fresh) or _cadence.pop("seen_now", None) is not None
         for fam in (("4", "6") if learn_now or _due("seen", SEEN_EVERY_S, now) else ()):
             _cadence["seen"] = now.timestamp()
-            for cg, proto, ip, port in _elements(f"seen{fam}"):
+            seen = _elements(f"seen{fam}")
+            # lo leído se quita: el conjunto guarda solo lo de la última ventana, no un día entero. Cada elemento
+            # cuesta ~8 ms de CPU al listarlo (piloto A: 283 elementos, 2,7 s cada 5 min, y creciendo)
+            _forget_read(f"seen{fam}", seen)
+            for cg, proto, ip, port in seen:
                 s = subjects.get(cg)
                 if not s:
                     continue

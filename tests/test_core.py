@@ -2282,8 +2282,9 @@ class NftOwnTableTests(unittest.TestCase):
 
             class R:
                 stderr = ""
-                stdout = test.listing if argv[:3] == ["nft", "list", "table"] else ""
-                returncode = test.rc if argv[:3] == ["nft", "list", "table"] else 0
+                table = argv[:3] == ["nft", "list", "table"] or argv[:4] == ["nft", "-t", "list", "table"]
+                stdout = test.listing if table else ""
+                returncode = test.rc if table else 0
             return R()
         p = mock.patch.object(response.subprocess, "run", fake_run)
         p.start()
@@ -2291,7 +2292,7 @@ class NftOwnTableTests(unittest.TestCase):
 
     def test_only_its_own_table_is_read(self):
         self.r._nft_setup()
-        self.assertEqual(self.calls[0], "nft list table inet arx")
+        self.assertEqual(self.calls[0], "nft -t list table inet arx")  # la estructura, sin los elementos
         self.assertFalse(any("list ruleset" in c for c in self.calls))
 
     def test_everything_is_created_when_the_table_is_missing(self):

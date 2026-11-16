@@ -197,7 +197,7 @@ def sync(paths: list[str], signature) -> None:
     if signature == _state["rules"]:
         return
     try:
-        listing = subprocess.run(["nft", "list", "table", "inet", "arx"], capture_output=True, text=True,
+        listing = subprocess.run(["nft", "-t", "list", "table", "inet", "arx"], capture_output=True, text=True,
                                  timeout=15).stdout or ""
         if f"chain {CHAIN} " not in listing:
             subprocess.run(["nft", "add", "chain", "inet", "arx", CHAIN], capture_output=True, timeout=15)

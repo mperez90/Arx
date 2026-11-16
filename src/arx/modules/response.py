@@ -1772,18 +1772,20 @@ def _nft_chain(listing: str, name: str) -> str:
 
 
 def _table_listing() -> str | None:
-    """`nft list table inet arx`, la tabla entera: «» si no existe, None si nft no contesta. Dentro de un barrido se
-    lee una vez (lleva todos los sets, y los de cgroup cuestan CPU por elemento); en una acción, siempre de nuevo."""
+    """`nft -t list table inet arx`: la estructura (sets, cadenas, reglas) sin elementos, que nadie de aquí lee y que
+    en los sets de cgroup cuestan CPU por elemento (piloto A: 2,3 s con ellos, 0,07 s sin ellos). «» si no existe,
+    None si nft no contesta. Dentro de un barrido se lee una vez; en una acción, siempre de nuevo."""
     from arx.modules import sweepcache
 
     def read() -> str | None:
         try:
-            r = subprocess.run(["nft", "list", "table", "inet", "arx"], capture_output=True, text=True, timeout=15)
+            r = subprocess.run(["nft", "-t", "list", "table", "inet", "arx"], capture_output=True, text=True,
+                               timeout=15)
         except (OSError, subprocess.TimeoutExpired):
             return None
         return (r.stdout or "") if r.returncode == 0 else ""
 
-    return sweepcache.memo(("nft", "list", "table", "inet", "arx"), read)
+    return sweepcache.memo(("nft", "-t", "list", "table", "inet", "arx"), read)
 
 
 def _nft_setup() -> bool:
@@ -2170,7 +2172,7 @@ def _allow_set(level: int, fam: int) -> str:
 def _ensure_allow_sets(level: int) -> bool:
     """Sets de excepciones y su regla, ANTES del corte (se inserta al principio de la cadena)."""
     try:
-        listing = subprocess.run(["nft", "list", "table", "inet", "arx"], capture_output=True, text=True,
+        listing = subprocess.run(["nft", "-t", "list", "table", "inet", "arx"], capture_output=True, text=True,
                                  timeout=15).stdout or ""
     except (OSError, subprocess.TimeoutExpired):
         return False
