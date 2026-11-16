@@ -3160,7 +3160,7 @@ class LoginSensorTests(unittest.TestCase):
         with mock.patch.object(self.s, "JOURNAL_SOCKET", sock), \
                 mock.patch.object(self.s.shutil, "which", lambda n: "/usr/bin/" + n), \
                 mock.patch.object(self.s.recon, "_run", lambda argv, timeout=30: None):  # journal sin respuesta
-            self.assertEqual(self.s.accepted_logins(), {"root@203.0.113.66"})  # entonces, el fichero
+            self.assertEqual(self.s.accepted_logins(), set())  # nunca el fichero, que no dice quién escribió
 
     def test_accepted_login_without_terminal_is_seen(self):
         self.s.read_auth_log()
@@ -3187,10 +3187,20 @@ class LoginSensorTests(unittest.TestCase):
     def test_old_baseline_without_the_set_does_not_flood(self):
         self.assertEqual(self.g._new_logins_only([self.s.login_finding("ana@1.2.3.4")], {"sets": {}}), [])
 
-    def test_history_is_learned(self):
+    def test_history_is_learned_only_from_what_sshd_wrote(self):
+        """Sin journald, auth.log no dice quién escribió cada línea (`logger -t sshd`): no se aprende de él (re-REV de
+        Q). Del journal, sí (test_learning_prefers_what_sshd_itself_wrote_in_the_journal)."""
         self._append("sshd[9]: Accepted publickey for ansible from 10.0.0.5 port 5 ssh2")
-        self.assertEqual(self.s.accepted_logins(), {"ansible@10.0.0.5"})
-        with mock.patch.object(self.b, "_login_users", lambda: ["ana"]):
+        self.assertEqual(self.s.accepted_logins(), set())
+        sock = os.path.join(self.d, "journal.socket")
+        open(sock, "w").close()
+        out = json.dumps({"MESSAGE": "Accepted publickey for ansible from 10.0.0.5 port 5 ssh2",
+                          "_EXE": "/usr/sbin/sshd"}) + "\n"
+        with mock.patch.object(self.b, "_login_users", lambda: ["ana"]), \
+                mock.patch.object(self.s, "JOURNAL_SOCKET", sock), \
+                mock.patch.object(self.s.shutil, "which", lambda n: "/usr/bin/" + n), \
+                mock.patch.object(self.s, "sshd_exes_filter", lambda: ["/usr/sbin/sshd"]), \
+                mock.patch.object(self.s.recon, "_run", lambda argv, timeout=30: out):
             self.b.run()
         self.assertEqual(set(self.b.load()["sets"]["login_users"]), {"ana", "ansible@10.0.0.5"})
 

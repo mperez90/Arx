@@ -573,29 +573,21 @@ def login_finding(item: str) -> dict:
             "fp_key": f"login_users|nuevo en login_users: {item}"}
 
 
-def accepted_logins(path: str | None = None, limit: int = 16 * 1024 * 1024) -> set[str]:
+def accepted_logins() -> set[str]:
     """`cuenta@origen` de los accesos aceptados. Lo usa el aprendizaje: si solo aprendiera de `who`, cada `ssh -T`,
     `scp` o Ansible legítimo saldría como acceso nuevo.
 
-    Con journald, de él y solo de lo que escribió un binario de sshd (`_EXE`), aunque haya auth.log: rsyslog escribe
-    allí lo que le llegue, y un `logger -t sshd` de cualquier usuario metería un «Accepted … for root from <su IP>»
-    que la base sellaría como conocido (HZ#M4-1 de Q). El fichero, solo sin journald."""
-    if path is None and shutil.which("journalctl") and os.path.exists(JOURNAL_SOCKET):
-        text = recon._run(["journalctl", "--no-pager", "-q", "-o", "json", "--since", "-30d", *_SSHD_COMM],
-                          timeout=30)
-        if text is not None:
-            return {f"{m.group(1)}@{m.group(2)}" for line in _sshd_entries(text) if (m := AUTH_OK_RE.match(line))}
-    path = path or next((p for p in AUTH_LOGS if os.path.exists(p)), None)
-    text = ""
-    if path:
-        try:
-            with open(path, "rb") as f:
-                f.seek(max(0, os.fstat(f.fileno()).st_size - limit))
-                text = f.read(limit).decode("utf-8", "replace")
-        except OSError:
-            pass
-    msgs = (_file_sshd_message(line) for line in text.splitlines())
-    return {f"{m.group(1)}@{m.group(2)}" for msg in msgs if msg and (m := AUTH_OK_RE.match(msg))}
+    Solo del journal, y solo de lo que escribió un binario de sshd (`_EXE`): rsyslog escribe en auth.log lo que le
+    llegue, y un `logger -t sshd` de cualquier usuario metería un «Accepted … for root from <su IP>» que la base
+    sellaría como conocido, y los accesos reales desde ahí no avisarían (HZ#M4-1 de Q). Sin journald, o si no
+    contesta, no se aprende de ningún fichero (residual de la re-REV de Q): un `ssh -T` o un `scp` saldrá una vez como
+    acceso nuevo y se acepta con `arx accept`. Avisar de un acceso falso es ruido; sellarlo, un punto ciego."""
+    if not (shutil.which("journalctl") and os.path.exists(JOURNAL_SOCKET)):
+        return set()
+    text = recon._run(["journalctl", "--no-pager", "-q", "-o", "json", "--since", "-30d", *_SSHD_COMM], timeout=30)
+    if text is None:
+        return set()
+    return {f"{m.group(1)}@{m.group(2)}" for line in _sshd_entries(text) if (m := AUTH_OK_RE.match(line))}
 
 
 def detect_uid0_accounts(known=(), accounts: list | None = None) -> list[dict]:
