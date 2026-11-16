@@ -804,6 +804,12 @@ ES = {
         "ℹ Modo OBSERVAR: Arx detecta, registra y alerta, pero no aplica acciones Tier 1.\n  Revisa unos días sus hallazgos (arx status) y, si son fiables, reinstala con:\n  arx service install --enforce\n",
     "✓ Arx installed as a systemd service and started (enable --now).":
         "✓ Arx instalado como servicio systemd y arrancado (enable --now).",
+    "{n} new destinations in one sweep from {units}: beyond {max} the kernel stops noting them in observe mode":
+        "{n} destinos nuevos en un barrido desde {units}: pasados {max}, en observar el kernel deja de anotarlos",
+    "a flood of connections can hide the one that matters":
+        "una avalancha de conexiones puede esconder la que importa",
+    "✓ Arx was already running: restarted with the new unit ({mode}).":
+        "✓ Arx ya estaba en marcha: reiniciado con la unit nueva ({mode}).",
     "Requires Linux + root with systemd. On the server:":
         "Requiere Linux + root con systemd. En el servidor:",
     "✓ Arx service removed.":

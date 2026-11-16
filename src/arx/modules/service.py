@@ -217,12 +217,20 @@ def install(exec_start: str | None = None, enforce: bool = False) -> int:
     Path(REVIVE_UNIT_PATH).write_text(revive_unit_text())
     Path(REVIVE_TIMER_PATH).write_text(revive_timer_text())
     Path(MAINTENANCE_SLICE_PATH).write_text(maintenance_slice_text())
+    # Ya en marcha, `enable --now` no hace nada: seguiría con el modo anterior hasta un reinicio a mano (HZ#11).
+    was_active = subprocess.run(["systemctl", "is-active", "--quiet", "arx"], check=False).returncode == 0
     _seal_units()
     subprocess.run(["systemctl", "daemon-reload"], check=False)
     subprocess.run(["systemctl", "enable", "arx-firewall"], check=False)
     subprocess.run(["systemctl", "enable", "--now", "arx-revive.timer"], check=False)
     r = subprocess.run(["systemctl", "enable", "--now", "arx"], check=False)
-    if r.returncode == 0:
+    if r.returncode == 0 and was_active:
+        r = subprocess.run(["systemctl", "restart", "arx"], check=False)
+        if r.returncode == 0:
+            print(tr("✓ Arx was already running: restarted with the new unit ({mode}).").format(
+                mode="enforce" if enforce else tr("observe")))
+            return 0
+    elif r.returncode == 0:
         print(tr("✓ Arx installed as a systemd service and started (enable --now)."))
         return 0
     print(tr("Unit written, but systemctl failed. Check:  systemctl status arx"))
