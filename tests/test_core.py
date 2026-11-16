@@ -1681,6 +1681,22 @@ class AuditLogTailTests(unittest.TestCase):
         self.assertIn("/usr/bin/cat", got[0]["detail"])
         self.assertIn("/root/.aws/credentials", got[0]["detail"])
 
+    def test_an_identity_change_that_found_nothing_to_change_is_not_an_event(self):
+        """Piloto A: `rm -f` de un /etc/sudoers.d/x que no existía (ENOENT) salía high. Lo que falla por permisos
+        (EPERM de un fichero inmutable) y lo que sí cambia, cuentan."""
+        self.pids()
+        gone = [l.replace("exit=-13", "exit=-2") for l in self.event(700, key="arx_ident", name="/etc/sudoers.d/")]
+        perm = [l.replace("exit=-13", "exit=-1") for l in self.event(701, key="arx_ident", name="/etc/sudoers")]
+        done = [l.replace("success=no exit=-13", "success=yes exit=0") for l in
+                self.event(702, key="arx_ident", name="/etc/passwd")]
+        self.write(gone + perm + done)
+        with mock.patch.object(self.s.shutil, "which", return_value=None):
+            got = self.s.read_auditd_events()
+        self.assertEqual(len(got), 2)
+        self.assertFalse([e for e in got if "sudoers.d/" in e["detail"]])
+        self.assertTrue([e for e in got if "/etc/sudoers " in e["detail"] or e["detail"].endswith("/etc/sudoers")])
+        self.assertTrue([e for e in got if "/etc/passwd" in e["detail"]])
+
     def test_log_file_comes_from_auditd_conf(self):
         conf = os.path.join(os.path.dirname(self.log), "auditd.conf")
         with open(conf, "w", encoding="utf-8") as f:

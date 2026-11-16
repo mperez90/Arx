@@ -492,9 +492,21 @@ def read_denied_opens(lines: list[str] | None = None) -> list[dict]:
     return out[-MAX_EVENTS:]
 
 
+def _nothing_there(ev: list[str]) -> bool:
+    """Una llamada que falló porque no existía lo que tocaba (ENOENT): no cambió nada. Piloto A: `rm -f` de un
+    fichero de /etc/sudoers.d que no existía salía high («root intentó borrar sudoers.d sin éxito»). Un fallo por
+    permisos (EPERM de un fichero inmutable, EACCES) sí cuenta."""
+    for line in ev:
+        if line.startswith("type=SYSCALL"):
+            f = {k: _audit_value(k, v) for k, v in _AUDIT_FIELD.findall(line)}
+            return f.get("success") == "no" and f.get("exit") in ("-2", "ENOENT")
+    return False
+
+
 def read_auditd_events() -> list[dict]:
     events = []
-    for line in _audit_text(_audit_new("arx_ident")[-MAX_EVENTS:]):
+    ident = [ev for ev in _audit_new("arx_ident")[-MAX_EVENTS:] if not _nothing_there(ev)]
+    for line in _audit_text(ident):
         events.append({"sev": "high", "kind": "auditd", "detail": tr("auditd · identity: {line}",
                                                                      line=line)[:400],
                        "fp_key": "auditd|" + f"auditd · identidad: {line}"[:400],
