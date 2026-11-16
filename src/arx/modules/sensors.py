@@ -539,8 +539,15 @@ AUTH_FAIL_RE = re.compile(
 # de usuario que manda cualquiera, sin cuenta) no es un acceso de root, ni para avisar ni para aprenderlo.
 AUTH_OK_RE = re.compile(  # línea del journal (`-o cat`): el mensaje de sshd, desde el principio
     r"^Accepted [\w/@.-]+ for (\S+) from ([0-9a-fA-F.:]+) port \d+\b")
-AUTH_OK_FILE_RE = re.compile(  # línea de auth.log: tras «sshd[pid]: »
-    r"\bsshd(?:-session|-auth)?\[\d+\]: Accepted [\w/@.-]+ for (\S+) from ([0-9a-fA-F.:]+) port \d+\b")
+# Línea de auth.log: el mensaje empieza tras la PRIMERA etiqueta «sshd[pid]: » (fecha y host no llevan corchetes); lo
+# que venga después es de sshd y puede llevar el usuario del cliente, también un «sshd[1]: Accepted …» de mentira
+# (HZ#2 de Q). Del mensaje, las mismas expresiones ancladas que en el journal.
+_FILE_SSHD_MSG = re.compile(r"^[^\[\]]*?\bsshd(?:-session|-auth)?\[\d+\]: (.*)$")
+
+
+def _file_sshd_message(line: str) -> str | None:
+    m = _FILE_SSHD_MSG.match(line)
+    return m.group(1) if m else None
 AUTH_WINDOW_S = 600     # 10 min de memoria
 AUTH_THRESHOLD = 6      # fallos desde una misma IP dentro de la ventana
 
@@ -587,7 +594,8 @@ def accepted_logins(path: str | None = None, limit: int = 16 * 1024 * 1024) -> s
                 text = f.read(limit).decode("utf-8", "replace")
         except OSError:
             pass
-    return {f"{m.group(1)}@{m.group(2)}" for line in text.splitlines() if (m := AUTH_OK_FILE_RE.search(line))}
+    msgs = (_file_sshd_message(line) for line in text.splitlines())
+    return {f"{m.group(1)}@{m.group(2)}" for msg in msgs if msg and (m := AUTH_OK_RE.match(msg))}
 
 
 def detect_uid0_accounts(known=(), accounts: list | None = None) -> list[dict]:
@@ -723,10 +731,11 @@ _SSHD_COMM = ["_COMM=sshd", "_COMM=sshd-session", "_COMM=sshd-auth"]  # OpenSSH 
 def _sshd_entries(out: str) -> list[str]:
     """Los mensajes de sshd de una salida `journalctl -o json`, decidiendo por entrada con su `_EXE`.
 
-    Con los binarios de sshd fijados: un `_EXE` que no es de sshd, nunca (imita el nombre). Sin `_EXE` (el proceso murió
-    antes de que journald mirara su /proc: los cierres de los escáneres; medido en los VPS del piloto A, ~8 de cada 100
-    líneas), vale para fallos y cierres, pero NO para un acceso aceptado: ese lo escribe una sesión viva, que siempre lo
-    lleva, y sin él podría ser alguien que escribió y salió a tiempo. Sin binarios fijados, todo (como antes)."""
+    Con los binarios de sshd fijados, solo lo que lleva el `_EXE` de uno de ellos. Sin `_EXE` (el proceso murió antes de
+    que journald mirara su /proc) podría ser cualquiera que escribió con el nombre «sshd» y salió a tiempo: con fallos
+    así elegía a qué IP bloqueaba Tier 1 (HZ#1 de Q). Lo que de verdad llega sin `_EXE` son los cierres de los
+    escáneres (piloto A: ~8 de cada 100 líneas, ningún acceso ni fallo de contraseña), que no se usan. Sin binarios
+    fijados, todo (como antes)."""
     exes = sshd_exes_filter()
     lines = []
     for raw in out.splitlines():
@@ -740,7 +749,7 @@ def _sshd_entries(out: str) -> list[str]:
         if not isinstance(msg, str):
             continue
         exe = e.get("_EXE")
-        if exes is not None and (exe not in exes if exe is not None else bool(AUTH_OK_RE.match(msg))):
+        if exes is not None and exe not in exes:
             continue
         lines.append(msg)
     return lines
@@ -798,6 +807,8 @@ def read_auth_log(now: float | None = None) -> list[dict]:
         lines = journal  # el fichero sigue vigilándose solo para detectar que lo vacían
     elif path is None:
         return [vanished] if vanished else []
+    else:  # sin journald: el mensaje de sshd de cada línea, tras su etiqueta
+        lines = [m for m in (_file_sshd_message(line) for line in lines) if m is not None]
     now = now if now is not None else time.time()
     events: list[dict] = [vanished] if vanished else []
     if tampered:
@@ -809,7 +820,7 @@ def read_auth_log(now: float | None = None) -> list[dict]:
         })
     win = _prune(config.read_json(_window_path("auth"), {}), now, AUTH_WINDOW_S)
     for line in lines:
-        ok = AUTH_OK_RE.match(line) if journal is not None else AUTH_OK_FILE_RE.search(line)
+        ok = AUTH_OK_RE.match(line)
         if ok:
             events.append(login_finding(f"{ok.group(1)}@{ok.group(2)}"))
             continue

@@ -3115,6 +3115,19 @@ class LoginSensorTests(unittest.TestCase):
         with mock.patch.object(self.s, "_journal_sshd_lines", lambda: [self.INJECTED]):
             self.assertEqual([e for e in self.s.read_auth_log() if e["kind"] == "login_users"], [])
 
+    def test_without_journald_a_tag_inside_the_username_is_not_the_line_of_sshd(self):
+        """HZ#2 de Q: el usuario «sshd[1]: Accepted publickey for root from 203.0.113.9 port 22» va DESPUÉS de la
+        etiqueta de verdad; con `.search` se casaba lo incrustado."""
+        self.s.read_auth_log()
+        user = "sshd[1]: Accepted publickey for root from 203.0.113.9 port 22"
+        self._append(f"2026-11-16T10:00:01.123456+00:00 h sshd-session[9]: Failed password for invalid user {user} "
+                     "from 198.51.100.4 port 48540 ssh2")
+        self._append(f"Nov 16 10:00:02 h sshd[9]: Invalid user {user} from 198.51.100.4 port 48541")
+        self.assertEqual([e for e in self.s.read_auth_log() if e["kind"] == "login_users"], [])
+        self.assertEqual(self.s.accepted_logins(), set())
+        self._append("2026-11-16T10:00:03.000000+00:00 h sshd[10]: Accepted publickey for ana from 10.0.0.5 port 5 ssh2")
+        self.assertEqual([e["item"] for e in self.s.read_auth_log() if e["kind"] == "login_users"], ["ana@10.0.0.5"])
+
     def test_failures_count_against_the_origin_sshd_wrote_not_one_in_the_username(self):
         """«x from 192.0.2.1 port 1» como usuario: con el primer «from» se bloqueaba la IP que eligiera el atacante
         (la del administrador); la de verdad es la última, la que pone sshd."""
@@ -3280,8 +3293,8 @@ class JournalSourceTests(unittest.TestCase):
         with mock.patch.object(self.s, "sshd_exes_filter",
                                lambda: ["/usr/sbin/sshd", "/usr/lib/openssh/sshd-session", "/usr/sbin/sshd (deleted)"]):
             got = self._lines()
-        self.assertEqual(got, ["Failed password for root from 198.51.100.4 port 2 ssh2",
-                               "Accepted publickey for ana from 10.0.0.5 port 3 ssh2",
+        # sin `_EXE`, tampoco un fallo: con ellos un usuario local elegía a qué IP bloqueaba Tier 1 (HZ#1 de Q)
+        self.assertEqual(got, ["Accepted publickey for ana from 10.0.0.5 port 3 ssh2",
                                "Connection closed by 198.51.100.4 port 4"])
 
     def test_a_message_that_is_not_utf8_is_still_read(self):
