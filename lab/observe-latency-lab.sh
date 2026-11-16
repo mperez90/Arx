@@ -63,7 +63,9 @@ sleep 2
 check "el destino contesta desde la VM" v bash -c 'timeout 3 bash -c "echo > /dev/tcp/10.77.0.2/9101"'
 
 step "Arx en observar, con la observación acortada (solo para el lab)"
-v sh -c 'tar czf /root/arx-state-before-latency-lab.tgz /var/lib/arx /etc/arx 2>/dev/null; systemctl stop arx; rm -rf /var/lib/arx/*'
+# también la tabla del kernel: sus conjuntos (1 d) sobreviven al estado de Arx, y un corte de una pasada anterior
+# salía como hallazgo «nuevo» y daba latencia 0,0 s
+v sh -c 'tar czf /root/arx-state-before-latency-lab.tgz /var/lib/arx /etc/arx 2>/dev/null; systemctl stop arx; rm -rf /var/lib/arx/*; nft delete table inet arx 2>/dev/null; true'
 v bash -c 'arx recon >/dev/null; arx learn >/dev/null; arx learn >/dev/null; arx learn --seal >/dev/null'
 v python3 -c "import json; p = '/etc/arx/config.json'; c = json.load(open(p)); c.update(profile_observe_days=0.003, profile_jitter_days=0); json.dump(c, open(p, 'w'))"
 v systemctl enable --now arxlat >/dev/null 2>&1
@@ -90,6 +92,7 @@ check "y no cortan: ninguna regla de lo nuevo lleva drop" v sh -c '! nft list ta
 measure() {  # $1 = puerto nuevo; imprime «latencia_s» o «none»
   v python3 - "$1" <<'PY'
 import json, os, sys, time
+from datetime import datetime
 port = sys.argv[1]
 t0 = time.time()
 open("/run/arxlat.ports", "a").write(port + "\n")       # el servicio empieza a abrir un destino que no conoce
@@ -99,7 +102,11 @@ while time.time() < end:
         with open("/var/lib/arx/incidents.jsonl") as f:
             for line in f:
                 e = json.loads(line)
-                if e.get("finding_kind") == "egress_profile" and f"10.77.0.2:{port}" in str(e.get("detail")):
+                try:  # solo lo de esta medición (resolución de 1 s en `at`)
+                    fresh = datetime.fromisoformat(e.get("at")).timestamp() >= int(t0)
+                except (TypeError, ValueError):
+                    fresh = False
+                if fresh and e.get("finding_kind") == "egress_profile" and f"10.77.0.2:{port}" in str(e.get("detail")):
                     print(f"{max(0.0, time.time() - t0):.1f}")
                     sys.exit(0)
     except (OSError, ValueError):
