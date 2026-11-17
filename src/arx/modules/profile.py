@@ -99,6 +99,7 @@ _SERVICE_PATH_RE = re.compile(r"^(?:[A-Za-z0-9@_.:\\-]+/)*system\.slice/[A-Za-z0
 _EXEC_FREE = re.compile(r"^(?:cron|crond|anacron|atd|ssh|sshd|getty@[\w-]*|serial-getty@[\w-]*)\.service$")
 _PATH_RE = re.compile(r"^system\.slice/[A-Za-z0-9@_.:\\-]{1,200}\.service$")
 _ELEMENT_RE = re.compile(r'(?:"([^"]+)"|(\d+)) \. (tcp|udp) \. ([0-9a-fA-F.:/]+) \. (\d+)')
+_PORT_ELEMENT_RE = re.compile(r'(?:"([^"]+)"|(\d+)) \. (tcp|udp) \. (\d+)')
 _rng = random.SystemRandom()
 
 
@@ -138,6 +139,8 @@ _pins_epoch: list = [None]       # época de la tabla de nft con la que se compr
 _denied_seen: list = [0]         # cuántos cortes había en el barrido anterior
 _obs_pinned: dict = {}           # servicio → (su cgroup, lo permitido) cuando se cargó en «observar»
 _obs_epoch: list = [None]        # época de la tabla con la que se cargaron
+_ports_pinned: dict = {}         # servicio → su cgroup cuando se cargó en `seen_ports`
+_ports_epoch: list = [None]      # época de la tabla con la que se cargaron
 
 
 def _due(name: str, every: float, now: datetime) -> bool:
@@ -158,6 +161,8 @@ def _reset_cadence() -> None:
     _denied_seen[0] = 0
     _obs_pinned.clear()
     _obs_epoch[0] = None
+    _ports_pinned.clear()
+    _ports_epoch[0] = None
     _setup_state.update(ok_at=None, epoch=None)
 
 
@@ -239,6 +244,17 @@ def _setup_structure(response) -> bool:
     if "set watched2 " not in listing:
         cmds.append(["add", "set", "inet", "arx", "watched2", "{", "typeof", "socket", "cgroupv2",
                      "level", "2;", "}"])
+    # B78-b: un servicio cuyo perfil ya es por puertos (tailscaled: ~200 destinos STUN por ventana) no llena `seen` con
+    # sus IPs, que no sirven de nada y cuestan ~8 ms de CPU por elemento al listarlas: entra en `seen_ports`, la regla de
+    # `seen` lo deja fuera y otra apunta solo (cgroup, protocolo, puerto) en `seenp4/6`.
+    if "set seen_ports " not in listing:
+        cmds.append(["add", "set", "inet", "arx", "seen_ports", "{", "typeof", "socket", "cgroupv2",
+                     "level", "2;", "}"])
+    for fam in ("4", "6"):
+        if f"set seenp{fam} " not in listing:
+            cmds.append(["add", "set", "inet", "arx", f"seenp{fam}", "{", "typeof", "socket", "cgroupv2", "level", "2",
+                         ".", "meta", "l4proto", ".", "th", "dport", ";", "flags", "dynamic,timeout;", "timeout", "1d;",
+                         "size", "65535;", "}"])
     # «Observar» (sin --enforce): lo mismo que corta --enforce, pero solo se anota. `novel4/6` guarda lo que un
     # servicio vigilado abre fuera de lo permitido (sin drop, caduca solo) y se lee en cada barrido, como `denied`:
     # un destino nuevo se ve en ≤ 1 barrido y no en los 300 s de `seen`.
@@ -252,13 +268,19 @@ def _setup_structure(response) -> bool:
                          "flags", "dynamic,timeout;", "timeout", f"{NOVEL_TIMEOUT};", "size", f"{NOVEL_SIZE};", "}"])
     new = ["meta", "oifname", "!=", "lo", "ct", "state", "new", "ct", "direction", "original",
            "meta", "l4proto", "{", "tcp,", "udp", "}"]
+    migrate = []
     for fam, addr in (("4", "ip"), ("6", "ip6")):
         key = ["{", *_KEY, addr, "daddr", ".", "th", "dport", "}"]
-        if f"@seen{fam}" not in output:
-            # solo servicios del sistema: las sesiones de los admins no son asunto de esta pista
-            cmds.append(["add", "rule", "inet", "arx", "output", *new, "meta", "nfproto",
-                         "ipv4" if fam == "4" else "ipv6", "socket", "cgroupv2", "level", "1",
-                         '"system.slice"', "add", f"@seen{fam}", *key])
+        seen_rule, ports_rule = _seen_rules(new, fam, key)
+        old, have_new, have_ports = _seen_rule_state(output, fam)
+        if old:  # la regla de antes, sin la exclusión: existe en toda instalación; se sustituye por su handle, abajo
+            migrate.append((fam, seen_rule, ports_rule, have_new, have_ports))
+        else:
+            if not have_new:
+                # solo servicios del sistema: las sesiones de los admins no son asunto de esta pista
+                cmds.append(["add", "rule", "inet", "arx", "output", *seen_rule])
+            if not have_ports:
+                cmds.append(["add", "rule", "inet", "arx", "output", *ports_rule])
         if f"@ok{fam}" not in output:
             cmds.append(["add", "rule", "inet", "arx", "output", *new, "socket", "cgroupv2", "level",
                          "2", "@watched2", *_KEY, addr, "daddr", ".", "th", "dport", "!=", f"@ok{fam}",
@@ -267,7 +289,56 @@ def _setup_structure(response) -> bool:
             cmds.append(["add", "rule", "inet", "arx", "output", *new, "socket", "cgroupv2", "level",
                          "2", "@watched_obs", *_KEY, addr, "daddr", ".", "th", "dport", "!=", f"@ok{fam}",
                          "add", f"@novel{fam}", *key])
-    return all(_nft(*c) for c in cmds)
+    ok = all(_nft(*c) for c in cmds)
+    return _replace_seen_rules(migrate) if ok and migrate else ok
+
+
+def _seen_rules(new: list, fam: str, key: list) -> tuple[list, list]:
+    """(la regla de `seen`, la de `seenp`) tal como se escriben hoy. La de `seen` deja fuera `@seen_ports`; la otra apunta
+    (cgroup, protocolo, puerto) de lo que SÍ está en él. Ninguna corta nada."""
+    head = [*new, "meta", "nfproto", "ipv4" if fam == "4" else "ipv6", "socket", "cgroupv2", "level", "1",
+            '"system.slice"', "socket", "cgroupv2", "level", "2"]
+    seen = [*head, "!=", "@seen_ports", "add", f"@seen{fam}", *key]
+    ports = [*head, "@seen_ports", "add", f"@seenp{fam}", "{", "socket", "cgroupv2", "level", "2", ".", "meta", "l4proto",
+             ".", "th", "dport", "}"]
+    return seen, ports
+
+
+def _seen_rule_state(output: str, fam: str) -> tuple[bool, bool, bool]:
+    """(hay una regla de `seen` de antes —sin la exclusión—, hay la nueva, hay la de puertos) en la cadena `output`."""
+    rules = output.splitlines()
+    adds = [r for r in rules if re.search(rf"add @seen{fam}\b", r)]
+    return (any("@seen_ports" not in r for r in adds), any("@seen_ports" in r for r in adds),
+            any(f"add @seenp{fam}" in r for r in rules))
+
+
+def _replace_seen_rules(migrate: list) -> bool:
+    """Sustituye, por su handle y solo la de Arx, la regla de `seen` de antes: primero se inserta la nueva (y la de puertos)
+    JUSTO ANTES de la vieja, luego se borra la vieja. En ningún instante el kernel se queda sin regla de aprendizaje, y la
+    nueva ocupa el sitio de la vieja (antes del corte). Idempotente: si la vieja sobrevive a un fallo, la comprobación
+    siguiente solo la borra."""
+    listing = _nft_raw("-a", "list", "chain", "inet", "arx", "output")
+    if not listing:
+        return False
+    ok = True
+    for fam, seen_rule, ports_rule, have_new, have_ports in migrate:
+        olds = [int(m.group(1)) for line in listing.splitlines()
+                if re.search(rf"add @seen{fam}\b", line) and "@seen_ports" not in line
+                and (m := re.search(r"# handle (\d+)", line))]
+        if not olds:
+            continue
+        anchor = str(olds[0])
+        learned = have_new
+        if not have_new:
+            learned = _nft("insert", "rule", "inet", "arx", "output", "position", anchor, *seen_rule)
+        if not have_ports:
+            ok = _nft("insert", "rule", "inet", "arx", "output", "position", anchor, *ports_rule) and ok
+        if learned:  # nunca se borra la vieja sin que la nueva exista
+            for h in olds:
+                ok = _nft("delete", "rule", "inet", "arx", "output", "handle", str(h)) and ok
+        else:
+            ok = False
+    return ok
 
 
 def _elements(set_name: str) -> list[tuple[str, str, str, int]]:
@@ -276,6 +347,12 @@ def _elements(set_name: str) -> list[tuple[str, str, str, int]]:
     for m in _ELEMENT_RE.finditer(_nft_out("list", "set", "inet", "arx", set_name)):
         out.append((m.group(1) or m.group(2), m.group(3), m.group(4), int(m.group(5))))
     return out
+
+
+def _elements_ports(set_name: str) -> list[tuple[str, str, int]]:
+    """(cgroup, protocolo, puerto) de un `seenp`. El cgroup sale como número si ya no existe."""
+    return [(m.group(1) or m.group(2), m.group(3), int(m.group(4)))
+            for m in _PORT_ELEMENT_RE.finditer(_nft_out("list", "set", "inet", "arx", set_name))]
 
 
 def _observe_pin(items: list) -> None:
@@ -296,11 +373,15 @@ def _element_key(cg: str, proto: str, ip: str, port: int) -> str:
     return f'{cg if cg.isdigit() else chr(34) + cg + chr(34)} . {proto} . {ip} . {port}'
 
 
-def _forget_read(set_name: str, found: list) -> None:
+def _port_element_key(cg: str, proto: str, port: int) -> str:
+    return f'{cg if cg.isdigit() else chr(34) + cg + chr(34)} . {proto} . {port}'
+
+
+def _forget_read(set_name: str, found: list, key_of=None) -> None:
     """Quita del conjunto SOLO lo leído: vaciarlo entero borraría sin leer lo que el kernel anotó entre la lectura y
     el vaciado, y una conexión de un disparo no vuelve a anotarse (HZ#1 de Q). Una sola orden; si falla (un elemento
     caducó entretanto), uno a uno."""
-    keys = [_element_key(*e) for e in found]
+    keys = [(key_of or _element_key)(*e) for e in found]
     if not keys or _nft("delete", "element", "inet", "arx", set_name, "{ " + ", ".join(keys) + " }"):
         return
     for k in keys:
@@ -338,6 +419,30 @@ def _watched_members() -> set[str] | None:
     """Los cgroups cargados en `watched2`, de una lectura. None si no se pudo leer (no se recarga nada a ciegas)."""
     listing = _nft_out("list", "set", "inet", "arx", "watched2")
     return set(re.findall(r'"([^"]+)"', listing)) if listing else None
+
+
+def _by_ports(s: dict) -> bool:
+    """¿Su perfil ya es por puertos? En aprendizaje, el mismo criterio que `_mode` (≥ OPEN_DIVERSITY redes) y ninguno otro;
+    ya vigilado, el modo con el que se pasó a vigilar. Sus IPs no sirven de nada: lo aprendido son sus puertos."""
+    if s["status"] == "observing":
+        return _mode(s) == "ports"
+    return s["status"] == "watching" and s.get("mode") == "ports"
+
+
+def _sync_seen_ports(subjects: dict, response) -> None:
+    """Carga en `seen_ports` los servicios por puertos. Un servicio reiniciado tiene otro cgroup y se carga otra vez; una
+    tabla que desapareció y volvió, todos otra vez (como `watched_obs`). UNA orden para los que toquen."""
+    epoch = response.tracking_epoch()
+    if _ports_epoch[0] != epoch:
+        _ports_epoch[0] = epoch
+        _ports_pinned.clear()
+    want = {}
+    for path, s in subjects.items():
+        if _by_ports(s) and _cgroup_exists(path) and (cid := _cgroup_id(path)):
+            want[path] = cid
+    todo = [p for p, cid in want.items() if _ports_pinned.get(p) != cid]
+    if todo and _nft("add", "element", "inet", "arx", "seen_ports", "{ " + ", ".join(f'"{p}"' for p in todo) + " }"):
+        _ports_pinned.update({p: want[p] for p in todo})
 
 
 def _net_of(ip: str) -> str:
@@ -1023,6 +1128,17 @@ def sweep(enforce: bool = False, cfg: dict | None = None, now: datetime | None =
             # lo leído se quita DESPUÉS de procesarlo: el conjunto guarda solo lo de la última ventana, no un día
             # entero. Cada elemento cuesta ~8 ms de CPU al listarlo (piloto A: 283 elementos, 2,7 s cada 5 min)
             _forget_read(f"seen{fam}", seen)
+            # los servicios por puertos (B78-b): cualquier dirección en ese puerto, que es lo que `_allowed` produce en
+            # modo puertos. En vigilancia no hay hallazgo: el corte y el aviso son de `denied` y `novel`.
+            seenp = _elements_ports(f"seenp{fam}")
+            for cg, proto, port in seenp:
+                path = cg if cg in subjects else by_id.get(cg)
+                s = subjects.get(path) if path else None
+                if s and s["status"] == "observing":
+                    d = s["dest"].setdefault(f"{proto}|{'::/0' if fam == '6' else '0.0.0.0/0'}|{port}",
+                                             {"first": _iso(now), "n": 0})
+                    d["last"], d["n"] = _iso(now), d["n"] + 1
+            _forget_read(f"seenp{fam}", seenp, _port_element_key)
         for path, s in subjects.items():
             until = _parse(s.get("observe_until"))
             if s["status"] != "observing" or not until or now < until:
@@ -1055,6 +1171,7 @@ def sweep(enforce: bool = False, cfg: dict | None = None, now: datetime | None =
                 findings += _doc_apply(path, s, {k: tuple(v) for k, v in pending.items()})
                 if s.get("enforced") and _cgroup_exists(path):
                     _pin(path, s)
+        _sync_seen_ports(subjects, response)
         housekeeping = _due("housekeeping", HOUSEKEEPING_EVERY_S, now)
         members = None  # los servicios fijados siguen cargados: una lectura de watched2, no un `get` por servicio
         if enforce and any(x.get("enforced") for x in subjects.values()):
@@ -1566,7 +1683,7 @@ def _cleanup_dead() -> None:
         for cg, proto, net, port in _elements(name):
             if cg.isdigit():
                 _nft("delete", "element", "inet", "arx", name, f"{{ {cg} . {proto} . {net} . {port} }}")
-    for name in ("watched2", "watched_obs"):
+    for name in ("watched2", "watched_obs", "seen_ports"):
         for m in re.finditer(r"(?<![\w\"/.])(\d+)(?=\s*[,}])", _nft_out("list", "set", "inet", "arx", name)):
             _nft("delete", "element", "inet", "arx", name, f"{{ {m.group(1)} }}")
 

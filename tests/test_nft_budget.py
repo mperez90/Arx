@@ -194,10 +194,12 @@ class _Sweeps(unittest.TestCase):
 
 class IdleBudgetTests(_Sweeps):
     def test_an_idle_host_costs_a_couple_of_processes_per_sweep_not_seventeen(self):
-        for i in range(40):  # 20 min
+        self.sweep(0)
+        installed = self.fake.processes()  # la instalación de la estructura (una vez): sets y reglas de Arx
+        for i in range(1, 40):  # 20 min
             self.sweep(i * STEP)
-        per_sweep = self.fake.processes() / 40
-        self.assertLessEqual(per_sweep, 3.0, self.fake.calls[:12])
+        per_sweep = (self.fake.processes() - installed) / 39
+        self.assertLessEqual(per_sweep, 3.0, self.fake.calls[installed:installed + 12])
 
     def test_the_table_is_checked_with_list_tables_and_listed_whole_only_now_and_then(self):
         for i in range(40):
