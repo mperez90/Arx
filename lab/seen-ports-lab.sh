@@ -97,7 +97,7 @@ Description=Arx lab: 300 UDP destinations
 ExecStart=/usr/bin/python3 /usr/local/bin/$SVC.py
 EOF
 systemctl daemon-reload; systemctl start $SVC"
-sleep 25
+for _ in $(seq 18); do [ "$(mine seen4)" -ge 100 ] && break; sleep 5; done  # hasta 90 s: depende de cuándo arranque el servicio
 OLDN=$(mine seen4); OLDMS=$(list_ms seen4)
 echo "  seen4 con OLD: $OLDN elementos del servicio · listar seen4 = ${OLDMS} ms de CPU"
 [ "${OLDN:-0}" -ge 100 ] && pass "OLD llena seen4 con sus destinos ($OLDN)" || fail "el servicio de prueba no llenó seen4 ($OLDN)"
@@ -127,7 +127,8 @@ echo "  seen4 tras NEW: $NEWN elementos del servicio · seenp4: $PN"
 [ "${NEWN:-99}" -le 10 ] && pass "seen4 ≤ 10 elementos del servicio (antes $OLDN)" || fail "seen4 sigue lleno ($NEWN)"
 [ "${PN:-0}" -ge 1 ] && [ "${PN:-9}" -le 3 ] && pass "seenp4 trae sus puertos ($PN ≤ 3)" || fail "seenp4 inesperado ($PN)"
 NEWMS=$(list_ms seen4)
-echo "  listar seen4: ${OLDMS} ms antes → ${NEWMS} ms después"
+echo "  listar seen4: ${OLDMS} ms con ${OLDN} elementos suyos → ${NEWMS} ms con ${NEWN} (en esta VM, con pocos cgroups, listar es barato:"
+echo "  el coste de ~8 ms por elemento del piloto A depende de cuántos cgroups tenga el host; aquí se mide cuántos elementos quedan)"
 
 step "lo aprendido pasa a su perfil como cualquier dirección en ese puerto"
 v systemctl restart arx; sleep 50
@@ -161,6 +162,6 @@ v arx service uninstall >/dev/null 2>&1
 vb 'nft list table inet arx >/dev/null 2>&1' && fail "la tabla de Arx sigue ahí tras desinstalar" || pass "la tabla (sets y reglas incluidos) ya no existe"
 
 echo
-[ "$FAILED" = 0 ] && echo "══ B78-b P1 REAL: regla sustituida sin hueco, seen_ports/seenp funcionan, seen ya no se llena (${OLDN}→${NEWN}); listar seen4 ${OLDMS}→${NEWMS} ms ══" \
+[ "$FAILED" = 0 ] && echo "══ B78-b P1 REAL: regla sustituida sin hueco, seen_ports/seenp funcionan, seen ya no se llena (${OLDN}→${NEWN} elementos del servicio) ══" \
   || echo "══ B78-b P1 REAL: HAY FALLOS (ver [FAIL]) ══"
 exit "$FAILED"

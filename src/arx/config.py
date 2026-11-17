@@ -78,8 +78,24 @@ def read_json(path: Path, default=None):
         return {} if default is None else default
 
 
+# Lo último que ESTE proceso escribió en cada fichero (huella del contenido y firma del fichero tras escribirlo). El barrido
+# reescribía cinco ficheros de estado cada 30 s con fsync aunque nada hubiera cambiado (B78-b, P4): si lo que se va a escribir
+# es lo que ya hay, y el fichero sigue siendo el que dejamos nosotros, no se toca el disco.
+WRITE_MEMORY_MAX = 256
+_last_written: dict[str, tuple[bytes, tuple | None]] = {}
+
+
+def _file_sig(path: Path) -> tuple | None:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+
+
 def write_json(path: Path, data) -> None:
-    """Escritura atómica: temporal 0600 en el mismo dir → fsync → rename."""
+    """Escritura atómica: temporal 0600 en el mismo dir → fsync → rename. Si el contenido es el que este proceso dejó y el
+    fichero no ha cambiado desde entonces (otro proceso, la CLI, pudo tocarlo), no se escribe."""
     path = Path(path)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
     text = json.dumps(data, indent=2, ensure_ascii=False)
@@ -87,6 +103,10 @@ def write_json(path: Path, data) -> None:
         raw = text.encode("utf-8")
     except UnicodeEncodeError:  # ruta no UTF-8 de un atacante: se escapa (ida y vuelta exacta)
         raw = json.dumps(data, indent=2).encode("ascii")
+    key, digest = str(path), hashlib.sha256(raw).digest()
+    prev = _last_written.get(key)
+    if prev is not None and prev[0] == digest and prev[1] is not None and prev[1] == _file_sig(path):
+        return
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         with os.fdopen(fd, "wb") as f:
@@ -98,6 +118,9 @@ def write_json(path: Path, data) -> None:
         with contextlib.suppress(OSError):
             os.unlink(tmp)
         raise
+    if key not in _last_written and len(_last_written) >= WRITE_MEMORY_MAX:
+        _last_written.pop(next(iter(_last_written)))  # acotado: lo más antiguo se olvida y se vuelve a escribir una vez
+    _last_written[key] = (digest, _file_sig(path))
 
 
 @contextlib.contextmanager

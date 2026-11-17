@@ -162,6 +162,7 @@ class _Sweeps(unittest.TestCase):
                 (profile, "_updates", lambda *a, **k: []), (profile, "_exec_events", lambda *a, **k: []),
                 (profile, "_dns_events", lambda *a, **k: []), (profile, "_library_events", lambda *a, **k: []),
                 (profile, "_read_events", lambda *a, **k: []), (profile, "_doc_review_later", lambda *a: None),
+                (response, "_table_by_netlink", lambda: None),  # estos tests cuentan las órdenes de `nft`: sin netlink real
                 (profile, "_cgroup_exists", lambda path: True),
                 (profile, "_cgroup_id", lambda path: self.cgroup_ids.get(path)),
                 (profile, "_pin", lambda path, s: self.pinned.append(path) or True),

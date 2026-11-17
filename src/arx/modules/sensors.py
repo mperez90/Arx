@@ -868,6 +868,10 @@ def _scan_from_nft() -> dict[str, set[int]] | None:
     return hits if found else None
 
 
+SCAN_EVERY_S = 60   # la pista de escaneo del kernel dura 10 min (timeout del set): leerla cada 30 s era el doble de lo útil
+_scan_read: dict = {"at": None, "nft": False}
+
+
 def detect_port_scan(conns: list[dict] | None = None, now: float | None = None,
                      listen_ports: set[int] | None = None) -> list[dict]:
     """Una IP que toca muchos puertos locales distintos en poco tiempo = escaneo.
@@ -878,8 +882,12 @@ def detect_port_scan(conns: list[dict] | None = None, now: float | None = None,
     Nunca señala loopback ni las IPs propias del host.
     """
     now = now if now is not None else time.time()
+    last = _scan_read["at"]
+    if _scan_read["nft"] and last is not None and 0 <= now - last < SCAN_EVERY_S:
+        return []  # lo que el kernel anota dura 10 min: la lectura de hace < 60 s ya lo vio y su aviso salió (se deduplica)
     own = recon.local_ips()
     hits = _scan_from_nft()
+    _scan_read.update(at=now, nft=hits is not None)  # sin nft (o sin tabla aún) no hay pausa: el respaldo corre cada barrido
     if hits is not None:
         events = []
         for ip, ports in sorted(hits.items()):

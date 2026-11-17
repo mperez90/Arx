@@ -198,8 +198,46 @@ def verify_package(pkg: str, root: str | None = None) -> tuple[list[str], list[s
     return (changed, missing) if checked else None
 
 
+# La prueba de integridad (el md5 del fichero contra el `.md5sums` del paquete) de un hallazgo que se repite barrido tras barrido
+# se guarda mientras ni el fichero ni el `.md5sums` cambien: 4,4 ms por hallazgo permanente y barrido (B78-b, P6). Solo lo
+# definitivo (intacto / cambiado): lo que no se pudo probar se vuelve a intentar siempre.
+INTACT_TTL_S = 600
+INTACT_MAX = 512
+_intact_cache: dict[tuple, tuple[float, tuple, bool]] = {}
+
+
+def _file_signature(path: str) -> tuple | None:
+    """Identidad del fichero: inodo, tamaño, mtime y ctime (un `touch -r` devuelve el mtime, no el ctime) y a dónde apunta."""
+    try:
+        st = os.stat(path)
+        return (st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns, os.path.realpath(path))
+    except OSError:
+        return None
+
+
+def _intact_remember(key: tuple, signature: tuple, value: bool) -> None:
+    if key not in _intact_cache and len(_intact_cache) >= INTACT_MAX:
+        _intact_cache.pop(next(iter(_intact_cache)))  # lo más antiguo se olvida y se prueba otra vez
+    _intact_cache[key] = (time.monotonic(), signature, value)
+
+
 def intact(path: str, pkg: str) -> bool | None:
     """¿El fichero es el que instaló dpkg? None si dpkg no guardó su resumen (no se puede probar)."""
+    key = (path, pkg)
+    sums = tuple(_file_signature(f) for f in _md5sums_files(pkg))
+    signature = (_file_signature(path), sums)
+    hit = _intact_cache.get(key)
+    if hit and hit[1] == signature and signature[0] is not None and 0 <= time.monotonic() - hit[0] < INTACT_TTL_S:
+        return hit[2]
+    value = _intact_uncached(path, pkg)
+    if value is not None and signature[0] is not None:
+        _intact_remember(key, signature, value)
+    else:
+        _intact_cache.pop(key, None)
+    return value
+
+
+def _intact_uncached(path: str, pkg: str) -> bool | None:
     wanted = {p.lstrip("/") for p in _variants(path)}
     for s in _md5sums_files(pkg):
         try:

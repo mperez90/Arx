@@ -33,7 +33,9 @@ PROC_CN_MCAST_LISTEN = 1
 PROC_EVENT_EXEC = 0x00000002
 NLMSG_DONE = 3
 MAX_EVENTS = 4000
-ALLOW_REFRESH_S = 60
+# `sshd -T` y la lectura de la configuración de sshd y de PAM cada 15 min por edad (B78-b, P7: cada minuto era ~0,02 % de CPU
+# para no ver nada). Un cambio de lo leído se ve al instante por el sello de cada fichero y directorio (`_changed`).
+ALLOW_REFRESH_S = 900
 SSHD_PIECES = {"sshd", "sshd-session", "sshd-auth"}
 # sshd como servicio, o una instancia por conexión (socket con Accept=yes: Debian 13, por ejemplo)
 SSH_UNIT_RE = re.compile(r"^(?:.+/)?system\.slice/(?:system-sshd?\.slice/sshd?@[^/]+|sshd?)\.service$")

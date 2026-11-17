@@ -39,7 +39,9 @@ import re
 import secrets
 import shutil
 import signal
+import socket
 import stat
+import struct
 import subprocess
 import sys
 import time
@@ -1665,8 +1667,41 @@ STRUCTURE_EVERY_S = 300  # la estructura de la tabla (sets, cadenas, reglas) se 
 _tracking = {"ok_until": 0.0, "epoch": 0}
 
 
+# ¿Existe `table inet arx`? Se le pregunta al kernel por netlink (nf_tables: NFT_MSG_GETTABLE) y no con `nft list tables`:
+# misma respuesta, en el mismo barrido, sin lanzar un proceso (3,7 ms de CPU por barrido; B78-b, P3).
+_NFNL_SUBSYS_NFTABLES, _NFT_MSG_NEWTABLE, _NFT_MSG_GETTABLE = 10, 0, 1
+_NETLINK_NETFILTER, _NLMSG_ERROR, _NLM_F_REQUEST, _NFPROTO_INET, _NFTA_TABLE_NAME = 12, 2, 1, 1, 1
+_AF_NETLINK = getattr(socket, "AF_NETLINK", 16)  # Linux; en otro sistema el socket falla y se usa `nft`
+
+
+def _table_by_netlink() -> bool | None:
+    """True si el kernel tiene la tabla, False si dice que no existe (ENOENT), None si no contesta como se espera (otro
+    error, sin permiso, sin netlink): quien llama usa `nft`."""
+    name = b"arx\0"
+    body = struct.pack("=BBH", _NFPROTO_INET, 0, 0) + struct.pack("=HH", 4 + len(name), _NFTA_TABLE_NAME) + name
+    request = struct.pack("=IHHII", 16 + len(body), (_NFNL_SUBSYS_NFTABLES << 8) | _NFT_MSG_GETTABLE, _NLM_F_REQUEST,
+                          1, 0) + body
+    try:
+        with socket.socket(_AF_NETLINK, socket.SOCK_RAW, _NETLINK_NETFILTER) as sock:
+            sock.settimeout(2)
+            sock.bind((0, 0))
+            sock.send(request)
+            reply = sock.recv(65536)
+    except (OSError, ValueError):
+        return None
+    if len(reply) < 16:
+        return None
+    kind = struct.unpack("=IHHII", reply[:16])[1]
+    if kind == (_NFNL_SUBSYS_NFTABLES << 8) | _NFT_MSG_NEWTABLE:
+        return True
+    if kind == _NLMSG_ERROR and len(reply) >= 20 and struct.unpack("=i", reply[16:20])[0] == -2:  # ENOENT
+        return False
+    return None
+
+
 def _arx_table_present() -> bool | None:
-    """¿Existe la tabla de Arx? `nft list tables` cuesta ~4 ms; listar la tabla entera, ~170 ms. None si no se sabe."""
+    """¿Existe la tabla de Arx? Por netlink (sin proceso); si el kernel no contesta como se espera, `nft list tables`
+    (~4 ms). None si no se sabe. Dentro de un barrido se pregunta una vez."""
     from arx.modules import sweepcache
 
     def tables() -> str | None:
@@ -1676,8 +1711,14 @@ def _arx_table_present() -> bool | None:
             return None
         return r.stdout if r.returncode == 0 else None
 
-    out = sweepcache.memo(("nft", "tables"), tables)
-    return None if out is None else "table inet arx" in out
+    def probe() -> bool | None:
+        asked = _table_by_netlink()
+        if asked is not None:
+            return asked
+        out = tables()
+        return None if out is None else "table inet arx" in out
+
+    return sweepcache.memo(("nft", "tables"), probe)
 
 
 def tracking_epoch() -> int:
