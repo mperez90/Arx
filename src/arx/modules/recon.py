@@ -13,6 +13,7 @@ from __future__ import annotations
 import glob
 import os
 import platform
+import re
 import shutil
 import socket
 import subprocess
@@ -200,10 +201,60 @@ def collect_ports() -> list[dict]:
     return [dict(p) for p in ports or []]
 
 
+_NET_FILES = {"tcp": "/proc/net/tcp", "tcp6": "/proc/net/tcp6", "udp": "/proc/net/udp", "udp6": "/proc/net/udp6"}
+# `ss -tulpnH` (un proceso que recorre /proc/*/fd: ~6 ms de CPU por barrido) solo hace falta si cambió lo que escucha. La firma
+# son los sockets en escucha de /proc/net con su inodo; mientras sea la misma, la salida de `ss` de antes sigue valiendo, con
+# tres cortafuegos: 5 min como mucho, un proceso que nombra y ya no existe (un worker que se reinicia), y cualquier duda sobre
+# /proc/net. Un puerto nuevo, o uno que cambia de dueño, cambia el inodo y la firma: se pregunta al instante (B78-b, P2).
+PORTS_REFRESH_S = 300
+_ports_cache: dict = {}
+
+
+def _pid_alive(pid: int) -> bool:
+    return os.path.exists(f"/proc/{pid}")
+
+
+def _listen_signature() -> frozenset | None:
+    """{(tipo, dirección local, inodo)} de los sockets en escucha (TCP LISTEN, UDP sin conectar); None si /proc/net no se
+    puede leer entero (tcp y udp: tcp6 y udp6 pueden no existir sin IPv6)."""
+    entries = set()
+    for kind, wanted in (("tcp", "0A"), ("tcp6", "0A"), ("udp", "07"), ("udp6", "07")):
+        try:
+            text = Path(_NET_FILES[kind]).read_text()
+        except OSError:
+            if kind in ("tcp", "udp"):
+                return None
+            continue
+        for line in text.splitlines()[1:]:
+            f = line.split()
+            if len(f) > 9 and f[3] == wanted:
+                entries.add((kind, f[1], f[9]))
+    return frozenset(entries)
+
+
+def count_established() -> int | None:
+    """Conexiones TCP establecidas (IPv4 e IPv6) de /proc/net, lo que cuenta `ss -tan state established`; None si no se puede."""
+    total = 0
+    for kind in ("tcp", "tcp6"):
+        try:
+            text = Path(_NET_FILES[kind]).read_text()
+        except OSError:
+            if kind == "tcp":
+                return None
+            continue
+        total += sum(1 for line in text.splitlines()[1:] if len(line.split()) > 3 and line.split()[3] == "01")
+    return total
+
+
 def _collect_ports() -> list[dict] | None:
+    sig, now = _listen_signature(), time.monotonic()  # la firma, ANTES de preguntar: un cambio durante `ss` se ve en la vez siguiente
+    hit = _ports_cache.get("v")
+    if sig is not None and hit and hit["sig"] == sig and 0 <= now - hit["at"] < PORTS_REFRESH_S \
+            and all(_pid_alive(p) for p in hit["pids"]):
+        return [dict(p) for p in hit["ports"]]
     out = _run(["ss", "-tulpnH"]) or _run(["ss", "-tulpn"])
     if not out:
-        return _collect_ports_procfs()  # sin ss no significa sin sensor
+        return _collect_ports_procfs()  # sin ss no significa sin sensor (y lo del respaldo nunca se guarda)
     ports: list[dict] = []
     for line in out.splitlines():
         f = line.split()
@@ -219,10 +270,46 @@ def _collect_ports() -> list[dict] | None:
                 "process": proc,
             }
         )
+    if sig is not None:
+        _ports_cache["v"] = {"sig": sig, "at": now, "ports": [dict(p) for p in ports],
+                             "pids": sorted({int(m) for p in ports for m in re.findall(r"pid=(\d+)", p["process"])})}
     return ports
 
 
+CGROUP_ROOT = "/sys/fs/cgroup"
+
+
+def _services_from_cgroups() -> list[str] | None:
+    """Los servicios en marcha según la jerarquía cgroup v2: cada `*.service` con procesos, en cualquier slice (también las
+    instancias de `system-getty.slice` o el `user@1000.service`), sin descender dentro de un servicio ni de un scope.
+    None si esto no es cgroup v2 o no se puede leer."""
+    if not os.path.exists(os.path.join(CGROUP_ROOT, "cgroup.controllers")):
+        return None
+    found, stack = set(), [CGROUP_ROOT]
+    while stack:
+        try:
+            with os.scandir(stack.pop()) as entries:
+                for e in entries:
+                    if not e.is_dir(follow_symlinks=False) or e.name.endswith(".scope"):
+                        continue
+                    if e.name.endswith(".service"):
+                        try:
+                            with open(os.path.join(e.path, "cgroup.procs"), "rb") as f:
+                                if f.read(1):
+                                    found.add(e.name)
+                        except OSError:
+                            pass
+                    else:
+                        stack.append(e.path)  # un slice
+        except OSError:
+            return None
+    return sorted(found)
+
+
 def collect_services() -> list[str] | None:
+    from_cgroups = _services_from_cgroups()
+    if from_cgroups is not None:
+        return from_cgroups
     out = _run(
         ["systemctl", "list-units", "--type=service", "--state=running",
          "--no-legend", "--no-pager"]

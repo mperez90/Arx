@@ -466,6 +466,21 @@ class IntactCacheTests(unittest.TestCase):
         self.v.intact(link, "tool")
         self.assertEqual(len(self.hashed), 2)
 
+    def test_two_links_to_one_file_are_two_different_files_to_check(self):
+        """Dos rutas al mismo inodo tienen la misma firma de fichero: el destino del enlace las distingue."""
+        a, b = os.path.join(self.d, "usr", "bin", "a"), os.path.join(self.d, "usr", "bin", "b")
+        os.link(self.exe, a)
+        os.link(self.exe, b)
+        link = os.path.join(self.d, "usr", "bin", "link")
+        with open(self.md5, "a") as f:
+            f.write(f"{'0' * 32}  {link.lstrip('/')}\n")
+        os.symlink(a, link)
+        self.v.intact(link, "tool")
+        os.unlink(link)
+        os.symlink(b, link)  # mismo inodo, otra ruta
+        self.v.intact(link, "tool")
+        self.assertEqual(len(self.hashed), 2)
+
     def test_the_package_checksum_file_changing_makes_it_checked_again(self):
         self.assertIs(self.v.intact(self.exe, "tool"), True)
         self._sums("0" * 32)  # el paquete se actualizó: otro resumen
@@ -493,6 +508,373 @@ class IntactCacheTests(unittest.TestCase):
         for i in range(self.v.INTACT_MAX + 30):
             self.v._intact_remember((f"/x/{i}", "tool"), (i,), True)
         self.assertLessEqual(len(self.v._intact_cache), self.v.INTACT_MAX)
+
+
+class SystemdPathsCacheTests(unittest.TestCase):
+    """P5a · la lista de unidades de systemd (4 mil listados de directorio por barrido) se guarda mientras ningún directorio
+    cambie: la firma son sus inodos y fechas (mtime y ctime). Una unidad, un drop-in o un enlace nuevos se ven en la
+    llamada siguiente, no a los 5 min."""
+
+    def setUp(self):
+        _isolate()
+        from arx.modules import integrity
+        self.i = integrity
+        self.d = tempfile.mkdtemp()
+        self.sys = os.path.join(self.d, "system")
+        self.gen = os.path.join(self.d, "generators")
+        os.makedirs(self.sys)
+        os.makedirs(self.gen)
+        self.now = [100.0]
+        for obj, name, value in ((integrity, "_SYSTEMD_DIRS", (self.sys,)), (integrity, "_GENERATOR_DIRS", (self.gen,)),
+                                 (integrity.time, "monotonic", lambda: self.now[0])):
+            patch = mock.patch.object(obj, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+        integrity.clear_cache()
+        self.addCleanup(integrity.clear_cache)
+        self.globs = []
+        real = integrity.glob.glob
+
+        def counting(pattern, **kw):
+            self.globs.append(pattern)
+            return real(pattern, **kw)
+        patch = mock.patch.object(integrity.glob, "glob", counting)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def touch(self, *parts):
+        path = os.path.join(self.sys, *parts)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        open(path, "w").write("[Service]\n")
+        return path
+
+    def test_the_same_tree_is_listed_once(self):
+        self.touch("a.service")
+        first = self.i._systemd_paths()
+        listed = len(self.globs)
+        for _ in range(5):
+            self.assertEqual(self.i._systemd_paths(), first)
+        self.assertEqual(len(self.globs), listed)
+
+    def test_a_new_unit_is_seen_at_once(self):
+        self.touch("a.service")
+        self.i._systemd_paths()
+        new = self.touch("evil.service")
+        self.assertIn(new, self.i._systemd_paths())
+
+    def test_a_new_drop_in_in_an_existing_directory_is_seen_at_once(self):
+        self.touch("a.service")
+        self.touch("a.service.d", "10-x.conf")
+        self.i._systemd_paths()
+        new = self.touch("a.service.d", "99-evil.conf")
+        self.assertIn(new, self.i._systemd_paths())
+
+    def test_a_new_drop_in_directory_is_seen_at_once(self):
+        self.touch("a.service")
+        self.i._systemd_paths()
+        new = self.touch("b.service.d", "99-evil.conf")
+        self.assertIn(new, self.i._systemd_paths())
+
+    def test_a_new_wants_link_is_seen_at_once(self):
+        self.touch("a.service")
+        os.makedirs(os.path.join(self.sys, "multi-user.target.wants"))
+        self.i._systemd_paths()
+        link = os.path.join(self.sys, "multi-user.target.wants", "a.service")
+        os.symlink(os.path.join(self.sys, "a.service"), link)
+        self.assertIn(link, self.i._systemd_paths())
+
+    def test_a_new_generator_is_seen_at_once(self):
+        self.i._systemd_paths()
+        gen = os.path.join(self.gen, "evil-generator")
+        open(gen, "w").write("#!/bin/sh\n")
+        self.assertIn(gen, self.i._systemd_paths())
+
+    def test_a_removed_unit_is_gone_at_once(self):
+        gone = self.touch("a.service")
+        self.i._systemd_paths()
+        os.unlink(gone)
+        self.assertNotIn(gone, self.i._systemd_paths())
+
+    def test_a_directory_whose_mtime_was_put_back_is_still_noticed_by_its_ctime(self):
+        self.touch("a.service")
+        self.i._systemd_paths()
+        before = os.stat(self.sys)
+        new = self.touch("evil.service")
+        os.utime(self.sys, ns=(before.st_atime_ns, before.st_mtime_ns))  # `touch -r`
+        self.assertIn(new, self.i._systemd_paths())
+
+    def test_it_is_listed_again_after_five_minutes_anyway(self):
+        self.touch("a.service")
+        self.i._systemd_paths()
+        listed = len(self.globs)
+        self.now[0] += self.i.SYSTEMD_LIST_TTL_S + 1
+        self.i._systemd_paths()
+        self.assertGreater(len(self.globs), listed)
+
+    def test_another_set_of_directories_is_never_served_from_the_cache(self):
+        self.touch("a.service")
+        self.i._systemd_paths()
+        other = tempfile.mkdtemp()
+        with mock.patch.object(self.i, "_SYSTEMD_DIRS", (other,)):
+            self.assertEqual(self.i._systemd_paths(), [])
+
+    def test_the_caller_cannot_poison_the_cache(self):
+        self.touch("a.service")
+        self.i._systemd_paths().append("/etc/evil")       # lo que devuelve al reconstruir
+        self.i._systemd_paths().append("/etc/evil2")      # lo que devuelve desde la caché
+        paths = self.i._systemd_paths()
+        self.assertNotIn("/etc/evil", paths)
+        self.assertNotIn("/etc/evil2", paths)
+
+
+class ServicesFromCgroupsTests(unittest.TestCase):
+    """P5a · los servicios en marcha salen de /sys/fs/cgroup, sin `systemctl list-units` (un proceso y trabajo para PID 1)."""
+
+    def setUp(self):
+        _isolate()
+        from arx.modules import recon
+        self.r = recon
+        self.root = tempfile.mkdtemp()
+        open(os.path.join(self.root, "cgroup.controllers"), "w").write("cpu memory\n")
+        self.ran = []
+        for obj, name, value in ((recon, "CGROUP_ROOT", self.root),
+                                 (recon, "_run", lambda args, **k: self.ran.append(list(args)) or None)):
+            patch = mock.patch.object(obj, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def service(self, *parts, procs="1\n"):
+        path = os.path.join(self.root, *parts)
+        os.makedirs(path, exist_ok=True)
+        open(os.path.join(path, "cgroup.procs"), "w").write(procs)
+
+    def test_running_services_are_found_in_the_system_slice(self):
+        self.service("system.slice", "ssh.service")
+        self.service("system.slice", "cron.service")
+        self.assertEqual(self.r.collect_services(), ["cron.service", "ssh.service"])
+        self.assertEqual(self.ran, [])  # sin lanzar nada
+
+    def test_instances_in_their_own_slices_and_user_managers_count_like_in_list_units(self):
+        self.service("system.slice", "system-getty.slice", "getty@tty1.service")
+        self.service("system.slice", "system-sshd.slice", "sshd@1-a.service")
+        self.service("user.slice", "user-1000.slice", "user@1000.service")
+        self.assertEqual(self.r.collect_services(), ["getty@tty1.service", "sshd@1-a.service", "user@1000.service"])
+
+    def test_a_service_without_processes_is_not_running(self):
+        self.service("system.slice", "ssh.service")
+        self.service("system.slice", "oneshot.service", procs="")
+        self.assertEqual(self.r.collect_services(), ["ssh.service"])
+
+    def test_what_a_service_runs_inside_is_not_another_service(self):
+        self.service("system.slice", "docker.service")
+        self.service("system.slice", "docker.service", "sub", "inner.service")
+        self.assertEqual(self.r.collect_services(), ["docker.service"])
+
+    def test_scopes_and_the_user_sessions_are_not_services(self):
+        self.service("system.slice", "ssh.service")
+        self.service("system.slice", "docker-abc.scope")
+        self.service("system.slice", "docker-abc.scope", "x.service")
+        self.service("user.slice", "user-1000.slice", "session-3.scope")
+        self.service("init.scope")
+        self.assertEqual(self.r.collect_services(), ["ssh.service"])
+
+    def test_without_cgroup_v2_it_asks_systemd_as_before(self):
+        os.unlink(os.path.join(self.root, "cgroup.controllers"))
+        self.assertIsNone(self.r.collect_services())  # el `_run` de la prueba devuelve None
+        self.assertEqual(self.ran[0][:2], ["systemctl", "list-units"])
+
+    def test_an_unreadable_hierarchy_asks_systemd_as_before(self):
+        with mock.patch.object(self.r, "CGROUP_ROOT", os.path.join(self.root, "nope")):
+            self.r.collect_services()
+        self.assertEqual(self.ran[0][:2], ["systemctl", "list-units"])
+
+
+def _net_line(i, local, state, inode):
+    return f"{i:4d}: {local} 00000000:0000 {state} 00000000:00000000 00:00000000 00000000     0        0 {inode} 1 0 100 0 0 10 0"
+
+
+class ListeningPortsCacheTests(unittest.TestCase):
+    """P2 · `ss -tulpnH` solo cuando cambia lo que escucha: la firma sale de /proc/net/{tcp,tcp6,udp,udp6} (sockets en escucha
+    con su inodo) y la salida de `ss` se guarda mientras no cambie, hasta 5 min y mientras sigan vivos los procesos que
+    nombra. Así la paridad con `ss -p` es la de `ss` mismo."""
+
+    HEADER = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
+    SS = ('tcp   LISTEN 0 128 0.0.0.0:22 0.0.0.0:* users:(("sshd",pid=900,fd=3))\n'
+          'udp   UNCONN 0 0   127.0.0.54:53 0.0.0.0:* users:(("systemd-resolve",pid=901,fd=12))\n')
+
+    def setUp(self):
+        _isolate()
+        from arx.modules import recon
+        self.r = recon
+        self.net = tempfile.mkdtemp()
+        self.files = {k: os.path.join(self.net, k) for k in ("tcp", "tcp6", "udp", "udp6")}
+        self.rows = {k: [] for k in self.files}
+        self.now = [1000.0]
+        self.ss_runs = []
+        self.ss_out = self.SS
+        self.alive = {900, 901}
+        self.write()
+
+        def run(args, **k):
+            self.ss_runs.append(list(args))
+            return self.ss_out
+        for obj, name, value in ((recon, "_NET_FILES", dict(self.files)),
+                                 (recon, "_run", run), (recon.time, "monotonic", lambda: self.now[0]),
+                                 (recon, "_pid_alive", lambda pid: pid in self.alive)):
+            patch = mock.patch.object(obj, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+        recon._ports_cache.clear()
+        self.addCleanup(recon._ports_cache.clear)
+
+    def write(self):
+        for k, path in self.files.items():
+            with open(path, "w") as f:
+                f.write(self.HEADER + "\n".join(self.rows[k]) + ("\n" if self.rows[k] else ""))
+
+    def listen(self, kind, port, inode, state=None):
+        state = state or ("0A" if kind.startswith("tcp") else "07")
+        addr = "00000000" if not kind.endswith("6") else "0" * 32
+        self.rows[kind].append(_net_line(len(self.rows[kind]), f"{addr}:{port:04X}", state, inode))
+        self.write()
+
+    def test_nothing_changed_ss_is_asked_once(self):
+        self.listen("tcp", 22, 1111)
+        self.listen("udp", 53, 2222)
+        for _ in range(10):
+            ports = self.r._collect_ports()
+        self.assertEqual(len(self.ss_runs), 1)
+        self.assertEqual([p["proto"] for p in ports], ["tcp", "udp"])
+        self.assertIn("sshd", ports[0]["process"])
+
+    def test_a_new_listening_socket_asks_again_at_once(self):
+        self.listen("tcp", 22, 1111)
+        self.r._collect_ports()
+        self.listen("tcp", 4444, 3333)
+        self.ss_out = self.SS + 'tcp LISTEN 0 1 0.0.0.0:4444 0.0.0.0:* users:(("nc",pid=902,fd=3))\n'
+        self.alive.add(902)
+        ports = self.r._collect_ports()
+        self.assertEqual(len(self.ss_runs), 2)
+        self.assertIn("nc", " ".join(p["process"] for p in ports))
+
+    def test_a_new_udp_socket_asks_again_at_once(self):
+        self.listen("udp", 53, 2222)
+        self.r._collect_ports()
+        self.listen("udp", 31337, 4444)
+        self.r._collect_ports()
+        self.assertEqual(len(self.ss_runs), 2)
+
+    def test_a_new_ipv6_socket_asks_again_at_once(self):
+        self.listen("tcp6", 22, 1111)
+        self.r._collect_ports()
+        self.listen("tcp6", 4444, 3333)
+        self.r._collect_ports()
+        self.assertEqual(len(self.ss_runs), 2)
+
+    def test_a_socket_that_stops_listening_asks_again(self):
+        self.listen("tcp", 22, 1111)
+        self.listen("tcp", 8080, 1112)
+        self.r._collect_ports()
+        self.rows["tcp"].pop()
+        self.write()
+        self.r._collect_ports()
+        self.assertEqual(len(self.ss_runs), 2)
+
+    def test_the_same_port_taken_by_another_process_is_another_socket(self):
+        self.listen("tcp", 22, 1111)
+        self.r._collect_ports()
+        self.rows["tcp"] = []
+        self.listen("tcp", 22, 5555)  # otro proceso, otro inodo
+        self.r._collect_ports()
+        self.assertEqual(len(self.ss_runs), 2)
+
+    def test_connections_and_other_states_do_not_count(self):
+        self.listen("tcp", 22, 1111)
+        self.r._collect_ports()
+        self.listen("tcp", 40000, 7777, state="01")  # una conexión establecida
+        self.listen("udp", 40001, 7778, state="01")  # un UDP conectado
+        self.r._collect_ports()
+        self.assertEqual(len(self.ss_runs), 1)
+
+    def test_a_process_that_died_asks_again_even_if_the_socket_is_the_same(self):
+        self.listen("tcp", 22, 1111)
+        self.r._collect_ports()
+        self.alive.discard(900)  # un worker que se reinicia
+        self.r._collect_ports()
+        self.assertEqual(len(self.ss_runs), 2)
+
+    def test_after_five_minutes_it_asks_again_anyway(self):
+        self.listen("tcp", 22, 1111)
+        self.r._collect_ports()
+        self.now[0] += self.r.PORTS_REFRESH_S + 1
+        self.r._collect_ports()
+        self.assertEqual(len(self.ss_runs), 2)
+
+    def test_an_unreadable_procfs_never_uses_the_cache(self):
+        self.listen("tcp", 22, 1111)
+        self.r._collect_ports()
+        os.unlink(self.files["tcp"])
+        self.r._collect_ports()
+        self.r._collect_ports()
+        self.assertEqual(len(self.ss_runs), 3)
+
+    def test_the_fallback_without_ss_is_not_kept(self):
+        self.listen("tcp", 22, 1111)
+        self.ss_out = None  # sin ss
+        self.r._collect_ports()
+        self.ss_out = self.SS
+        ports = self.r._collect_ports()
+        self.assertIn("sshd", ports[0]["process"])  # el respaldo (sin procesos) no se quedó guardado
+
+    def test_the_caller_cannot_poison_the_cache(self):
+        self.listen("tcp", 22, 1111)
+        self.r._collect_ports()[0]["process"] = "evil"
+        self.assertIn("sshd", self.r._collect_ports()[0]["process"])
+
+
+class EstablishedCountTests(unittest.TestCase):
+    """P2 · el número de conexiones establecidas (el indicador de la base) sale de /proc/net/tcp y tcp6, como `ss -tan state
+    established`, sin lanzar `ss`."""
+
+    def setUp(self):
+        _isolate()
+        from arx.modules import baseline, recon
+        self.b, self.r = baseline, recon
+        self.d = tempfile.mkdtemp()
+        self.tcp, self.tcp6 = os.path.join(self.d, "tcp"), os.path.join(self.d, "tcp6")
+        self.ran = []
+        for obj, name, value in ((recon, "_NET_FILES", {"tcp": self.tcp, "tcp6": self.tcp6, "udp": "/nope", "udp6": "/nope"}),
+                                 (recon, "_run", lambda args, **k: self.ran.append(list(args)) or "a\nb\nc\n")):
+            patch = mock.patch.object(obj, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def put(self, path, states):
+        header = "  sl  local_address rem_address   st\n"
+        with open(path, "w") as f:
+            f.write(header + "".join(_net_line(i, "0100007F:0016", st, 100 + i) + "\n" for i, st in enumerate(states)))
+
+    def test_only_established_tcp_of_both_families_count(self):
+        self.put(self.tcp, ["01", "0A", "01", "06", "01"])
+        self.put(self.tcp6, ["01", "0A", "08"])
+        self.assertEqual(self.r.count_established(), 4)
+        self.assertEqual(self.ran, [])
+
+    def test_the_gauge_uses_it_and_does_not_run_ss(self):
+        self.put(self.tcp, ["01", "01"])
+        self.put(self.tcp6, [])
+        self.assertEqual(self.b._gauges()["conn_count"], 2.0)
+        self.assertNotIn(["ss", "-tanH", "state", "established"], self.ran)
+
+    def test_with_no_connections_it_is_zero_not_missing(self):
+        self.put(self.tcp, ["0A"])
+        self.put(self.tcp6, [])
+        self.assertEqual(self.r.count_established(), 0)
+
+    def test_without_procfs_it_asks_ss_as_before(self):
+        self.assertIsNone(self.r.count_established())
+        self.assertEqual(self.b._gauges()["conn_count"], 3.0)  # lo que dijo el `ss` de la prueba
+        self.assertIn(["ss", "-tanH", "state", "established"], self.ran)
 
 
 if __name__ == "__main__":

@@ -1294,6 +1294,7 @@ class ProcfsPortsTests(unittest.TestCase):
     def test_collect_falls_back_when_no_ss(self):
         from arx.modules import recon
         with mock.patch.object(recon, "_run", lambda *a, **k: ""), \
+             mock.patch.object(recon, "_listen_signature", lambda: None), \
              mock.patch.object(recon, "_collect_ports_procfs",
                                return_value=[{"proto": "tcp", "local": "*:4444",
                                               "exposed": "all", "process": ""}]) as fb:

@@ -597,9 +597,12 @@ class MemoTests(unittest.TestCase):
         from arx.modules import profile, sweepcache
         self.p, self.sc = profile, sweepcache
         self.fake = FakeNft()
-        patch = mock.patch.object(profile.subprocess, "run", self.fake.run)
-        patch.start()
-        self.addCleanup(patch.stop)
+        from arx.modules import recon
+        for obj, name, value in ((profile.subprocess, "run", self.fake.run),
+                                 (recon, "_listen_signature", lambda: None)):  # sin caché de `ss` entre barridos: se cuenta cada uno
+            patch = mock.patch.object(obj, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
         self.sc.end_sweep()
         self.addCleanup(self.sc.end_sweep)
 

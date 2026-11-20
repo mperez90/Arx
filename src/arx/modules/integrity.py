@@ -34,15 +34,41 @@ _SYSTEMD_DIRS = ("/etc/systemd/system", "/usr/local/lib/systemd/system")
 _UNIT_EXT = (".service", ".timer", ".socket", ".path", ".mount", ".automount", ".target")
 
 
-def _systemd_paths() -> list[str]:
+_GENERATOR_DIRS = ("/etc/systemd/system-generators", "/usr/local/lib/systemd/system-generators")
+# Listar todo esto (cuatro mil listados de directorio por barrido: ~3,7 ms) solo hace falta si algún directorio cambió: una
+# unidad, un drop-in o un enlace nuevos cambian el inodo, el mtime y el ctime de su directorio (el ctime no se puede devolver
+# con `touch -r`). La firma son esos directorios; además se rehace cada SYSTEMD_LIST_TTL_S (B78-b, P5a).
+SYSTEMD_LIST_TTL_S = 300
+_systemd_cache: dict = {}
+
+
+def _dirs_signature(dirs) -> tuple:
     out = []
+    for d in dirs:
+        try:
+            st = os.stat(d)
+            out.append((d, st.st_ino, st.st_mtime_ns, st.st_ctime_ns))
+        except OSError:
+            out.append((d, None))
+    return tuple(out)
+
+
+def _systemd_paths() -> list[str]:
+    top = (*_SYSTEMD_DIRS, *_GENERATOR_DIRS)
+    hit, now = _systemd_cache.get("v"), time.monotonic()
+    if hit and hit["top"] == top and 0 <= now - hit["at"] < SYSTEMD_LIST_TTL_S and _dirs_signature(hit["dirs"]) == hit["sig"]:
+        return list(hit["paths"])
+    out, subdirs = [], []
     for d in _SYSTEMD_DIRS:
         for ext in _UNIT_EXT:
             out += glob.glob(f"{d}/*{ext}")
         out += glob.glob(f"{d}/*.d/*.conf")           # drop-ins: persistencia clásica (ExecStartPre=…)
         out += glob.glob(f"{d}/*.wants/*") + glob.glob(f"{d}/*.requires/*")  # enlaces que habilitan
-    for d in ("/etc/systemd/system-generators", "/usr/local/lib/systemd/system-generators"):
+        subdirs += glob.glob(f"{d}/*.d") + glob.glob(f"{d}/*.wants") + glob.glob(f"{d}/*.requires")
+    for d in _GENERATOR_DIRS:
         out += glob.glob(f"{d}/*")
+    dirs = [*top, *sorted(subdirs)]
+    _systemd_cache["v"] = {"top": top, "at": now, "dirs": dirs, "sig": _dirs_signature(dirs), "paths": list(out)}
     return out
 
 
@@ -199,6 +225,7 @@ def _stat_key(path: str) -> tuple | None:
 
 def clear_cache() -> None:
     _cache.clear()
+    _systemd_cache.clear()
 
 
 def cached_state(path: str, group: str, writers=None, now: float | None = None) -> dict | None:

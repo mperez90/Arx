@@ -163,9 +163,12 @@ def _gauges() -> dict:
                 avail = int(line.split()[1])
         if total and avail is not None:
             g["mem_used_pct"] = round((total - avail) / total * 100, 1)
-    est = recon._run(["ss", "-tanH", "state", "established"])
-    if est is not None:
-        g["conn_count"] = float(len([l for l in est.splitlines() if l.strip()]))
+    n = recon.count_established()  # de /proc/net, sin lanzar `ss`
+    if n is None:
+        est = recon._run(["ss", "-tanH", "state", "established"])
+        n = None if est is None else len([l for l in est.splitlines() if l.strip()])
+    if n is not None:
+        g["conn_count"] = float(n)
     return g
 
 
