@@ -277,12 +277,27 @@ def _collect_ports() -> list[dict] | None:
 
 
 CGROUP_ROOT = "/sys/fs/cgroup"
+SERVICES_REFRESH_S = 300
+_services_cache: dict = {}
 
 
-def _services_from_cgroups() -> list[str] | None:
-    """Los servicios en marcha según la jerarquía cgroup v2: cada `*.service` con procesos, en cualquier slice (también las
-    instancias de `system-getty.slice` o el `user@1000.service`), sin descender dentro de un servicio ni de un scope.
-    None si esto no es cgroup v2 o no se puede leer."""
+def _populated(path: str) -> bool:
+    """¿Corre algo en este cgroup o debajo? `cgroup.events` lo dice (cgroup v2); sin él, los procesos del propio cgroup."""
+    try:
+        with open(os.path.join(path, "cgroup.events"), encoding="ascii", errors="replace") as f:
+            return "populated 1" in f.read()
+    except OSError:
+        pass
+    try:
+        with open(os.path.join(path, "cgroup.procs"), "rb") as f:
+            return bool(f.read(1))
+    except OSError:
+        return False
+
+
+def _services_signature() -> frozenset | None:
+    """{(servicio, ¿con procesos?)} de la jerarquía cgroup v2: cada `*.service` en cualquier slice, sin descender dentro de un
+    servicio ni de un scope. None si esto no es cgroup v2 o no se puede leer."""
     if not os.path.exists(os.path.join(CGROUP_ROOT, "cgroup.controllers")):
         return None
     found, stack = set(), [CGROUP_ROOT]
@@ -293,30 +308,32 @@ def _services_from_cgroups() -> list[str] | None:
                     if not e.is_dir(follow_symlinks=False) or e.name.endswith(".scope"):
                         continue
                     if e.name.endswith(".service"):
-                        try:
-                            with open(os.path.join(e.path, "cgroup.procs"), "rb") as f:
-                                if f.read(1):
-                                    found.add(e.name)
-                        except OSError:
-                            pass
+                        found.add((e.name, _populated(e.path)))
                     else:
                         stack.append(e.path)  # un slice
         except OSError:
             return None
-    return sorted(found)
+    return frozenset(found)
 
 
 def collect_services() -> list[str] | None:
-    from_cgroups = _services_from_cgroups()
-    if from_cgroups is not None:
-        return from_cgroups
+    """Los servicios en marcha según systemd. `systemctl list-units` (un proceso, y trabajo para PID 1) solo cuando cambia el
+    conjunto de cgroups de servicios o pasan 5 min: lo que dice es lo de systemd, no lo de los cgroups (los `sshd@<conexión>`
+    de Debian 13 están en marcha para systemd con el cgroup vacío). Sin cgroup v2, siempre se le pregunta."""
+    sig, now = _services_signature(), time.monotonic()
+    hit = _services_cache.get("v")
+    if sig is not None and hit and hit["sig"] == sig and 0 <= now - hit["at"] < SERVICES_REFRESH_S:
+        return list(hit["names"])
     out = _run(
         ["systemctl", "list-units", "--type=service", "--state=running",
          "--no-legend", "--no-pager"]
     )
     if out is None:
         return None
-    return [l.split()[0] for l in out.splitlines() if l.strip()]
+    names = [l.split()[0] for l in out.splitlines() if l.strip()]
+    if sig is not None:
+        _services_cache["v"] = {"sig": sig, "at": now, "names": list(names)}
+    return names
 
 
 # ── conexiones activas/recientes (procfs, sin dependencias) ──────────────────

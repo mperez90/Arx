@@ -627,8 +627,14 @@ class SystemdPathsCacheTests(unittest.TestCase):
         self.assertNotIn("/etc/evil2", paths)
 
 
-class ServicesFromCgroupsTests(unittest.TestCase):
-    """P5a · los servicios en marcha salen de /sys/fs/cgroup, sin `systemctl list-units` (un proceso y trabajo para PID 1)."""
+class ServicesCacheTests(unittest.TestCase):
+    """P5a · `systemctl list-units --state=running` (un proceso, y trabajo para PID 1) solo cuando cambia el conjunto de cgroups de
+    servicios: la firma es cada `*.service` de la jerarquía con su `populated`. Mientras sea la misma, la salida de systemd de
+    antes sigue valiendo (5 min como mucho), así que la paridad es la de systemd mismo: visto en un host real, los
+    `sshd@<conexión>.service` de Debian 13 están en marcha para systemd con el cgroup vacío (el proceso pasó a la sesión)."""
+
+    LIST = ("  ssh.service      loaded active running OpenBSD Secure Shell server\n"
+            "  cron.service     loaded active running Regular background program processing daemon\n")
 
     def setUp(self):
         _isolate()
@@ -636,57 +642,103 @@ class ServicesFromCgroupsTests(unittest.TestCase):
         self.r = recon
         self.root = tempfile.mkdtemp()
         open(os.path.join(self.root, "cgroup.controllers"), "w").write("cpu memory\n")
+        self.now = [1000.0]
         self.ran = []
-        for obj, name, value in ((recon, "CGROUP_ROOT", self.root),
-                                 (recon, "_run", lambda args, **k: self.ran.append(list(args)) or None)):
+        self.out = self.LIST
+
+        def run(args, **k):
+            self.ran.append(list(args))
+            return self.out
+        for obj, name, value in ((recon, "CGROUP_ROOT", self.root), (recon, "_run", run),
+                                 (recon.time, "monotonic", lambda: self.now[0])):
             patch = mock.patch.object(obj, name, value)
             patch.start()
             self.addCleanup(patch.stop)
-
-    def service(self, *parts, procs="1\n"):
-        path = os.path.join(self.root, *parts)
-        os.makedirs(path, exist_ok=True)
-        open(os.path.join(path, "cgroup.procs"), "w").write(procs)
-
-    def test_running_services_are_found_in_the_system_slice(self):
+        recon._services_cache.clear()
+        self.addCleanup(recon._services_cache.clear)
         self.service("system.slice", "ssh.service")
         self.service("system.slice", "cron.service")
-        self.assertEqual(self.r.collect_services(), ["cron.service", "ssh.service"])
-        self.assertEqual(self.ran, [])  # sin lanzar nada
 
-    def test_instances_in_their_own_slices_and_user_managers_count_like_in_list_units(self):
-        self.service("system.slice", "system-getty.slice", "getty@tty1.service")
-        self.service("system.slice", "system-sshd.slice", "sshd@1-a.service")
-        self.service("user.slice", "user-1000.slice", "user@1000.service")
-        self.assertEqual(self.r.collect_services(), ["getty@tty1.service", "sshd@1-a.service", "user@1000.service"])
+    def service(self, *parts, populated=True):
+        path = os.path.join(self.root, *parts)
+        os.makedirs(path, exist_ok=True)
+        open(os.path.join(path, "cgroup.events"), "w").write(f"populated {int(populated)}\nfrozen 0\n")
+        return path
 
-    def test_a_service_without_processes_is_not_running(self):
-        self.service("system.slice", "ssh.service")
-        self.service("system.slice", "oneshot.service", procs="")
+    def test_the_answer_is_what_systemd_says(self):
+        self.assertEqual(self.r.collect_services(), ["ssh.service", "cron.service"])
+        self.assertEqual(self.ran[0][:2], ["systemctl", "list-units"])
+
+    def test_nothing_changed_systemd_is_asked_once(self):
+        for _ in range(10):
+            self.r.collect_services()
+        self.assertEqual(len(self.ran), 1)
+
+    def test_a_new_service_cgroup_asks_again_at_once(self):
+        self.r.collect_services()
+        self.service("system.slice", "evil.service")
+        self.out = self.LIST + "  evil.service loaded active running x\n"
+        self.assertIn("evil.service", self.r.collect_services())
+        self.assertEqual(len(self.ran), 2)
+
+    def test_a_service_that_goes_away_asks_again_at_once(self):
+        self.r.collect_services()
+        os.unlink(os.path.join(self.root, "system.slice", "cron.service", "cgroup.events"))
+        os.rmdir(os.path.join(self.root, "system.slice", "cron.service"))
+        self.out = self.LIST.splitlines(True)[0]
         self.assertEqual(self.r.collect_services(), ["ssh.service"])
 
-    def test_what_a_service_runs_inside_is_not_another_service(self):
-        self.service("system.slice", "docker.service")
-        self.service("system.slice", "docker.service", "sub", "inner.service")
-        self.assertEqual(self.r.collect_services(), ["docker.service"])
+    def test_a_service_that_starts_or_stops_running_its_processes_asks_again(self):
+        self.r.collect_services()
+        self.service("system.slice", "cron.service", populated=False)
+        self.r.collect_services()
+        self.assertEqual(len(self.ran), 2)
 
-    def test_scopes_and_the_user_sessions_are_not_services(self):
-        self.service("system.slice", "ssh.service")
+    def test_services_in_their_own_slices_and_user_managers_are_part_of_the_signature(self):
+        self.r.collect_services()
+        self.service("system.slice", "system-sshd.slice", "sshd@1-a.service")
+        self.r.collect_services()
+        self.service("user.slice", "user-1000.slice", "user@1000.service")
+        self.r.collect_services()
+        self.assertEqual(len(self.ran), 3)
+
+    def test_what_a_service_runs_inside_and_scopes_are_not_part_of_it(self):
+        self.r.collect_services()
+        self.service("system.slice", "ssh.service", "sub", "inner.service")
         self.service("system.slice", "docker-abc.scope")
         self.service("system.slice", "docker-abc.scope", "x.service")
         self.service("user.slice", "user-1000.slice", "session-3.scope")
-        self.service("init.scope")
-        self.assertEqual(self.r.collect_services(), ["ssh.service"])
+        self.r.collect_services()
+        self.assertEqual(len(self.ran), 1)
 
-    def test_without_cgroup_v2_it_asks_systemd_as_before(self):
+    def test_after_five_minutes_it_asks_again_anyway(self):
+        self.r.collect_services()
+        self.now[0] += self.r.SERVICES_REFRESH_S + 1
+        self.r.collect_services()
+        self.assertEqual(len(self.ran), 2)
+
+    def test_without_cgroup_v2_it_always_asks_systemd(self):
         os.unlink(os.path.join(self.root, "cgroup.controllers"))
-        self.assertIsNone(self.r.collect_services())  # el `_run` de la prueba devuelve None
-        self.assertEqual(self.ran[0][:2], ["systemctl", "list-units"])
+        for _ in range(3):
+            self.r.collect_services()
+        self.assertEqual(len(self.ran), 3)
 
-    def test_an_unreadable_hierarchy_asks_systemd_as_before(self):
+    def test_an_unreadable_hierarchy_always_asks_systemd(self):
         with mock.patch.object(self.r, "CGROUP_ROOT", os.path.join(self.root, "nope")):
             self.r.collect_services()
-        self.assertEqual(self.ran[0][:2], ["systemctl", "list-units"])
+            self.r.collect_services()
+        self.assertEqual(len(self.ran), 2)
+
+    def test_a_failure_of_systemd_is_never_kept(self):
+        self.out = None
+        self.assertIsNone(self.r.collect_services())
+        self.out = self.LIST
+        self.assertEqual(self.r.collect_services(), ["ssh.service", "cron.service"])
+
+    def test_the_caller_cannot_poison_the_cache(self):
+        self.r.collect_services().append("evil.service")
+        self.r.collect_services().append("evil2.service")
+        self.assertEqual(self.r.collect_services(), ["ssh.service", "cron.service"])
 
 
 def _net_line(i, local, state, inode):
