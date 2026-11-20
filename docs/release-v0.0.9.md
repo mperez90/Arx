@@ -160,4 +160,7 @@ are final.
 - **Authorship needs a working audit backend.** Attributing a change to who made it relies on auditd's
   file watches, which some virtualized guests do not deliver. Detection works without it; only the
   "who" is missing there.
+- **Listening-socket owners are refreshed lazily.** A new port, or a port that changes socket, is seen in
+  the same sweep. If a second process inherits or receives an existing listener while its first owner is
+  still alive, the owner list Arx shows for that port can be up to 5 minutes old.
 - TODO: confirmar con arx-98 — replace the remaining rc1/rc2 carry-overs once the list is final.
