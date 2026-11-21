@@ -2547,12 +2547,16 @@ def _extend_containment(blk: dict) -> int:
 def _restore_confinements() -> int:
     """Tras un reinicio o un `flush`, los confinamientos vuelven: no caducan."""
     restored = 0
+    asked: set = set()  # varios bloqueos pueden recordar el mismo confinamiento: una pregunta a nft por cada uno
     for b in _load_blocks():
         revert = b.get("revert")
         if not (isinstance(revert, dict) and revert.get("tool") == "confine"):
             continue
         for entry in (revert.get("units") or []) + (revert.get("scopes") or []):
             path, set_name = str(entry.get("path", "")), str(entry.get("set", ""))
+            if (path, set_name) in asked:
+                continue
+            asked.add((path, set_name))
             if not os.path.isdir(f"/sys/fs/cgroup/{path}"):
                 continue  # el servicio está parado o el proceso ya no existe
             try:

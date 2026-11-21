@@ -1684,7 +1684,10 @@ def _cleanup_dead() -> None:
             if cg.isdigit():
                 _nft("delete", "element", "inet", "arx", name, f"{{ {cg} . {proto} . {net} . {port} }}")
     for name in ("watched2", "watched_obs", "seen_ports"):
-        for m in re.finditer(r"(?<![\w\"/.])(\d+)(?=\s*[,}])", _nft_out("list", "set", "inet", "arx", name)):
+        # Solo dentro de `elements = { … }`: en un set vacío, la cifra de «typeof socket cgroupv2 level 0» no es un
+        # cgroup muerto, y borrar «{ 0 }» fallaba en cada barrido y obligaba a releer la tabla (rc9, piloto A).
+        block = re.search(r"elements\s*=\s*\{([^}]*)\}", _nft_out("list", "set", "inet", "arx", name))
+        for m in re.finditer(r"(?<![\w\"/.])(\d+)(?=\s*(?:,|$))", block.group(1) if block else ""):
             _nft("delete", "element", "inet", "arx", name, f"{{ {m.group(1)} }}")
 
 
