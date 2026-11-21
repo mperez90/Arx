@@ -30,6 +30,11 @@ def begin_sweep() -> None:
         _owner[0] = threading.get_ident()
 
 
+def in_sweep() -> bool:
+    """¿Estamos en la parte de lectura de un barrido, en su hilo? Fuera (acciones, otros hilos) se pregunta de nuevo."""
+    return _owner[0] == threading.get_ident()
+
+
 def end_sweep() -> None:
     """Acaba la parte de lectura del barrido: lo que venga después (las respuestas, otros hilos) pregunta de nuevo."""
     with _lock:

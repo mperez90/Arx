@@ -95,5 +95,71 @@ class RestoreConfinements(unittest.TestCase):
         self.assertEqual(len(adds), 1, adds)
 
 
+class StructureByGeneration(unittest.TestCase):
+    """rc10 en u24: con un servicio confinado, `restore_kernel_blocks` lista la estructura de la tabla en cada barrido
+    (0,09 s: nft resuelve los 46 cgroups de las reglas). La estructura solo cambia en una transacción de nf_tables, y
+    cada transacción sube la generación del kernel: con la misma generación, lo listado sigue valiendo (5 min como mucho)."""
+
+    def setUp(self):
+        response._struct_cache.update(gen=None, at=0.0, text=None)
+        self.listings = 0
+
+        def fake(cmd, *a, **k):
+            if cmd[:3] == ["nft", "-t", "list"]:
+                self.listings += 1
+                return _R(0, "table inet arx {\n}\n")
+            return _R(0)
+        self.fake = fake
+
+    def _sweeps(self, gens, clock=None):
+        clock = clock or [1000.0 + 30 * i for i in range(len(gens))]
+        it = iter(gens)
+        with mock.patch.object(response.subprocess, "run", side_effect=self.fake), \
+                mock.patch.object(response, "_ruleset_generation", side_effect=lambda: next(it)):
+            for now in clock:
+                with mock.patch.object(response.time, "monotonic", return_value=now):
+                    sweepcache.begin_sweep()
+                    try:
+                        self.assertIsNotNone(response._table_listing())
+                    finally:
+                        sweepcache.end_sweep()
+
+    def test_same_generation_lists_once(self):
+        self._sweeps([7, 7, 7, 7])
+        self.assertEqual(self.listings, 1)
+
+    def test_a_new_generation_lists_again(self):
+        self._sweeps([7, 7, 8, 8])
+        self.assertEqual(self.listings, 2)
+
+    def test_without_netlink_every_sweep_lists(self):
+        self._sweeps([None, None, None])
+        self.assertEqual(self.listings, 3)
+
+    def test_at_most_five_minutes(self):
+        self._sweeps([7, 7, 7], clock=[1000.0, 1200.0, 1301.0])
+        self.assertEqual(self.listings, 2)
+
+    def test_outside_a_sweep_always_lists(self):
+        response._struct_cache.update(gen=7, at=0.0, text="table inet arx {\n}\n")
+        with mock.patch.object(response.subprocess, "run", side_effect=self.fake), \
+                mock.patch.object(response, "_ruleset_generation", return_value=7), \
+                mock.patch.object(response.time, "monotonic", return_value=10.0):
+            response._table_listing()
+            response._table_listing()
+        self.assertEqual(self.listings, 2)
+
+    def test_parse_a_real_newgen_reply(self):
+        # NFT_MSG_NEWGEN (subsistema 10, tipo 15) con NFTA_GEN_ID=0x0001e240, PROC_PID y PROC_NAME, como el del kernel
+        import struct
+        attrs = (struct.pack("=HH", 8, 1) + struct.pack("!I", 123456) + struct.pack("=HH", 8, 2) + struct.pack("!I", 42)
+                 + struct.pack("=HH", 8, 3) + b"nft\0")
+        body = struct.pack("=BBH", 0, 0, 0) + attrs
+        reply = struct.pack("=IHHII", 16 + len(body), (10 << 8) | 15, 0, 1, 0) + body
+        self.assertEqual(response._parse_generation(reply), 123456)
+        self.assertIsNone(response._parse_generation(struct.pack("=IHHII", 36, 2, 0, 1, 0) + struct.pack("=i", -1)))
+        self.assertIsNone(response._parse_generation(b"short"))
+
+
 if __name__ == "__main__":
     unittest.main()

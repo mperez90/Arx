@@ -1826,7 +1826,55 @@ def _table_listing() -> str | None:
             return None
         return (r.stdout or "") if r.returncode == 0 else ""
 
-    return sweepcache.memo(("nft", "-t", "list", "table", "inet", "arx"), read)
+    def by_generation() -> str | None:
+        # En un barrido, lo listado vale mientras la generación de nf_tables sea la misma (toda transacción la sube:
+        # una regla, un set o un elemento que alguien añade o quita), 5 min como mucho. La generación se lee ANTES de
+        # listar: un cambio entre las dos cosas deja guardada una generación vieja y obliga a listar en el siguiente.
+        if not sweepcache.in_sweep():
+            return read()
+        gen, now, c = _ruleset_generation(), time.monotonic(), _struct_cache
+        if gen is not None and c["text"] and c["gen"] == gen and now - c["at"] < STRUCTURE_EVERY_S:
+            return c["text"]
+        text = read()
+        c.update(gen=gen if text else None, at=now, text=text if gen is not None else None)
+        return text
+
+    return sweepcache.memo(("nft", "-t", "list", "table", "inet", "arx"), by_generation)
+
+
+# La generación de nf_tables (NFT_MSG_GETGEN → NFT_MSG_NEWGEN, atributo NFTA_GEN_ID): sube con cada transacción. Por
+# netlink, sin proceso. Con ella, la estructura de la tabla no se lista en cada barrido (0,09 s en u24: nft resuelve
+# cada cgroup de las reglas recorriendo /sys/fs/cgroup; rc10, piloto A).
+_NFT_MSG_NEWGEN, _NFT_MSG_GETGEN, _NFTA_GEN_ID = 15, 16, 1
+_struct_cache: dict = {"gen": None, "at": 0.0, "text": None}
+
+
+def _parse_generation(reply: bytes) -> int | None:
+    if len(reply) < 20 or struct.unpack("=IHHII", reply[:16])[1] != (_NFNL_SUBSYS_NFTABLES << 8) | _NFT_MSG_NEWGEN:
+        return None
+    end, off = min(len(reply), struct.unpack("=I", reply[:4])[0]), 20
+    while off + 4 <= end:
+        alen, atype = struct.unpack("=HH", reply[off:off + 4])
+        if alen < 4:
+            return None
+        if atype & 0x3FFF == _NFTA_GEN_ID and alen >= 8 and off + 8 <= end:
+            return struct.unpack("!I", reply[off + 4:off + 8])[0]
+        off += (alen + 3) & ~3
+    return None
+
+
+def _ruleset_generation() -> int | None:
+    """La generación actual de nf_tables, o None si el kernel no contesta como se espera (entonces se lista siempre)."""
+    request = struct.pack("=IHHII", 20, (_NFNL_SUBSYS_NFTABLES << 8) | _NFT_MSG_GETGEN, _NLM_F_REQUEST, 1, 0) + \
+        struct.pack("=BBH", 0, 0, 0)
+    try:
+        with socket.socket(_AF_NETLINK, socket.SOCK_RAW, _NETLINK_NETFILTER) as sock:
+            sock.settimeout(2)
+            sock.bind((0, 0))
+            sock.send(request)
+            return _parse_generation(sock.recv(65536))
+    except (OSError, ValueError, struct.error):
+        return None
 
 
 def _nft_setup() -> bool:
