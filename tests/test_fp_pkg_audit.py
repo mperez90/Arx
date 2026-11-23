@@ -77,9 +77,10 @@ class Base(unittest.TestCase):
         self.not_intact: set = set()
         self.owners = dict(OWNERS)
         self.dpkg_log = DPKG_LOG
+        self.now = NOW
         for obj, name, value in (
                 (sensors, "AUDIT_LOG", self.log), (sensors, "AUDIT_CONF", os.path.join(d, "no-auditd.conf")),
-                (sensors.time, "time", lambda: NOW), (sensors.shutil, "which", lambda *a, **k: None),
+                (sensors.time, "time", lambda: self.now), (sensors.shutil, "which", lambda *a, **k: None),
                 (pkgdb, "owner", lambda path: self.owners.get(path)),
                 (provenance, "intact", lambda path, pkg: pkg not in self.not_intact),
                 (provenance, "signed_origin",
@@ -319,13 +320,22 @@ class TransactionWindowsTests(Base):
         self.assertFalse(self.covers("foo", t + 60))
         self.assertTrue(self.covers("foo", t + 601))
 
-    def test_a_transaction_that_never_ends_is_open_only_for_a_while(self):
-        """dpkg muerto a medias (corte de luz): sin línea final la ventana no queda abierta para siempre."""
+    def test_a_transaction_without_a_closing_line_is_open_and_says_so(self):
+        """Sin línea final no se sabe cuándo acaba: no hay tope de tiempo que la dé por buena, decide el que mira."""
         self.use_log(["2026-11-22 06:00:00 configure foo:amd64 2.0 <none>",
                       "2026-11-22 06:00:00 status half-configured foo:amd64 2.0"])
         t = self.p._to_epoch("2026-11-22 06:00:00")
-        self.assertTrue(self.covers("foo", t + 120))
-        self.assertFalse(self.covers("foo", t + self.p.OPEN_MAX_S + 1))
+        self.assertIsNone(self.p.transaction("foo", t - 1))
+        self.assertIsNone(self.p.transaction("foo", t + 120)["t1"])
+        self.assertIsNone(self.p.transaction("foo", t + 86400)["t1"])
+
+    def test_a_closed_window_that_covers_wins_over_an_open_one(self):
+        self.use_log(["2026-11-22 06:00:00 configure foo:amd64 2.0 <none>",
+                      "2026-11-22 06:00:05 status installed foo:amd64 2.0",
+                      "2026-11-22 06:00:30 configure foo:amd64 2.0 <none>"])  # otra, sin cerrar
+        t = self.p._to_epoch("2026-11-22 06:00:00")
+        self.assertIsNotNone(self.p.transaction("foo", t + 2)["t1"])
+        self.assertIsNone(self.p.transaction("foo", t + 40)["t1"])
 
     def test_another_package_is_not_covered(self):
         self.use_log(SUDO_TX)
@@ -416,6 +426,143 @@ class TransactionWindowsTests(Base):
         with mock.patch("builtins.open", counting):
             self.p.in_transaction("sudo", 0)
         self.assertEqual(len(opened), 2)
+
+
+def open_sudo_log():
+    """El dpkg.log real de d13 sin las líneas que cierran las dos ventanas de sudo (unpack y configure)."""
+    with open(DPKG_LOG, encoding="utf-8") as f:
+        return [line for line in f.read().splitlines()
+                if not ("sudo:amd64" in line and (("status unpacked" in line and "deb13u5" in line)
+                                                  or "status installed" in line))]
+
+
+class OpenTransactionTests(Base):
+    """Si el paquete dueño sigue en transacción cuando se mira, el evento espera a su cierre (5 min como mucho); sin
+    cierre, high. La ventana de un evento es solo la de SU paquete: lo que otro paquete esté haciendo no cuenta."""
+
+    def close_log(self):
+        self.use_log(open(DPKG_LOG, encoding="utf-8").read().splitlines())
+
+    def test_events_of_an_open_transaction_wait_and_are_not_decided_early(self):
+        self.use_log(open_sudo_log())
+        got = self.feed(real_records())
+        self.assertEqual(self.high(got), [])
+        self.assertEqual(self.info(got), [])  # tampoco se da por buena antes de saber cómo acaba
+
+    def test_once_the_transaction_closes_the_waiting_events_are_explained(self):
+        self.use_log(open_sudo_log())
+        self.feed(real_records())
+        self.close_log()
+        got = self.s.read_auditd_events()  # sin eventos nuevos: salen los que esperaban
+        self.assertEqual(self.high(got), [])
+        self.assertEqual(len(self.info(got)), 1)
+        self.assertEqual(self.info(got)[0]["target"]["events"], 9)
+        self.assertEqual(self.s.read_auditd_events(), [])  # y no vuelven
+
+    def test_without_a_closing_line_after_five_minutes_they_are_high(self):
+        self.use_log(open_sudo_log())
+        self.feed(real_records())
+        self.now = T0 + self.p.DEFER_MAX_S - 1
+        self.assertEqual(self.s.read_auditd_events(), [])  # aún esperan
+        self.now = T0 + 0.367 + self.p.DEFER_MAX_S + 1
+        got = self.s.read_auditd_events()
+        self.assertEqual(len(self.high(got)), 9)
+        self.assertEqual(self.s.read_auditd_events(), [])  # una vez
+
+    def test_an_event_already_older_than_the_wait_is_not_deferred(self):
+        self.use_log(open_sudo_log())
+        self.now = T0 + self.p.DEFER_MAX_S + 60
+        self.assertEqual(len(self.high(self.feed(real_records()))), 9)
+
+    def test_a_transaction_that_closes_before_the_event_does_not_cover_it(self):
+        """La línea de cierre es de antes de lo que se escribió: ya no es de esa transacción."""
+        self.use_log(open_sudo_log())
+        self.feed(real_records())
+        self.use_log([l.replace("06:26:49", "06:26:30") for l in open(DPKG_LOG).read().splitlines()])
+        self.assertEqual(len(self.high(self.s.read_auditd_events())), 9)
+
+    def test_waiting_events_survive_a_restart_of_arx(self):
+        self.use_log(open_sudo_log())
+        self.feed(real_records())
+        self.p.clear_cache()  # un reinicio: la memoria se pierde, lo que esperaba está en disco
+        self.close_log()
+        got = self.s.read_auditd_events()
+        self.assertEqual((len(self.high(got)), len(self.info(got))), (0, 1))
+
+    def test_the_waiting_list_is_bounded_and_the_overflow_is_high_not_lost(self):
+        self.use_log(open_sudo_log())
+        evs = [audit_event(9300 + i, T0 + 0.30, "/usr/bin/dpkg", ["/etc/sudoers.d/README"]) for i in range(8)]
+        with mock.patch.object(self.p, "MAX_DEFERRED", 5):
+            got = self.feed(*evs)
+        self.assertEqual(len(self.high(got)), 3)
+        self.close_log()
+        self.assertEqual(len(self.info(self.s.read_auditd_events())), 1)
+
+    def test_another_package_in_transaction_does_not_cover_the_event(self):
+        """sudo está abierto, pero /etc/pam.d/sshd es de openssh-server, que no está en transacción: high ya."""
+        self.use_log(open_sudo_log())
+        ev = audit_event(9400, T0 + 0.5, "/usr/bin/dpkg", ["/etc/pam.d/sshd"], pid="424671")
+        self.assertEqual(len(self.high(self.feed(ev))), 1)
+
+    def test_the_window_of_a_package_is_not_the_union_of_all_that_are_open(self):
+        """Con openssh-server abierto, un fichero de sudo escrito fuera de las ventanas de sudo sigue siendo high."""
+        self.use_log(["2026-11-22 06:26:30 configure openssh-server:amd64 1:10.0 <none>",
+                      "2026-11-22 06:26:30 status half-configured openssh-server:amd64 1:10.0"] + SUDO_TX)
+        ev = audit_event(9401, T0 + 20, "/usr/bin/chown", ["/etc/sudoers"])  # 06:27:09: sudo ya cerró
+        self.assertEqual(len(self.high(self.feed(ev))), 1)
+
+    def test_an_event_with_files_of_two_packages_waits_if_either_is_still_open(self):
+        self.owners["/etc/pam.d/sshd"] = "openssh-server"
+        self.use_log(["2026-11-22 06:26:49 configure sudo:amd64 1.9.16p2-3+deb13u5 <none>",
+                      "2026-11-22 06:26:49 status half-configured sudo:amd64 1.9.16p2-3+deb13u5",
+                      "2026-11-22 06:26:49 configure openssh-server:amd64 1:10.0 <none>",
+                      "2026-11-22 06:26:49 status installed openssh-server:amd64 1:10.0"])
+        for names in (["/etc/sudoers", "/etc/pam.d/sshd"], ["/etc/pam.d/sshd", "/etc/sudoers"]):
+            self.s._audit_pending.clear()
+            ev = audit_event(9500, T0 + 0.5, "/usr/bin/dpkg", names, syscall="82")
+            got = self.feed(ev)
+            self.assertEqual((self.high(got), self.info(got)), ([], []), names)
+
+    def test_a_damaged_waiting_list_on_disk_is_ignored_not_trusted(self):
+        import json
+        path = self.p._deferred_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps([5, {"at": "x", "records": []}, {"at": 1.0, "records": "no"},
+                                    {"at": 1.0, "records": [1, 2]}, {"at": 1.0, "records": ["type=SYSCALL msg=audit(1.000:1): x"],
+                                                                       "inodes": ["mal", [1, 2, 3], ["a", "b", "c"]]}]))
+        self.p.clear_cache()
+        waiting = self.p.take_deferred()
+        self.assertEqual(waiting, [["type=SYSCALL msg=audit(1.000:1): x"]])
+        self.assertEqual(self.s.read_auditd_events(), [])  # y un evento que no se entiende no hace daño
+
+    def test_the_wait_is_five_minutes_and_has_room_for_a_whole_sweep(self):
+        self.assertEqual(self.p.DEFER_MAX_S, 300)
+        self.assertGreaterEqual(self.p.MAX_DEFERRED, self.s.MAX_EVENTS)
+
+    def test_the_unexplained_ones_are_not_held_back_by_the_ones_that_wait(self):
+        self.use_log(open_sudo_log())
+        bad = audit_event(9402, T0 + 0.2, "/usr/bin/chmod", ["/etc/passwd"])
+        got = self.feed(real_records(), bad)
+        self.assertEqual(len(self.high(got)), 1)
+        self.assertIn("/etc/passwd", self.high(got)[0]["detail"])
+
+    def test_a_waiting_event_that_stops_being_attributable_is_high(self):
+        """Mientras esperaba, el paquete dejó de ser de un repositorio firmado."""
+        self.use_log(open_sudo_log())
+        self.feed(real_records())
+        self.close_log()
+        self.unsigned.add("sudo")
+        got = self.s.read_auditd_events()
+        self.assertEqual((len(self.high(got)), len(self.info(got))), (9, 0))
+
+    def test_the_wait_is_counted_from_the_event_not_from_each_look(self):
+        self.use_log(open_sudo_log())
+        self.feed(real_records())
+        for step in (60, 120, 200, 280):
+            self.now = T0 + step
+            self.assertEqual(self.s.read_auditd_events(), [], step)  # mirar muchas veces no la alarga
+        self.now = T0 + 0.367 + self.p.DEFER_MAX_S + 1
+        self.assertEqual(len(self.high(self.s.read_auditd_events())), 9)
 
 
 class FilesOfTheEventTests(Base):
@@ -588,8 +735,9 @@ class MixedAndShapeTests(Base):
         self.assertEqual([f["target"]["package"] for f in got], ["sudo"])
 
     def test_a_failure_inside_the_attribution_is_never_an_explanation(self):
-        with mock.patch.object(self.p, "_explain", side_effect=RuntimeError("x")):
+        with mock.patch.object(self.p, "_judge", side_effect=RuntimeError("x")):
             self.assertIsNone(self.p.explain(real_records()[:5]))
+            self.assertEqual(self.p.judge(real_records()[:5]), ("unexplained", None))
 
     def test_each_check_is_made_once_per_sweep_however_many_events_there_are(self):
         owner_calls, intact_calls = [], []

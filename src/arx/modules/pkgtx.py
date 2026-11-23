@@ -12,13 +12,24 @@ Una escritura se explica por una transacción de paquete solo si TODO esto es ci
   · lo escribió el propio dpkg, o un hijo de sus scripts: una herramienta de un paquete firmado y sin alterar, root y
     sin sesión (una sesión de login nunca se atribuye a un paquete).
 
-Lo que no cumpla algo de eso sigue siendo un high. Los límites, escritos tal cual:
-  · A un hijo no se le puede seguir el árbol de procesos (auditd solo trae su ppid, y el proceso ya no existe cuando
-    Arx barre): se le atribuye por ventana de tiempo y por ser de un paquete en transacción. Un root sin sesión (un
-    servicio comprometido) que escriba, con una herramienta del sistema, un fichero de ese paquete en el segundo de su
-    transacción, y lo deje como estaba, no avisa. Si lo deja distinto, lo ve la comprobación de integridad, que
-    compara el contenido con la base sellada y solo da por buena la escritura si TODOS los autores son dpkg.
-  · `dpkg.log` va en segundos enteros y lo puede escribir un root: la ventana es el segundo entero de sus líneas.
+Una transacción todavía abierta (sin su línea final) no se da por buena a ciegas: el evento ESPERA a que cierre, 5 min
+como mucho contados desde el evento, y se decide entonces con la ventana ya cerrada; sin cierre, high. Lo que espera se
+guarda en disco (un reinicio de Arx no lo pierde) y tiene tope (el exceso es high, no se descarta).
+
+Lo que no cumpla algo de eso sigue siendo un high. La ventana de un evento es la de SU paquete (el dueño del fichero),
+nunca la unión de los paquetes que haya en transacción: de `upgrade P` hasta que dpkg deja P «unpacked» en la versión
+nueva, y de `configure P` hasta su «status installed».
+
+El residuo, con su tamaño real. En el dpkg.log del piloto d13 (65 ventanas cerradas de 28 paquetes) la ventana dura 1 s
+de mediana y 13 s como máximo (`trigproc` de initramfs-tools); las dos de sudo, 1 s cada una. Un root sin sesión (un
+servicio comprometido) que en ese intervalo escriba, con una herramienta de un paquete firmado y sin alterar, un
+fichero DE ESE PAQUETE y lo deje como estaba, no avisa: lo que sí cambie de contenido o de permisos lo ve la comprobación
+de integridad, que compara con la base sellada y solo da por buena la escritura si TODOS los autores son dpkg. Además:
+  · A un hijo no se le puede seguir el árbol de procesos (auditd solo trae su ppid y el proceso ya no existe cuando Arx
+    barre): se le atribuye por la ventana y por ser una herramienta firmada. Es la causa del residuo de arriba.
+  · `dpkg.log` va en segundos enteros y lo puede escribir un root: la ventana es el segundo entero de sus líneas (hasta
+    2 s de dpkg.log contado por exceso); un dpkg alterado no vale (se comprueba antes), un dpkg.log falsificado por
+    un root con un dpkg auténtico sí podría abrir una ventana falsa de ese tamaño.
   · Lo que escribe un hijo de dpkg en una sesión de login (un `sudo apt upgrade` interactivo) no se atribuye: queda
     high. El propio dpkg sí se explica, tenga o no sesión.
   · Un fichero que el paquete deja de traer ya no consta como suyo cuando Arx barre: queda high.
@@ -33,7 +44,8 @@ from arx.modules import integrity, pkgdb, provenance, sensors
 
 DPKG_LOGS = ("/var/log/dpkg.log.1", "/var/log/dpkg.log")
 TAIL_BYTES = 4 << 20       # de cada log, solo el final: una transacción reciente está ahí
-OPEN_MAX_S = 900           # una transacción sin línea final (dpkg muerto a medias) no queda abierta para siempre
+DEFER_MAX_S = 300          # lo que cae en una transacción aún abierta espera su cierre esto, desde el evento; luego, high
+MAX_DEFERRED = 64          # eventos esperando: el exceso es high, no se descarta
 INODES_MAX = 256           # inodos con nombre recordados: lo que un fd escribe luego no trae nombre
 INODE_TTL_S = 60.0
 INODE_NAMES = 4            # nombres por inodo (se reutiliza al borrar y crear)
@@ -47,12 +59,17 @@ _ENDS = {"install": ("unpacked",), "upgrade": ("unpacked",), "configure": ("inst
 _BY_VERSION = ("unpacked", "installed")  # los demás estados terminales no repiten la versión
 
 _windows_cache: dict = {"sig": None, "windows": {}}
+_DEFERRED_STATE = "audit-deferred.json"
+_deferred: list = []  # [{"at", "records"}]
+_deferred_loaded = [False]
 _inodes: collections.OrderedDict = collections.OrderedDict()  # (dev, inodo) → [(instante, ruta)]
 
 
 def clear_cache() -> None:
     _windows_cache.update(sig=None, windows={})
     _inodes.clear()
+    _deferred.clear()
+    _deferred_loaded[0] = False
 
 
 # ── transacciones: dpkg.log ──────────────────────────────────────────────────
@@ -128,16 +145,74 @@ def windows() -> dict[str, list[dict]]:
 
 def transaction(name: str, ts: float) -> dict | None:
     """La ventana del paquete que cubre el instante `ts` (el segundo entero de su línea final: dpkg.log no tiene más
-    resolución), o None."""
+    resolución), o None. Una ventana cerrada que cubre gana; si solo hay una abierta (`t1` None: sin línea final), esa."""
+    open_one = None
     for w in reversed(windows().get(name.partition(":")[0], ())):
-        end = w["t1"] + 1.0 if w["t1"] is not None else w["t0"] + OPEN_MAX_S
-        if w["t0"] <= ts < end:
+        if w["t0"] > ts:
+            continue
+        if w["t1"] is None:
+            open_one = open_one or w
+        elif ts < w["t1"] + 1.0:
             return w
-    return None
+    return open_one
 
 
 def in_transaction(name: str, ts: float) -> bool:
     return transaction(name, ts) is not None
+
+
+# ── lo que espera a que cierre una transacción ──────────────────────────────
+def _deferred_path():
+    from arx import config
+    return config.state_dir() / _DEFERRED_STATE
+
+
+def _load_deferred() -> None:
+    if _deferred_loaded[0]:
+        return
+    _deferred_loaded[0] = True
+    from arx import config
+    data = config.read_json(_deferred_path(), []) or []
+    _deferred[:] = [d for d in data if isinstance(d, dict) and isinstance(d.get("at"), (int, float))
+                    and isinstance(d.get("records"), list) and all(isinstance(r, str) for r in d["records"])]
+    for d in _deferred:  # los nombres que los descriptores de ese evento tenían: la memoria de inodos no sobrevive al reinicio
+        for item in d.get("inodes") or []:
+            if isinstance(item, list) and len(item) == 3 and all(isinstance(x, str) for x in item):
+                _inodes[(item[0], item[1])] = [(d["at"], item[2])]
+    while len(_inodes) > INODES_MAX:
+        _inodes.popitem(last=False)
+
+
+def take_deferred() -> list[list[str]]:
+    """Lo que esperaba, para volver a juzgarlo; vacía la lista (`defer` lo devuelve si sigue esperando)."""
+    _load_deferred()
+    out = [d["records"] for d in _deferred]
+    _deferred.clear()
+    return out
+
+
+def defer(records: list[str], at: float) -> bool:
+    """Deja el evento esperando. False si ya no cabe (el llamador lo da por no explicado)."""
+    _load_deferred()
+    if len(_deferred) >= MAX_DEFERRED:
+        return False
+    entry = {"at": at, "records": list(records), "inodes": []}
+    f = facts(records)
+    for p in (f or {}).get("paths", ()):
+        if p.get("nametype") != "PARENT" and p.get("name") in (None, "", "(null)") and p.get("inode"):
+            known = [path for when, path in _inodes.get((p.get("dev"), p["inode"]), ()) if 0 <= at - when <= INODE_TTL_S]
+            if known:
+                entry["inodes"].append([str(p.get("dev")), str(p["inode"]), known[-1]])
+    _deferred.append(entry)
+    return True
+
+
+def save_deferred() -> None:
+    from arx import config
+    try:
+        config.write_json(_deferred_path(), _deferred)
+    except OSError:
+        pass  # sin disco lo que espera sigue en memoria
 
 
 # ── lo que dice auditd de un evento ──────────────────────────────────────────
@@ -264,22 +339,28 @@ class Checker:
         return self._tool[exe]
 
 
-def explain(records: list[str], checker: Checker | None = None) -> dict | None:
-    """Si el evento es una escritura de una transacción de paquete: {package, version, files, writer, key}; si no, None.
-    Ante cualquier duda, None (sigue siendo un high)."""
+def judge(records: list[str], checker: Checker | None = None) -> tuple[str, dict | None]:
+    """("explained", veredicto) · ("pending", {"at"}) si todo cuadra pero el paquete dueño sigue en transacción (hay que
+    esperar a que cierre) · ("unexplained", None). Ante cualquier duda, no explicado: sigue siendo un high."""
     try:
-        return _explain(records, checker or Checker())
+        return _judge(records, checker or Checker())
     except Exception:  # noqa: BLE001 - un fallo aquí nunca esconde un evento
-        return None
+        return "unexplained", None
 
 
-def _explain(records: list[str], checker: Checker) -> dict | None:
+def explain(records: list[str], checker: Checker | None = None) -> dict | None:
+    """El veredicto si el evento ya es una escritura de una transacción de paquete cerrada; si no, None."""
+    state, verdict = judge(records, checker)
+    return verdict if state == "explained" else None
+
+
+def _judge(records: list[str], checker: Checker) -> tuple[str, dict | None]:
     f = facts(records)
     if not f or f["sc"].get("success") != "yes":
-        return None
+        return "unexplained", None
     files = _files(f)
     if not files or not checker.dpkg_ok():
-        return None
+        return "unexplained", None
     sc = f["sc"]
     exe = sc.get("exe", "")
     if exe == integrity.DPKG:
@@ -287,22 +368,26 @@ def _explain(records: list[str], checker: Checker) -> dict | None:
     else:
         if sc.get("uid") != "0" or sc.get("euid", sc.get("uid")) != "0" or sc.get("auid") not in _UNSET \
                 or sc.get("ses") not in _UNSET or not checker.tool(exe):
-            return None
+            return "unexplained", None
         writer = "script"
     owners: dict[str, dict] = {}
     stems = []
+    pending = False
     for path in files:
         stem = _stem(path)
         pkg = checker.owner(stem)
         if not pkg:
-            return None
+            return "unexplained", None
         window = transaction(pkg, f["at"])
         if not window:
-            return None
+            return "unexplained", None
+        pending = pending or window["t1"] is None  # sin línea final: aún no se sabe cuándo acaba
         owners.setdefault(pkg.partition(":")[0], window)
         if stem not in stems:
             stems.append(stem)
+    if pending:
+        return "pending", {"at": f["at"]}
     names = sorted(owners)
-    return {"packages": names, "package": ", ".join(names), "files": stems, "writer": writer,
-            "version": ", ".join(owners[n]["ver"] for n in names),
-            "key": "|".join(f"{n}|{owners[n]['ver']}" for n in names)}
+    return "explained", {"packages": names, "package": ", ".join(names), "files": stems, "writer": writer,
+                         "version": ", ".join(owners[n]["ver"] for n in names),
+                         "key": "|".join(f"{n}|{owners[n]['ver']}" for n in names)}

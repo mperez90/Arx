@@ -508,18 +508,21 @@ def read_auditd_events() -> list[dict]:
     events = []
     raw = _audit_new("arx_ident")
     pkgtx.remember(raw)  # los nombres de los inodos, también de lo que el tope de abajo deja fuera
-    checker, plain, updates = pkgtx.Checker(), [], {}
-    for ev in raw[-MAX_EVENTS:]:
+    checker, plain, updates, now = pkgtx.Checker(), [], {}, time.time()
+    for ev in pkgtx.take_deferred() + raw[-MAX_EVENTS:]:  # lo que esperaba el cierre de una transacción, primero
         if _nothing_there(ev):
             continue
-        verdict = pkgtx.explain(ev, checker)
-        if verdict:
+        state, verdict = pkgtx.judge(ev, checker)
+        if state == "pending" and now - verdict["at"] < pkgtx.DEFER_MAX_S and pkgtx.defer(ev, verdict["at"]):
+            continue  # el paquete dueño sigue en transacción: se decide cuando cierre, o en 5 min (high)
+        if state == "explained":
             update = updates.setdefault(verdict["key"], {**verdict, "files": [], "writers": [], "n": 0})
             update["files"] += [p for p in verdict["files"] if p not in update["files"]]
             update["writers"] += [w for w in (verdict["writer"],) if w not in update["writers"]]
             update["n"] += 1
         else:
             plain.append(ev)
+    pkgtx.save_deferred()
     for line in _audit_text(plain):
         events.append({"sev": "high", "kind": "auditd", "detail": tr("auditd · identity: {line}",
                                                                      line=line)[:400],
