@@ -790,6 +790,7 @@ def _listen(sock: socket.socket, root: str, enforce) -> None:
             data = sock.recv(1 << 16)
         except OSError:  # ENOBUFS: el kernel tiró eventos; se cuenta y se sigue
             _state["lost"] += 1
+            procring.lost()  # y lo que se daba por vivo ya no se prueba: la salida pudo ser de lo tirado
             continue
         for what, pid, ts in parse_all(data):
             _observe(what, pid)

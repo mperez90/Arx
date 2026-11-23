@@ -203,6 +203,41 @@ class DescendantsAndTreeShape(AncestryBase):
         self.ring.observe_exec(900001, now=self.t_script + 5)
         self.assertEqual(len(self.ring._ring), 1)
 
+    def test_a_pid_number_after_the_script_exited_can_only_be_a_reused_one(self):
+        """HZ de Q: script sudo pid=1000 vivo en t=100, salida en t=101; un ppid=1000 en t=102,5 NO es un hijo suyo: muerto el
+        script sus descendientes pasan a init, así que ese número ya es de otro proceso. Sin margen en la salida."""
+        self.world.add(DPKG_PID, 494247, "/usr/bin/dpkg", ["dpkg"])
+        self.world.add(1000, DPKG_PID, "/usr/bin/dash", ["/bin/sh", "/var/lib/dpkg/info/sudo.postinst"], env_pkg="sudo")
+        self.ring.observe_exec(1000, now=100.0)
+        self.ring.observe_exit(1000, now=101.0)
+        self.assertEqual(self.ring.ancestry(2000, 1000, 100.5)["package"], "sudo")   # vivo
+        self.assertEqual(self.ring.ancestry(2000, 1000, 101.0)["package"], "sudo")   # el instante de la salida cuenta
+        self.assertIsNone(self.ring.ancestry(2000, 1000, 101.001))
+        self.assertIsNone(self.ring.ancestry(2000, 1000, 102.5))
+
+    def test_the_same_holds_for_a_helper_of_the_script_that_exited(self):
+        self.dpkg_runs_the_postinst()
+        self.world.add(500001, SCRIPT_PID, "/usr/bin/dpkg-maintscript-helper", ["h"])
+        self.ring.observe_exec(500001, now=self.t_script + 0.01)
+        self.ring.observe_exit(500001, now=self.t_script + 1)
+        self.assertIsNone(self.ring.ancestry(500002, 500001, self.t_script + 2.5))
+
+    def test_the_clock_margin_stays_on_the_birth_side(self):
+        """Lo que apunta Arx y lo que apunta el kernel no son el mismo instante: un evento de justo antes del exec cuenta."""
+        self.world.add(DPKG_PID, 494247, "/usr/bin/dpkg", ["dpkg"])
+        self.world.add(1000, DPKG_PID, "/usr/bin/dash", ["/bin/sh", "/var/lib/dpkg/info/sudo.postinst"], env_pkg="sudo")
+        self.ring.observe_exec(1000, now=100.0)
+        self.assertIsNotNone(self.ring.ancestry(2000, 1000, 100.0 - self.ring.SLACK_S + 0.1))
+        self.assertIsNone(self.ring.ancestry(2000, 1000, 100.0 - self.ring.SLACK_S - 0.1))
+
+    def test_when_the_kernel_drops_events_nothing_alive_is_trusted_from_then_on(self):
+        """Una salida pudo ir en lo tirado: el número del script puede ser ya de otro proceso."""
+        self.dpkg_runs_the_postinst()
+        self.assertIsNotNone(self.ring.ancestry(CHOWN_PID, SCRIPT_PID, self.t_script + 5))
+        self.ring.lost(now=self.t_script + 10)
+        self.assertIsNotNone(self.ring.ancestry(CHOWN_PID, SCRIPT_PID, self.t_script + 9))   # lo de antes sigue valiendo
+        self.assertIsNone(self.ring.ancestry(CHOWN_PID, SCRIPT_PID, self.t_script + 10.5))   # lo de después no
+
     def test_the_first_exit_is_the_exit(self):
         self.dpkg_runs_the_postinst()
         self.ring.observe_exit(SCRIPT_PID, now=self.t_script + 1)
@@ -350,6 +385,25 @@ class TheListenerFeedsTheRing(unittest.TestCase):
                 execwatch._listen(Sock(), "", lambda: False)
         self.assertEqual(observed, [(execwatch.PROC_EVENT_EXEC, 10), (execwatch.PROC_EVENT_EXIT, 11)])
         self.assertEqual(handled, [10])
+
+    def test_a_loss_of_events_reaches_the_ring(self):
+        from arx.modules import execwatch, procring
+
+        class Sock:
+            calls = 0
+
+            def recv(self, n):
+                Sock.calls += 1
+                if Sock.calls > 1:
+                    raise SystemExit
+                raise OSError(105, "no buffer space")
+        lost = []
+        with mock.patch.object(procring, "lost", lambda now=None: lost.append(1)), \
+                mock.patch.dict(execwatch._state, {"lost": 0}):
+            with self.assertRaises(SystemExit):
+                execwatch._listen(Sock(), "", lambda: False)
+            self.assertEqual(execwatch._state["lost"], 1)
+        self.assertEqual(lost, [1])
 
     def test_each_event_reaches_the_ring_before_the_slow_work_and_a_failure_never_stops_the_loop(self):
         from arx.modules import execwatch, procring

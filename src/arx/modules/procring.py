@@ -13,7 +13,10 @@ de procesos de `execwatch` (cada `exec` y cada salida del kernel), antes de su t
 milisegundos.
 
 `ancestry(pid, ppid, instante)` contesta, para lo que auditd vio escribir, si el padre era un proceso del anillo vivo en ese
-instante (con el margen del reloj entre lo que apunta Arx y lo que apunta el kernel). Límites:
+instante: desde su exec (con 2 s de margen de reloj hacia atrás) hasta su salida, sin margen. Límites:
+  · Si el kernel tira eventos del conector (ENOBUFS en una avalancha), puede haber tirado una salida: todo lo que el anillo
+    daba por vivo se da por salido en ese instante (`lost()`), y lo que escriban después sus hijos ya no se prueba. Es un
+    falso positivo posible bajo carga, nunca un falso negativo.
   · Solo se prueba lo que el vigilante leyó a tiempo: un ayudante que muere antes de que se le lea no figura, y lo que
     cuelgue de él no se prueba. Lo habitual (el chown, el chmod, el sed del propio script) cuelga directamente del script.
   · El anillo vive en el proceso: tras un reinicio de Arx no hay nada de antes (lo que esperaba en `pkgtx` sí se guarda).
@@ -30,7 +33,7 @@ import time
 DPKG = "/usr/bin/dpkg"
 TTL_S = 3600          # cuánto se recuerda un proceso; una transacción larga, o un evento que espera, caben de sobra
 MAX_ENTRIES = 2048
-SLACK_S = 2.0         # el instante de Arx y el del kernel no son el mismo reloj ni el mismo momento
+SLACK_S = 2.0         # solo hacia atrás desde el exec: el instante de Arx y el del kernel no son el mismo reloj
 MAX_DEPTH = 8
 _SCRIPT = re.compile(r"^/var/lib/dpkg/(?:info/(?P<pkg>[A-Za-z0-9][A-Za-z0-9+.:_-]*)\.(?:preinst|postinst|prerm|postrm)"
                      r"|tmp\.ci/(?:preinst|postinst|prerm|postrm))$")
@@ -157,12 +160,27 @@ def observe_exit(pid: int, now: float | None = None) -> None:
         return
 
 
+def lost(now: float | None = None) -> None:
+    """El kernel tiró eventos del conector: puede ser una salida. Nada de lo que se daba por vivo se prueba desde ahora."""
+    try:
+        now = time.time() if now is None else now
+        with _lock:
+            for entry in _ring.values():
+                if entry["exit"] is None:
+                    entry["exit"] = now
+    except Exception:  # noqa: BLE001
+        return
+
+
 def _covering(pid: int, at: float) -> dict | None:
     """La entrada de ese pid que estaba viva en `at`."""
     best = None
     for key in _by_pid.get(pid, ()):
         e = _ring.get(key)
-        if e and e["at"] - SLACK_S <= at and (e["exit"] is None or at <= e["exit"] + SLACK_S):
+        # El margen de reloj solo va del lado del nacimiento (un evento de justo antes del exec que Arx apuntó). Del lado
+        # de la salida, ninguno: muerto el script, sus descendientes pasan a init, así que un `ppid` igual a su número
+        # después de su salida solo puede ser un pid reutilizado (HZ de Q sobre 2b0dd18).
+        if e and e["at"] - SLACK_S <= at and (e["exit"] is None or at <= e["exit"]):
             if best is None or e["at"] > best["at"]:
                 best = e
     return best
