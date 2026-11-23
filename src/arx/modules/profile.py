@@ -939,13 +939,16 @@ def _updates(subjects: dict, cfg: dict, now: datetime, check_versions: bool = Tr
             if t["trusted"]:
                 lifted = bool(held.pop(key, None) and response.forget(response.fingerprint({"fp_key": key})))
                 if path in confined:
-                    # la versión que corre está verificada: lo que dejó un veredicto viejo de ESTE paquete (esta
-                    # versión medida con una comprobación ya corregida, o una versión que ya no está) deja de
-                    # contenerlo; el incidente se queda en el registro (rc12, u24: nginx seguía sin red)
-                    for fp in response.untrusted_confinements(path, p):
-                        lifted = bool(response.forget(fp)) or lifted
-                    for k in [k for k in held if k.startswith(f"untrusted_update|{path}|{p}=")]:
-                        held.pop(k)
+                    # lo que dejó un veredicto viejo de ESTE paquete deja de contenerlo (rc12, u24: nginx seguía sin
+                    # red); el incidente se queda en el registro. De esta misma versión (medida con una comprobación
+                    # ya corregida), siempre: lo que corre es lo verificado. De otra versión, solo si todo el servicio
+                    # arrancó después del confinamiento: sin reiniciar, en memoria sigue el código no fiable (RV de Q)
+                    for b in response.untrusted_confinements(path, p):
+                        if b["version"] == pv or _started_after(path, b["applied_at"]):
+                            lifted = bool(response.forget(b["fp"])) or lifted
+                    for k in [k for k in held if k.startswith(f"untrusted_update|{path}|{p}=") and k != key]:
+                        if _started_after(path, held[k]):
+                            held.pop(k)
                 if lifted:
                     response.record({"kind": "trust_confirmed", "detail": tr(
                         "{unit}: {pkg} {version} passed the trust checks; its network is back",
@@ -1524,6 +1527,26 @@ def _mapped_libs(pid: int) -> tuple[set[str], str | None]:
         return set(), None
     pre = next((e[11:].decode("utf-8", "replace") for e in env if e.startswith(b"LD_PRELOAD=")), None)
     return libs, pre
+
+
+def _started_after(path: str, when) -> bool:
+    """¿Todos los procesos del servicio arrancaron después de `when` (ISO o datetime)? Un servicio parado, también:
+    nada de lo que corre es de antes. Ante cualquier duda (sin hora, un proceso que no se puede leer), no."""
+    when = _parse(when) if isinstance(when, str) else when
+    if not when:
+        return False
+    try:
+        with open("/proc/stat", encoding="ascii") as f:
+            btime = next(int(line.split()[1]) for line in f if line.startswith("btime "))
+        hz = os.sysconf("SC_CLK_TCK")
+        for pid in _cgroup_pids(path):
+            with open(f"/proc/{pid}/stat", encoding="utf-8", errors="replace") as f:
+                start = btime + int(f.read().rsplit(")", 1)[1].split()[19]) / hz  # campo 22: starttime
+            if start <= when.timestamp():
+                return False
+    except (OSError, ValueError, StopIteration, IndexError):
+        return False
+    return True
 
 
 def _cgroup_pids(path: str) -> list[int]:

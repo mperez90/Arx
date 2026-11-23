@@ -1619,9 +1619,9 @@ def accept(fp: str, scope: str | None = None) -> str | None:
     return "\n".join(out)
 
 
-def untrusted_confinements(path: str, pkg: str) -> list[str]:
-    """Las huellas de lo que confina al servicio `path` por una actualización no fiable del paquete `pkg` (cualquier
-    versión). Lo de otro paquete, otro servicio u otra causa no entra."""
+def untrusted_confinements(path: str, pkg: str) -> list[dict]:
+    """Lo que confina al servicio `path` por una actualización no fiable del paquete `pkg`, de cualquier versión:
+    [{"fp", "version", "applied_at"}]. Lo de otro paquete, otro servicio u otra causa no entra."""
     findings, out = load_findings(), []
     for b in _load_blocks():
         rv = b.get("revert")
@@ -1629,8 +1629,9 @@ def untrusted_confinements(path: str, pkg: str) -> list[str]:
                 and any(u.get("path") == path for u in rv.get("units") or [])):
             continue
         e = findings.get(b.get("fp")) or {}
-        if e.get("set") == "untrusted_update" and str(e.get("item", "")).partition("=")[0] == pkg:
-            out.append(b["fp"])
+        name, _, version = str(e.get("item", "")).partition("=")
+        if e.get("set") == "untrusted_update" and name == pkg:
+            out.append({"fp": b["fp"], "version": version, "applied_at": b.get("applied_at")})
     return out
 
 
