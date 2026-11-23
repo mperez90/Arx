@@ -1619,6 +1619,21 @@ def accept(fp: str, scope: str | None = None) -> str | None:
     return "\n".join(out)
 
 
+def untrusted_confinements(path: str, pkg: str) -> list[str]:
+    """Las huellas de lo que confina al servicio `path` por una actualización no fiable del paquete `pkg` (cualquier
+    versión). Lo de otro paquete, otro servicio u otra causa no entra."""
+    findings, out = load_findings(), []
+    for b in _load_blocks():
+        rv = b.get("revert")
+        if not (isinstance(rv, dict) and rv.get("tool") == "confine"
+                and any(u.get("path") == path for u in rv.get("units") or [])):
+            continue
+        e = findings.get(b.get("fp")) or {}
+        if e.get("set") == "untrusted_update" and str(e.get("item", "")).partition("=")[0] == pkg:
+            out.append(b["fp"])
+    return out
+
+
 def forget(fp: str) -> dict | None:
     """Olvida un hallazgo aceptado, su pendiente Tier 2 y lo que lo contenía: si dices que es
     normal, tu servicio no puede seguir caído una hora más. Devuelve la entrada o None.

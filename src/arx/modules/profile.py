@@ -826,7 +826,7 @@ def _alert_only(unit: str) -> bool:
 
 
 def _updates(subjects: dict, cfg: dict, now: datetime, check_versions: bool = True,
-             enforce: bool = False, incomplete: list | None = None) -> list[dict]:
+             enforce: bool = False, incomplete: list | None = None, confined=frozenset()) -> list[dict]:
     """Una actualización es justo cuando llegaría una versión firmada con código malicioso: se evalúa con
     todas las capas, el modelo investiga si lo hay, y lo que no llegue a la confianza mínima queda
     confinado sin red (sigue atendiendo) hasta que una persona decida. Cuenta igual una actualización
@@ -937,7 +937,16 @@ def _updates(subjects: dict, cfg: dict, now: datetime, check_versions: bool = Tr
                         unit=s["unit"], pkg=p, version=pv)})
                 continue
             if t["trusted"]:
-                if held.pop(key, None) and response.forget(response.fingerprint({"fp_key": key})):
+                lifted = bool(held.pop(key, None) and response.forget(response.fingerprint({"fp_key": key})))
+                if path in confined:
+                    # la versión que corre está verificada: lo que dejó un veredicto viejo de ESTE paquete (esta
+                    # versión medida con una comprobación ya corregida, o una versión que ya no está) deja de
+                    # contenerlo; el incidente se queda en el registro (rc12, u24: nginx seguía sin red)
+                    for fp in response.untrusted_confinements(path, p):
+                        lifted = bool(response.forget(fp)) or lifted
+                    for k in [k for k in held if k.startswith(f"untrusted_update|{path}|{p}=")]:
+                        held.pop(k)
+                if lifted:
                     response.record({"kind": "trust_confirmed", "detail": tr(
                         "{unit}: {pkg} {version} passed the trust checks; its network is back",
                         unit=s["unit"], pkg=p, version=pv)})
@@ -1092,6 +1101,7 @@ def sweep(enforce: bool = False, cfg: dict | None = None, now: datetime | None =
         # versiones solo si dpkg cambió; lo ya actualizado se re-evalúa una hora (el modelo llega después)
         incomplete: list = []
         findings += _updates(subjects, cfg, now, check_versions=_dpkg_changed(st), enforce=enforce,
+                             confined=confined,
                              incomplete=incomplete)
         if incomplete:  # dpkg no contestó a todo: el cambio no se da por visto y el barrido siguiente lo repite
             st.pop("dpkg_gen", None)
