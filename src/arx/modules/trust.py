@@ -182,12 +182,16 @@ def check_files(f: dict) -> dict:
     conf, rules = _conffiles(f["package"]), _dpkg_filters()
     changed, recognized, ignored = [], 0, 0
     for line in out.splitlines():
-        if len(line) > 13 and line[2] == "5":
+        if len(line) > 10 and line[2] == "5":
+            # dpkg escribe «%.9s %c %s» («??5?????? c /etc/nginx/nginx.conf»): leer por columnas fijas tomaba un
+            # conffile editado por el admin como un paquete manipulado (rc11, piloto A: nginx crit con confianza 0)
             recognized += 1
-            if line[11] == "c":
+            rest = line[9:].strip()
+            is_conf, path = rest.startswith("c "), rest[2:].strip() if rest.startswith("c ") else rest
+            if is_conf or path in conf:
                 ignored += 1
             else:
-                changed.append(line[13:].strip())
+                changed.append(path)
         elif line.startswith("missing "):
             recognized += 1
             rest = line[len("missing"):].strip()
