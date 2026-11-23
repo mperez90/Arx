@@ -55,5 +55,59 @@ class DpkgVerifyRealFormat(unittest.TestCase):
         self.assertEqual(self._check("??5??????    /usr/bin/xz\n")["result"], "fail")
 
 
+class TrustCacheAge(unittest.TestCase):
+    """rc12 en u24: el veredicto de nginx .21 hecho con el `check_files` roto seguía vivo con la rc12 ya puesta.
+    `assess` reescribía la entrada de caché con la hora actual aunque viniera de la caché: mientras el servicio se siga
+    evaluando, un veredicto no caducaba nunca (CACHE_DAYS no hacía nada). Y lo que midió una comprobación ya corregida
+    no puede seguir valiendo: CACHE_V sube con cada arreglo de una comprobación."""
+
+    def setUp(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        os.environ["ARX_STATE_DIR"], os.environ["ARX_CONFIG_DIR"] = os.path.join(d, "s"), os.path.join(d, "c")
+        self.runs = 0
+
+        def ok(*a, **k):
+            self.runs += 1
+            return trust._check("x", "pass", "x")
+        self.patches = [mock.patch.object(trust, "package_facts", return_value=dict(F)),
+                        mock.patch.object(trust, "check_fresh", side_effect=ok),
+                        mock.patch.dict(trust.CHECKS, {n: ok for n in trust._QUICK if n != "fresh"})]
+        for p in self.patches:
+            p.start()
+            self.addCleanup(p.stop)
+        self.key = f"{F['package']}={F['version']}|quick"
+
+    def _seed(self, age_s, v=None, result="fail"):
+        from arx import config
+        old = trust.time.time() - age_s
+        config.write_json(trust._cache_path(), {self.key: {
+            "t": old, "v": trust.CACHE_V if v is None else v,
+            "checks": [trust._check("files_intact", result, "changed since installed: etc/nginx/nginx.conf",
+                                    required=True)]}})
+        return old
+
+    def _stored_t(self):
+        from arx import config
+        return config.read_json(trust._cache_path(), {})[self.key]["t"]
+
+    def test_reusing_a_cached_verdict_does_not_make_it_young_again(self):
+        old = self._seed(6 * 86400)
+        self.assertFalse(trust.assess("nginx")["trusted"])
+        self.assertEqual(self.runs, 0, "dentro de CACHE_DAYS se reutiliza")
+        self.assertAlmostEqual(self._stored_t(), old, places=3)
+
+    def test_a_verdict_older_than_cache_days_is_checked_again(self):
+        self._seed(8 * 86400)
+        self.assertTrue(trust.assess("nginx")["trusted"])
+        self.assertGreater(self.runs, 0)
+
+    def test_a_verdict_from_a_check_since_fixed_is_checked_again(self):
+        self._seed(60, v=2)  # hecho con el check_files de la columna equivocada
+        self.assertGreaterEqual(trust.CACHE_V, 3)
+        self.assertTrue(trust.assess("nginx")["trusted"])
+        self.assertGreater(self.runs, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
