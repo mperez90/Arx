@@ -938,6 +938,8 @@ class PortScanTests(unittest.TestCase):
         p = mock.patch.object(sensors, "_scan_from_nft", lambda: None)  # forzar fallback
         p.start()
         self.addCleanup(p.stop)
+        sensors._scan_read.update(at=None, nft=False)
+        self.addCleanup(sensors._scan_read.update, at=None, nft=False)
 
     def _conns(self, ip, ports):
         return [{"proto": "tcp", "local_port": p, "remote_ip": ip,
@@ -990,6 +992,9 @@ class NftScanTrackTests(unittest.TestCase):
         p = mock.patch.object(recon, "local_ips", lambda: {"127.0.0.1", "::1", "172.18.0.2"})
         p.start()
         self.addCleanup(p.stop)
+        # la última lectura de nft se recuerda entre llamadas (SCAN_EVERY_S): que no pase a la prueba siguiente
+        sensors._scan_read.update(at=None, nft=False)
+        self.addCleanup(sensors._scan_read.update, at=None, nft=False)
 
     def _run_canned(self, out):
         class R:
