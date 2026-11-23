@@ -389,9 +389,22 @@ def _audit_new(key: str) -> list[list[str]]:
 
 def _audit_text(events: list[list[str]]) -> list[str]:
     """Una línea legible por evento: la de `ausearch --format text` (lee los registros por stdin); sin él, un
-    resumen de los campos."""
+    resumen de los campos. Un `fchown`/`fchmod` sobre un descriptor trae `name=(null)`: se pone el fichero que el
+    inodo era cuando se abrió, si se sabe."""
     if not events:
         return []
+    return [_named(line, ev) for line, ev in zip(_audit_text_raw(events), events)]
+
+
+def _named(line: str, ev: list[str]) -> str:
+    if "(null)" not in line:
+        return line
+    from arx.modules import pkgtx  # perezoso: pkgtx importa este módulo
+    names = pkgtx.file_names(ev)
+    return re.sub(r"\S*\(null\)", lambda m: names[0], line, count=1) if names else line
+
+
+def _audit_text_raw(events: list[list[str]]) -> list[str]:
     if shutil.which("ausearch"):
         try:
             r = subprocess.run(["ausearch", "--format", "text"], input="".join(l + "\n" for ev in events for l in ev),
@@ -408,7 +421,8 @@ def _audit_text(events: list[list[str]]) -> list[str]:
             fields = {k: _audit_value(k, v) for k, v in _AUDIT_FIELD.findall(line)}
             if line.startswith("type=SYSCALL"):
                 sc = fields
-            elif line.startswith("type=PATH") and name == "?" and fields.get("name"):
+            elif line.startswith("type=PATH") and name == "?" and fields.get("name") \
+                    and fields.get("nametype") != "PARENT":
                 name = fields["name"]
         summary.append(f"{sc.get('exe', '?')} (pid {sc.get('pid', '?')}, uid {sc.get('uid', '?')}, "
                        f"success={sc.get('success', '?')}) {name}")

@@ -30,8 +30,14 @@ de integridad, que compara con la base sellada y solo da por buena la escritura 
   · `dpkg.log` va en segundos enteros y lo puede escribir un root: la ventana es el segundo entero de sus líneas (hasta
     2 s de dpkg.log contado por exceso); un dpkg alterado no vale (se comprueba antes), un dpkg.log falsificado por
     un root con un dpkg auténtico sí podría abrir una ventana falsa de ese tamaño.
-  · Lo que escribe un hijo de dpkg en una sesión de login (un `sudo apt upgrade` interactivo) no se atribuye: queda
-    high. El propio dpkg sí se explica, tenga o no sesión.
+  · Un hijo con sesión de login (el chown y el chmod del postinst en un `sudo apt upgrade` a mano, auid=0 ses=432 en d13)
+    solo se atribuye si se PRUEBA su ascendencia: hijo → script de mantenimiento del paquete dueño del fichero → dpkg,
+    visto en tiempo real por `procring` (alimentado por el conector de procesos de `execwatch`). Sin esa prueba (el padre
+    murió antes de que se le leyera, Arx se reinició, el kernel tiró el evento) queda high. El propio dpkg se explica,
+    tenga o no sesión. Con la prueba, la herramienta sigue teniendo que ser de un paquete firmado y sin alterar, root, y
+    el fichero del paquete cuyo script escribe; la ventana de `dpkg.log` sigue mandando.
+  · La prueba de ascendencia confía en el script: quien sea root puede editar `/var/lib/dpkg/info/P.postinst` y lanzar
+    `dpkg --configure P`; lo que sus hijos cambien de contenido o permisos lo ve la comprobación de integridad.
   · Un fichero que el paquete deja de traer ya no consta como suyo cuando Arx barre: queda high.
 """
 from __future__ import annotations
@@ -40,7 +46,7 @@ import collections
 import os
 import time
 
-from arx.modules import integrity, pkgdb, provenance, sensors
+from arx.modules import integrity, pkgdb, procring, provenance, sensors
 
 DPKG_LOGS = ("/var/log/dpkg.log.1", "/var/log/dpkg.log")
 TAIL_BYTES = 4 << 20       # de cada log, solo el final: una transacción reciente está ahí
@@ -363,11 +369,17 @@ def _judge(records: list[str], checker: Checker) -> tuple[str, dict | None]:
         return "unexplained", None
     sc = f["sc"]
     exe = sc.get("exe", "")
+    lineage, sessionless = None, True
     if exe == integrity.DPKG:
         writer = "dpkg"
     else:
-        if sc.get("uid") != "0" or sc.get("euid", sc.get("uid")) != "0" or sc.get("auid") not in _UNSET \
-                or sc.get("ses") not in _UNSET or not checker.tool(exe):
+        if sc.get("uid") != "0" or sc.get("euid", sc.get("uid")) != "0" or not checker.tool(exe):
+            return "unexplained", None
+        # un hijo es del paquete si se prueba su ascendencia (script de mantenimiento lanzado por dpkg, visto en tiempo
+        # real: vale también con la sesión de login de quien lanzó el apt); si no, solo sin sesión (la ventana decide)
+        lineage = _lineage(sc, f["at"])
+        sessionless = sc.get("auid") in _UNSET and sc.get("ses") in _UNSET
+        if lineage is None and not sessionless:
             return "unexplained", None
         writer = "script"
     owners: dict[str, dict] = {}
@@ -378,6 +390,8 @@ def _judge(records: list[str], checker: Checker) -> tuple[str, dict | None]:
         pkg = checker.owner(stem)
         if not pkg:
             return "unexplained", None
+        if lineage is not None and pkg.partition(":")[0] != lineage["package"] and not sessionless:
+            return "unexplained", None  # con sesión solo vale lo del paquete cuyo script lo escribe
         window = transaction(pkg, f["at"])
         if not window:
             return "unexplained", None
@@ -389,5 +403,30 @@ def _judge(records: list[str], checker: Checker) -> tuple[str, dict | None]:
         return "pending", {"at": f["at"]}
     names = sorted(owners)
     return "explained", {"packages": names, "package": ", ".join(names), "files": stems, "writer": writer,
+                         "proof": "ancestry" if lineage is not None else ("dpkg" if writer == "dpkg" else "window"),
                          "version": ", ".join(owners[n]["ver"] for n in names),
                          "key": "|".join(f"{n}|{owners[n]['ver']}" for n in names)}
+
+
+def _lineage(sc: dict, at: float) -> dict | None:
+    try:
+        return procring.ancestry(int(sc["pid"]), int(sc["ppid"]), at)
+    except (KeyError, ValueError):
+        return None
+
+
+def file_names(records: list[str]) -> list[str]:
+    """Los ficheros que tocó el evento con su nombre, también los que auditd no nombra (un `fchown` sobre un descriptor
+    solo trae el inodo: el nombre lo dijo el evento que lo abrió). Para el texto de la alerta."""
+    try:
+        f = facts(records)
+        out = []
+        for p in (f or {}).get("paths", ()):
+            if p.get("nametype") == "PARENT":
+                continue
+            names = _files({"at": f["at"], "cwd": f["cwd"], "paths": [p]})
+            if names:
+                out.append(names[0])
+        return out
+    except Exception:  # noqa: BLE001 - el texto es ayuda, nunca bloquea
+        return []
