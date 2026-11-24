@@ -1,14 +1,13 @@
 # Arx v0.0.9
 
-TODO: confirmar con arx-98 — summary of the release (one paragraph, after the fixes are final).
-
-> DRAFT by pista-q for arx-98 to review. Written for Arx users and operators deciding whether and how
-> to upgrade. Sources: `git log v0.0.9rc2..dev/0.0.9` and `DevelopDocs/canal-arx.md`. Short sentences; no
-> lab figures until measured (Performance leaves placeholders).
+Arx 0.0.9 is the first stable Core release after 0.0.9rc1 and rc2. Critical configuration is now checked
+file by file, by what a change means and who made it. Three ways to fool Arx through SSH log lines are fixed
+(see Security). Package updates are told apart from tampering, and this was checked on real Ubuntu 24.04 and
+Debian 13 servers: the last 12-hour pilot on both raised no false high or critical alert across signed
+updates, kernel updates and manual upgrades. On a quiet host Arx now uses about a third of the CPU it used
+in rc2.
 
 ## Highlights
-
-TODO: confirmar con arx-98 — the rc2 items below are carried over; check each one against the final 0.0.9 build.
 
 - **auditd is always installed.** The package now depends on `auditd` instead of only suggesting it,
   so identity-file, honeytoken and denied-open alerts work out of the box. The installer starts it if
@@ -52,9 +51,6 @@ those. None of them let an attacker into the host; they let an attacker fool or 
 
 ## Fixes
 
-TODO: confirmar con arx-98 — the carried entries below keep their rc2→0.0.9 wording; the pilot-A
-subsection is new. Each entry needs its test reference and evidence before publishing.
-
 ### Installer output
 
 The installer now installs the package in one `apt` step, so `apt` resolves `python3`, `auditd` and the
@@ -92,6 +88,10 @@ The model's verdict travels in its own structured channel, separate from the ana
 people. A verdict line placed inside the analysis is ignored. Validation is unchanged: zero tolerance,
 one verdict per finding, only the ids Arx asked about.
 
+If you accept a finding (`arx accept`) while the model is still analysing it, its late verdict no longer
+acts. Before, a "threat" verdict could still close the session and block the origin you had just
+accepted. An accepted login is remembered for 30 days, so the model cannot overrule you if it comes back.
+
 ### A new root or last-admin login is answered on your word
 
 A new login by root, a system account or the last administrator account is not answered by locking the
@@ -104,9 +104,37 @@ An integrity check reads a file again only when its metadata changes (including 
 `touch -r` cannot restore), when auditd sees a write to it, or once an hour. Setting the clock back does
 not hide a write from the cache: Arx compares the identity of the last audit event, not its date.
 
+### Package updates are not mistaken for tampering
+
+Found during the pilot on real Ubuntu 24.04 and Debian 13 servers, when automatic updates ran.
+
+- **An edited configuration file does not make an update untrusted.** Arx read `dpkg --verify` one column
+  off, so a configuration file you had edited (for example `/etc/nginx/nginx.conf`) counted as a tampered
+  package file. The update was rated untrusted and the service lost its network. Edited configuration
+  files are yours; changed programs and libraries still fail the check.
+- **A package update does not raise identity alerts.** When sudo was updated, the writes of dpkg and of the
+  package's own scripts to `/etc/sudoers` raised high alerts. Now they are one info entry, but only when
+  Arx can prove that:
+  - dpkg is intact;
+  - the package and dpkg come from a signed repository;
+  - the file belongs to that package;
+  - the write happened inside that package's own transaction;
+  - the writer was dpkg, or one of the package's maintainer scripts (proved from the process tree, so
+    an `apt upgrade` run by hand counts too).
+
+  A local `.deb`, a `trusted=yes` source, a write outside a transaction, another package's file, or a
+  tampered dpkg or tool still raise high.
+- **Trust verdicts expire as designed.** A cached verdict was saved again every time it was reused, so it
+  never expired. Verdicts now last their 7 days. A verdict made by a check that has since been fixed is
+  measured again.
+- **A verified update gives the network back.** When the installed version of a package is verified, the
+  containment left by older untrusted verdicts for that package is lifted, and the incident stays in the
+  log. Containment for another version is lifted only if the whole service restarted after it, because
+  until then the untrusted code may still be running in memory.
+
 ### Hardening and fixes from the pilot
 
-NEW. Found on real Ubuntu 24.04 and Debian 13 hosts during the pilot.
+Found on real Ubuntu 24.04 and Debian 13 hosts during the pilot.
 
 - **Upgrading to a build that watches new config groups no longer re-alerts.** When Arx starts watching
   `rc.local`, shell init files and `ld.so.conf`, the files already there are adopted with a single
@@ -125,18 +153,20 @@ NEW. Found on real Ubuntu 24.04 and Debian 13 hosts during the pilot.
 
 ## Performance
 
-TODO: confirmar con arx-98 — fill the measured figures from the pilot before publishing. No numbers here
-are final.
+Measured on the pilot servers (small cloud VPS): Ubuntu 24.04 in enforce mode with one confined
+service, Debian 13 in observe mode. CPU is the whole `arx.service`, its helper processes included, averaged
+over 12 hours in 10-minute windows.
 
-- **Maintenance is near-idle (B78).** On a quiet host a sweep spawns only a couple of helper processes,
-  not a storm of `dpkg-query` calls. Idle CPU on the pilot VPS: _TBD_.
-- **The nft structure is read without its elements (B78-b).** Reading the whole table with every learned
-  destination cost CPU in proportion to the number of destinations; Arx now reads the structure without
-  them, and removes each learned destination from the kernel once it has read it. CPU on a host with many
-  learned destinations: _TBD_.
-- Signed provenance is reused while apt's state does not change, and what has been learned is read every
-  15 minutes rather than every 5.
+- **Idle CPU about 0.7 % of one core** (0.74 % on Ubuntu, 0.68 % on Debian), down from 2.2 % before these
+  changes. Updates, trust checks and model calls make short peaks: a few 10-minute windows reached 1.4–1.8 %.
+- **A quiet sweep starts 2 helper processes, not 17.** Arx asks dpkg only when dpkg's state changes, and
+  reuses signed provenance while apt's state does not change. Maintenance helpers dropped from 12 per hour
+  to 3.6–4.6.
+- **nftables is read only when something changed.** The structure of Arx's table is read without its
+  elements, and only again when the nf_tables generation changes. Learned destinations are removed from
+  the kernel once read, and read every 15 minutes instead of 5.
 - Integrity rereads only what changed, with a full recheck once an hour.
+- Memory stayed flat: 37–64 MB resident.
 
 ## Upgrading
 
@@ -163,4 +193,13 @@ are final.
 - **Listening-socket owners are refreshed lazily.** A new port, or a port that changes socket, is seen in
   the same sweep. If a second process inherits or receives an existing listener while its first owner is
   still alive, the owner list Arx shows for that port can be up to 5 minutes old.
-- TODO: confirmar con arx-98 — replace the remaining rc1/rc2 carry-overs once the list is final.
+- **Idle CPU is about 0.7 % of one core**, not the 0.5 % we aimed for. What remains is the 30-second
+  polling design; 0.0.9.1 replaces most of it with events (inotify, dpkg and nftables) and targets under
+  0.3 %.
+- **A configuration change is seen within one sweep (up to 30 s).** 0.0.9.1 brings this down to seconds.
+- **A model analysis can delay the next sweep.** The model is asked in the same loop that sweeps, with a
+  3-minute limit, and nothing is lost meanwhile. In 0.0.9.1 the model runs on its own thread.
+- **Inside a package's own transaction**, which took a median of 1 s and at most 13 s in our logs, a root
+  process without a login session could write one of that package's files with a signed tool and put it
+  back before the next sweep, and Arx would report it as info. Any change that stays is still caught by the
+  integrity check.
