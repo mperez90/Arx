@@ -1356,6 +1356,37 @@ def _recent_llm_locks(now: datetime) -> list[str]:
     return [t for t in config.read_json(_llm_locks_path(), []) if (_parse_dt(t) or cutoff) > cutoff]
 
 
+# `accept()` de un acceso borra el hallazgo; que una persona lo aceptó queda aquí (como `human_cleared` de `unlock`) para que,
+# si el mismo hallazgo vuelve a aparecer, nazca ya decidido y el modelo no lo pueda contradecir. Acotado en tiempo y en número.
+CLEARED_DAYS = 30
+CLEARED_MAX = 500
+
+
+def _cleared_path():
+    return config.state_dir() / "human_cleared.json"
+
+
+def _read_cleared() -> dict:
+    data = config.read_json(_cleared_path(), {})
+    return data if isinstance(data, dict) else {}
+
+
+def _mark_cleared(fp: str, now=None) -> None:
+    now = now or _now()
+    horizon = now - timedelta(days=CLEARED_DAYS)
+    with config.locked():
+        marks = {k: v for k, v in _read_cleared().items()
+                 if isinstance(k, str) and (_parse_dt(v) or horizon) > horizon}
+        marks[fp] = _iso(now)
+        if len(marks) > CLEARED_MAX:
+            marks = dict(sorted(marks.items(), key=lambda kv: kv[1])[-CLEARED_MAX:])
+        config.write_json(_cleared_path(), marks)
+
+
+def _was_cleared(fp: str) -> bool:
+    return fp in _read_cleared()
+
+
 def _verdict_refusal(user: str, origin: str, entry: dict | None, enforce: bool,
                      cfg: dict, now: datetime) -> str | None:
     """Por qué NO se actúa sobre un veredicto del modelo. Todo esto lo decide el código."""
@@ -1363,7 +1394,9 @@ def _verdict_refusal(user: str, origin: str, entry: dict | None, enforce: bool,
         return tr("observe mode: with --enforce its access would have been closed")
     if cfg.get("llm_identity_actions") is False:
         return tr("disabled in the configuration (llm_identity_actions)")
-    if (entry or {}).get("human_cleared"):
+    if entry is None:  # aceptado u olvidado mientras el modelo pensaba (hasta 180 s): una persona ya decidió
+        return tr("it is no longer open (you accepted or forgot it): the model does not overrule you")
+    if entry.get("human_cleared"):
         return tr("you already unlocked it: the model does not overrule you")
     if not has_live_session(user, origin):
         return tr("no verifiable live session from that origin (auth.log can be forged)")
@@ -1603,6 +1636,8 @@ def accept(fp: str, scope: str | None = None) -> str | None:
     if not accepted:
         return tr("Could not update the baseline (does it exist and contain that set?).")
     contained = _active_block(fp)
+    if e["set"] == "login_users":
+        _mark_cleared(fp)  # una persona lo decidió: si vuelve, nace decidido, y el modelo no lo contradice (como `unlock`)
     forget(fp)
     if e["set"] == "untrusted_update":  # el preventivo y el veredicto de esa versión: los dos se levantan
         for other, oe in list(load_findings().items()):
@@ -3007,7 +3042,8 @@ def handle(finding: dict, enforce: bool = False, authorized: bool = False,
         entry = entry or {"first_seen": _iso(now), "seen": 0, "kind": finding.get("kind"),
                           "detail": finding.get("detail"), "set": finding.get("set"),
                           "item": finding.get("item"), "vaccine": finding.get("vaccine"),
-                          "ip": (finding.get("target") or {}).get("ip")}
+                          "ip": (finding.get("target") or {}).get("ip"),
+                          **({"human_cleared": True} if finding.get("kind") == "login_users" and _was_cleared(fp) else {})}
         entry["seen"] += 1
         entry["last_seen"] = _iso(now)
 

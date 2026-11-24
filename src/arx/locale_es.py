@@ -1352,6 +1352,8 @@ ES = {
         "modo observar: con --enforce se habrían cerrado sus accesos",
     "disabled in the configuration (llm_identity_actions)":
         "desactivado en la configuración (llm_identity_actions)",
+    "it is no longer open (you accepted or forgot it): the model does not overrule you":
+        "ya no está abierto (lo aceptaste o lo olvidaste): el modelo no te contradice",
     "you already unlocked it: the model does not overrule you":
         "ya la desbloqueaste tú: el modelo no te lleva la contraria",
     "no verifiable live session from that origin (auth.log can be forged)":
