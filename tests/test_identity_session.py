@@ -270,7 +270,9 @@ class AuthorizingClosesOnlyThatSession(SessionOnly):
 class TheModelStillCannotTouchRootOrTheLastAdmin(SessionOnly):
     def _pair(self, user):
         f = self.login(user)
-        return f, {"fp": "abc123" + "0" * 34, "tier": 2, "status": "pending", "new": True}
+        fp = "abc123" + "0" * 34
+        self.r._save_findings({fp: {"seen": 1, "kind": "login_users", "item": f["target"]["user"], "status": "pending"}})
+        return f, {"fp": fp, "tier": 2, "status": "pending", "new": True}   # un hallazgo vivo: está en el estado
 
     def test_a_model_verdict_on_root_closes_nothing_and_tells_the_owner_how_to_do_it(self):
         pair = self._pair("root")
