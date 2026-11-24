@@ -369,6 +369,15 @@ def _lab_answer(fp, verdict="threat", confidence=92):
             + json.dumps([{"id": fp, "verdict": verdict, "confidence": confidence, "reason": "lab"}]))
 
 
+def _lab_model(guard, fp, verdict="threat", confidence=92):
+    """El modelo del lab, por los dos canales de producción (B79): el análisis para personas y el veredicto por su
+    canal estructurado, validado con el mismo `checked_verdicts`. La línea VERDICTS del análisis se ignora a propósito;
+    sin esto, el lab no entregaba ningún veredicto y nada actuaba."""
+    guard._assess_with_engine = lambda new, b, c: _lab_answer(fp, verdict, confidence)
+    obj = {"verdicts": [{"id": fp, "verdict": verdict, "confidence": confidence, "reason": "lab"}]}
+    guard._verdicts_with_engine = lambda new, b, c: guard.checked_verdicts(obj, {fp})
+
+
 def identity_llm(ip):
     """Veredicto del modelo de punta a punta. El modelo se sustituye por su respuesta: lo que se
     prueba es qué hace Arx con ella. El acceso (sin terminal) y la línea falsa son reales."""
@@ -383,7 +392,7 @@ def identity_llm(ip):
         print(f"[FAIL] identidad+modelo: un acceso sin terminal de bob@{ip} no se detectó")
         return 1
     print(f"  hechos que recibe el modelo: {guard.build_dossier([real], base)['new_findings'][0]['facts']}")
-    guard._assess_with_engine = lambda new, b, c: _lab_answer(real[1]["fp"])
+    _lab_model(guard, real[1]["fp"])
     slow = guard.SlowLayer(cfg, base, enforce=True)
     slow.feed([real[0]], [real[1]])
     rep = slow.reports[0] if slow.reports else {}
@@ -422,7 +431,7 @@ def identity_forged():
     if forged is None:
         print("[FAIL] línea falsa: logger no llegó a auth.log; la prueba no prueba nada")
         return 1
-    guard._assess_with_engine = lambda new, b, c: _lab_answer(forged[1]["fp"])
+    _lab_model(guard, forged[1]["fp"])
     slow = guard.SlowLayer({}, base, enforce=True)
     slow.feed([forged[0]], [forged[1]])
     untouched = sh(["passwd", "-S", "dana"]).stdout.split()[1] == "P"
