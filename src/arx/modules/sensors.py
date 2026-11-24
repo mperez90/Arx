@@ -389,9 +389,22 @@ def _audit_new(key: str) -> list[list[str]]:
 
 def _audit_text(events: list[list[str]]) -> list[str]:
     """Una línea legible por evento: la de `ausearch --format text` (lee los registros por stdin); sin él, un
-    resumen de los campos."""
+    resumen de los campos. Un `fchown`/`fchmod` sobre un descriptor trae `name=(null)`: se pone el fichero que el
+    inodo era cuando se abrió, si se sabe."""
     if not events:
         return []
+    return [_named(line, ev) for line, ev in zip(_audit_text_raw(events), events)]
+
+
+def _named(line: str, ev: list[str]) -> str:
+    if "(null)" not in line:
+        return line
+    from arx.modules import pkgtx  # perezoso: pkgtx importa este módulo
+    names = pkgtx.file_names(ev)
+    return re.sub(r"\S*\(null\)", lambda m: names[0], line, count=1) if names else line
+
+
+def _audit_text_raw(events: list[list[str]]) -> list[str]:
     if shutil.which("ausearch"):
         try:
             r = subprocess.run(["ausearch", "--format", "text"], input="".join(l + "\n" for ev in events for l in ev),
@@ -408,7 +421,8 @@ def _audit_text(events: list[list[str]]) -> list[str]:
             fields = {k: _audit_value(k, v) for k, v in _AUDIT_FIELD.findall(line)}
             if line.startswith("type=SYSCALL"):
                 sc = fields
-            elif line.startswith("type=PATH") and name == "?" and fields.get("name"):
+            elif line.startswith("type=PATH") and name == "?" and fields.get("name") \
+                    and fields.get("nametype") != "PARENT":
                 name = fields["name"]
         summary.append(f"{sc.get('exe', '?')} (pid {sc.get('pid', '?')}, uid {sc.get('uid', '?')}, "
                        f"success={sc.get('success', '?')}) {name}")
@@ -504,13 +518,42 @@ def _nothing_there(ev: list[str]) -> bool:
 
 
 def read_auditd_events() -> list[dict]:
+    from arx.modules import pkgtx  # perezoso: pkgtx importa este módulo
     events = []
-    ident = [ev for ev in _audit_new("arx_ident")[-MAX_EVENTS:] if not _nothing_there(ev)]
-    for line in _audit_text(ident):
+    raw = _audit_new("arx_ident")
+    pkgtx.remember(raw)  # los nombres de los inodos, también de lo que el tope de abajo deja fuera
+    checker, plain, updates, now = pkgtx.Checker(), [], {}, time.time()
+    for ev in pkgtx.take_deferred() + raw[-MAX_EVENTS:]:  # lo que esperaba el cierre de una transacción, primero
+        if _nothing_there(ev):
+            continue
+        state, verdict = pkgtx.judge(ev, checker)
+        if state == "pending" and now - verdict["at"] < pkgtx.DEFER_MAX_S and pkgtx.defer(ev, verdict["at"]):
+            continue  # el paquete dueño sigue en transacción: se decide cuando cierre, o en 5 min (high)
+        if state == "explained":
+            update = updates.setdefault(verdict["key"], {**verdict, "files": [], "writers": [], "n": 0})
+            update["files"] += [p for p in verdict["files"] if p not in update["files"]]
+            update["writers"] += [w for w in (verdict["writer"],) if w not in update["writers"]]
+            update["n"] += 1
+        else:
+            plain.append(ev)
+    pkgtx.save_deferred()
+    for line in _audit_text(plain):
         events.append({"sev": "high", "kind": "auditd", "detail": tr("auditd · identity: {line}",
                                                                      line=line)[:400],
                        "fp_key": "auditd|" + f"auditd · identidad: {line}"[:400],
                        "why": tr("write/attribute change on an identity or privilege file")})
+    for u in updates.values():
+        # lo que dpkg y los scripts de mantenimiento del paquete firmado dueño del fichero escribieron dentro de su
+        # transacción: no abre un high (piloto d13, sudo). Queda a la vista, y la integridad sigue comparando el contenido
+        events.append({"sev": "info", "kind": "auditd",
+                       "detail": tr("package update {package} ({version}): its dpkg and maintainer scripts wrote "
+                                    "{files}", package=u["package"], version=u["version"],
+                                    files=", ".join(u["files"][:6]))[:400],
+                       "why": tr("written inside the transaction of the signed package that owns the files; the "
+                                 "content is still checked against the baseline"),
+                       "target": {"package": u["package"], "version": u["version"], "files": u["files"],
+                                  "writers": u["writers"], "events": u["n"]},
+                       "fp_key": f"auditd|package|{u['key']}"})
     for line in _audit_text(_audit_new("arx_canary")[-MAX_EVENTS:]):
         events.append({"sev": "high", "kind": "canary", "detail": tr("canary accessed · {line}",
                                                                      line=line)[:400],

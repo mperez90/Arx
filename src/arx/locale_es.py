@@ -836,6 +836,12 @@ ES = {
         "tiene todos los poderes de root con otro nombre; la instala quien quiere volver a entrar sin que se note. Si es legítima, acéptala",
     "Falco behavior rule fired":
         "regla de comportamiento de Falco disparada",
+    "package update {package} ({version}): its dpkg and maintainer scripts wrote {files}":
+        "actualización del paquete {package} ({version}): su dpkg y sus scripts de mantenimiento escribieron {files}",
+    "written inside the transaction of the signed package that owns the files; the content is still checked "
+    "against the baseline":
+        "escrito dentro de la transacción del paquete firmado dueño de los ficheros; el contenido se sigue "
+        "comparando con la línea base",
     "auditd · identity: {line}":
         "auditd · identidad: {line}",
     "write/attribute change on an identity or privilege file":

@@ -1,0 +1,34 @@
+2026-11-23 15:26:43 startup archives unpack
+2026-11-23 15:26:43 upgrade arx:all 0.0.9~rc11 0.0.9~rc12
+2026-11-23 15:26:43 status half-configured arx:all 0.0.9~rc11
+2026-11-23 15:26:43 status unpacked arx:all 0.0.9~rc11
+2026-11-23 15:26:43 status half-installed arx:all 0.0.9~rc11
+2026-11-23 15:26:43 status triggers-pending man-db:amd64 2.13.1-1
+2026-11-23 15:26:43 status unpacked arx:all 0.0.9~rc12
+2026-11-23 15:26:43 startup packages configure
+2026-11-23 15:26:43 configure arx:all 0.0.9~rc12 <none>
+2026-11-23 15:26:43 status unpacked arx:all 0.0.9~rc12
+2026-11-23 15:26:43 status half-configured arx:all 0.0.9~rc12
+2026-11-23 15:26:44 status installed arx:all 0.0.9~rc12
+2026-11-23 15:26:44 trigproc man-db:amd64 2.13.1-1 <none>
+2026-11-23 15:26:44 status half-configured man-db:amd64 2.13.1-1
+2026-11-23 15:26:44 status installed man-db:amd64 2.13.1-1
+2026-11-23 15:26:49 startup archives unpack
+2026-11-23 15:26:49 upgrade sudo:amd64 1.9.16p2-3+deb13u5 1.9.16p2-3+deb13u5
+2026-11-23 15:26:49 status triggers-pending libc-bin:amd64 2.41-12+deb13u5
+2026-11-23 15:26:49 status half-configured sudo:amd64 1.9.16p2-3+deb13u5
+2026-11-23 15:26:49 status unpacked sudo:amd64 1.9.16p2-3+deb13u5
+2026-11-23 15:26:49 status half-installed sudo:amd64 1.9.16p2-3+deb13u5
+2026-11-23 15:26:49 status triggers-pending man-db:amd64 2.13.1-1
+2026-11-23 15:26:49 status unpacked sudo:amd64 1.9.16p2-3+deb13u5
+2026-11-23 15:26:49 startup packages configure
+2026-11-23 15:26:49 configure sudo:amd64 1.9.16p2-3+deb13u5 <none>
+2026-11-23 15:26:49 status unpacked sudo:amd64 1.9.16p2-3+deb13u5
+2026-11-23 15:26:49 status half-configured sudo:amd64 1.9.16p2-3+deb13u5
+2026-11-23 15:26:50 status installed sudo:amd64 1.9.16p2-3+deb13u5
+2026-11-23 15:26:50 trigproc man-db:amd64 2.13.1-1 <none>
+2026-11-23 15:26:50 status half-configured man-db:amd64 2.13.1-1
+2026-11-23 15:26:50 status installed man-db:amd64 2.13.1-1
+2026-11-23 15:26:50 trigproc libc-bin:amd64 2.41-12+deb13u5 <none>
+2026-11-23 15:26:50 status half-configured libc-bin:amd64 2.41-12+deb13u5
+2026-11-23 15:26:50 status installed libc-bin:amd64 2.41-12+deb13u5

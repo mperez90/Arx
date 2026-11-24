@@ -1,0 +1,46 @@
+type=SYSCALL msg=audit(1795328809.207:29629): arch=c000003e syscall=84 success=no exit=-2 a0=562f4e5b9c40 a1=562f306e941f a2=562f306f6020 a3=100 items=1 ppid=424652 pid=424671 auid=4294967295 uid=0 gid=0 euid=0 suid=0 fsuid=0 egid=0 sgid=0 fsgid=0 tty=pts0 ses=4294967295 comm="dpkg" exe="/usr/bin/dpkg" subj=unconfined key="arx_ident"
+type=CWD msg=audit(1795328809.207:29629): cwd="/"
+type=PATH msg=audit(1795328809.207:29629): item=0 name="/etc/sudoers.d/" inode=25707 dev=08:01 mode=040750 ouid=0 ogid=0 rdev=00:00 nametype=PARENT cap_fp=0 cap_fi=0 cap_fe=0 cap_fver=0 cap_frootid=0
+type=PROCTITLE msg=audit(1795328809.207:29629): proctitle=2F7573722F62696E2F64706B67002D2D7374617475732D6664003131002D2D6E6F2D7472696767657273002D2D756E7061636B002D2D6175746F2D6465636F6E666967757265002F7661722F63616368652F6170742F61726368697665732F7375646F5F312E392E313670322D332B646562313375355F616D6436342E646562
+type=SYSCALL msg=audit(1795328809.207:29630): arch=c000003e syscall=84 success=no exit=-2 a0=562f4e338840 a1=562f306e941f a2=562f306f6020 a3=100 items=1 ppid=424652 pid=424671 auid=4294967295 uid=0 gid=0 euid=0 suid=0 fsuid=0 egid=0 sgid=0 fsgid=0 tty=pts0 ses=4294967295 comm="dpkg" exe="/usr/bin/dpkg" subj=unconfined key="arx_ident"
+type=CWD msg=audit(1795328809.207:29630): cwd="/"
+type=PATH msg=audit(1795328809.207:29630): item=0 name="/etc/sudoers.d/" inode=25707 dev=08:01 mode=040750 ouid=0 ogid=0 rdev=00:00 nametype=PARENT cap_fp=0 cap_fi=0 cap_fe=0 cap_fver=0 cap_frootid=0
+type=PROCTITLE msg=audit(1795328809.207:29630): proctitle=2F7573722F62696E2F64706B67002D2D7374617475732D6664003131002D2D6E6F2D7472696767657273002D2D756E7061636B002D2D6175746F2D6465636F6E666967757265002F7661722F63616368652F6170742F61726368697665732F7375646F5F312E392E313670322D332B646562313375355F616D6436342E646562
+type=SYSCALL msg=audit(1795328809.207:29631): arch=c000003e syscall=257 success=yes exit=12 a0=ffffffffffffff9c a1=562f4e5b9c40 a2=c1 a3=0 items=2 ppid=424652 pid=424671 auid=4294967295 uid=0 gid=0 euid=0 suid=0 fsuid=0 egid=0 sgid=0 fsgid=0 tty=pts0 ses=4294967295 comm="dpkg" exe="/usr/bin/dpkg" subj=unconfined key="arx_ident"
+type=CWD msg=audit(1795328809.207:29631): cwd="/"
+type=PATH msg=audit(1795328809.207:29631): item=0 name="/etc/sudoers.d/" inode=25707 dev=08:01 mode=040750 ouid=0 ogid=0 rdev=00:00 nametype=PARENT cap_fp=0 cap_fi=0 cap_fe=0 cap_fver=0 cap_frootid=0
+type=PATH msg=audit(1795328809.207:29631): item=1 name="/etc/sudoers.d/README.dpkg-new" inode=837 dev=08:01 mode=0100000 ouid=0 ogid=0 rdev=00:00 nametype=CREATE cap_fp=0 cap_fi=0 cap_fe=0 cap_fver=0 cap_frootid=0
+type=PROCTITLE msg=audit(1795328809.207:29631): proctitle=2F7573722F62696E2F64706B67002D2D7374617475732D6664003131002D2D6E6F2D7472696767657273002D2D756E7061636B002D2D6175746F2D6465636F6E666967757265002F7661722F63616368652F6170742F61726368697665732F7375646F5F312E392E313670322D332B646562313375355F616D6436342E646562
+type=SYSCALL msg=audit(1795328809.207:29632): arch=c000003e syscall=93 success=yes exit=0 a0=c a1=0 a2=0 a3=2 items=1 ppid=424652 pid=424671 auid=4294967295 uid=0 gid=0 euid=0 suid=0 fsuid=0 egid=0 sgid=0 fsgid=0 tty=pts0 ses=4294967295 comm="dpkg" exe="/usr/bin/dpkg" subj=unconfined key="arx_ident"
+type=CWD msg=audit(1795328809.207:29632): cwd="/"
+type=PATH msg=audit(1795328809.207:29632): item=0 name=(null) inode=837 dev=08:01 mode=0100000 ouid=0 ogid=0 rdev=00:00 nametype=NORMAL cap_fp=0 cap_fi=0 cap_fe=0 cap_fver=0 cap_frootid=0
+type=PROCTITLE msg=audit(1795328809.207:29632): proctitle=2F7573722F62696E2F64706B67002D2D7374617475732D6664003131002D2D6E6F2D7472696767657273002D2D756E7061636B002D2D6175746F2D6465636F6E666967757265002F7661722F63616368652F6170742F61726368697665732F7375646F5F312E392E313670322D332B646562313375355F616D6436342E646562
+type=SYSCALL msg=audit(1795328809.207:29633): arch=c000003e syscall=91 success=yes exit=0 a0=c a1=120 a2=0 a3=2 items=1 ppid=424652 pid=424671 auid=4294967295 uid=0 gid=0 euid=0 suid=0 fsuid=0 egid=0 sgid=0 fsgid=0 tty=pts0 ses=4294967295 comm="dpkg" exe="/usr/bin/dpkg" subj=unconfined key="arx_ident"
+type=CWD msg=audit(1795328809.207:29633): cwd="/"
+type=PATH msg=audit(1795328809.207:29633): item=0 name=(null) inode=837 dev=08:01 mode=0100000 ouid=0 ogid=0 rdev=00:00 nametype=NORMAL cap_fp=0 cap_fi=0 cap_fe=0 cap_fver=0 cap_frootid=0
+type=PROCTITLE msg=audit(1795328809.207:29633): proctitle=2F7573722F62696E2F64706B67002D2D7374617475732D6664003131002D2D6E6F2D7472696767657273002D2D756E7061636B002D2D6175746F2D6465636F6E666967757265002F7661722F63616368652F6170742F61726368697665732F7375646F5F312E392E313670322D332B646562313375355F616D6436342E646562
+type=SYSCALL msg=audit(1795328809.287:29634): arch=c000003e syscall=257 success=yes exit=10 a0=ffffffffffffff9c a1=562f4e5de5e0 a2=1 a3=0 items=1 ppid=424652 pid=424671 auid=4294967295 uid=0 gid=0 euid=0 suid=0 fsuid=0 egid=0 sgid=0 fsgid=0 tty=pts0 ses=4294967295 comm="dpkg" exe="/usr/bin/dpkg" subj=unconfined key="arx_ident"
+type=CWD msg=audit(1795328809.287:29634): cwd="/"
+type=PATH msg=audit(1795328809.287:29634): item=0 name="/etc/sudoers.d/README.dpkg-new" inode=837 dev=08:01 mode=0100440 ouid=0 ogid=0 rdev=00:00 nametype=NORMAL cap_fp=0 cap_fi=0 cap_fe=0 cap_fver=0 cap_frootid=0
+type=PROCTITLE msg=audit(1795328809.287:29634): proctitle=2F7573722F62696E2F64706B67002D2D7374617475732D6664003131002D2D6E6F2D7472696767657273002D2D756E7061636B002D2D6175746F2D6465636F6E666967757265002F7661722F63616368652F6170742F61726368697665732F7375646F5F312E392E313670322D332B646562313375355F616D6436342E646562
+type=SYSCALL msg=audit(1795328809.359:29635): arch=c000003e syscall=92 success=yes exit=0 a0=55f04dd5d4d0 a1=0 a2=0 a3=0 items=1 ppid=424652 pid=424687 auid=4294967295 uid=0 gid=0 euid=0 suid=0 fsuid=0 egid=0 sgid=0 fsgid=0 tty=pts0 ses=4294967295 comm="dpkg" exe="/usr/bin/dpkg" subj=unconfined key="arx_ident"
+type=CWD msg=audit(1795328809.359:29635): cwd="/"
+type=PATH msg=audit(1795328809.359:29635): item=0 name="/etc/sudoers.d/README.dpkg-new" inode=837 dev=08:01 mode=0100440 ouid=0 ogid=0 rdev=00:00 nametype=NORMAL cap_fp=0 cap_fi=0 cap_fe=0 cap_fver=0 cap_frootid=0
+type=PROCTITLE msg=audit(1795328809.359:29635): proctitle=2F7573722F62696E2F64706B67002D2D7374617475732D6664003131002D2D636F6E666967757265002D2D70656E64696E67
+type=SYSCALL msg=audit(1795328809.359:29636): arch=c000003e syscall=90 success=yes exit=0 a0=55f04dd5d4d0 a1=120 a2=0 a3=0 items=1 ppid=424652 pid=424687 auid=4294967295 uid=0 gid=0 euid=0 suid=0 fsuid=0 egid=0 sgid=0 fsgid=0 tty=pts0 ses=4294967295 comm="dpkg" exe="/usr/bin/dpkg" subj=unconfined key="arx_ident"
+type=CWD msg=audit(1795328809.359:29636): cwd="/"
+type=PATH msg=audit(1795328809.359:29636): item=0 name="/etc/sudoers.d/README.dpkg-new" inode=837 dev=08:01 mode=0100440 ouid=0 ogid=0 rdev=00:00 nametype=NORMAL cap_fp=0 cap_fi=0 cap_fe=0 cap_fver=0 cap_frootid=0
+type=PROCTITLE msg=audit(1795328809.359:29636): proctitle=2F7573722F62696E2F64706B67002D2D7374617475732D6664003131002D2D636F6E666967757265002D2D70656E64696E67
+type=SYSCALL msg=audit(1795328809.359:29637): arch=c000003e syscall=87 success=yes exit=0 a0=55f04dd5d4d0 a1=55f02b58dc30 a2=55f02b5975e0 a3=55f02b562ec0 items=2 ppid=424652 pid=424687 auid=4294967295 uid=0 gid=0 euid=0 suid=0 fsuid=0 egid=0 sgid=0 fsgid=0 tty=pts0 ses=4294967295 comm="dpkg" exe="/usr/bin/dpkg" subj=unconfined key="arx_ident"
+type=CWD msg=audit(1795328809.359:29637): cwd="/"
+type=PATH msg=audit(1795328809.359:29637): item=0 name="/etc/sudoers.d/" inode=25707 dev=08:01 mode=040750 ouid=0 ogid=0 rdev=00:00 nametype=PARENT cap_fp=0 cap_fi=0 cap_fe=0 cap_fver=0 cap_frootid=0
+type=PATH msg=audit(1795328809.359:29637): item=1 name="/etc/sudoers.d/README.dpkg-new" inode=837 dev=08:01 mode=0100440 ouid=0 ogid=0 rdev=00:00 nametype=DELETE cap_fp=0 cap_fi=0 cap_fe=0 cap_fver=0 cap_frootid=0
+type=PROCTITLE msg=audit(1795328809.359:29637): proctitle=2F7573722F62696E2F64706B67002D2D7374617475732D6664003131002D2D636F6E666967757265002D2D70656E64696E67
+type=SYSCALL msg=audit(1795328809.367:29638): arch=c000003e syscall=260 success=yes exit=0 a0=ffffff9c a1=564caae7a9e0 a2=0 a3=0 items=1 ppid=424688 pid=424689 auid=4294967295 uid=0 gid=0 euid=0 suid=0 fsuid=0 egid=0 sgid=0 fsgid=0 tty=pts0 ses=4294967295 comm="chown" exe="/usr/bin/chown" subj=unconfined key="arx_ident"
+type=CWD msg=audit(1795328809.367:29638): cwd="/"
+type=PATH msg=audit(1795328809.367:29638): item=0 name="/etc/sudoers" inode=25706 dev=08:01 mode=0100440 ouid=0 ogid=0 rdev=00:00 nametype=NORMAL cap_fp=0 cap_fi=0 cap_fe=0 cap_fver=0 cap_frootid=0
+type=PROCTITLE msg=audit(1795328809.367:29638): proctitle=63686F776E00726F6F743A726F6F74002F6574632F7375646F657273
+type=SYSCALL msg=audit(1795328809.367:29639): arch=c000003e syscall=268 success=yes exit=0 a0=ffffff9c a1=5626004da620 a2=120 a3=120 items=1 ppid=424688 pid=424690 auid=4294967295 uid=0 gid=0 euid=0 suid=0 fsuid=0 egid=0 sgid=0 fsgid=0 tty=pts0 ses=4294967295 comm="chmod" exe="/usr/bin/chmod" subj=unconfined key="arx_ident"
+type=CWD msg=audit(1795328809.367:29639): cwd="/"
+type=PATH msg=audit(1795328809.367:29639): item=0 name="/etc/sudoers" inode=25706 dev=08:01 mode=0100440 ouid=0 ogid=0 rdev=00:00 nametype=NORMAL cap_fp=0 cap_fi=0 cap_fe=0 cap_fver=0 cap_frootid=0
+type=PROCTITLE msg=audit(1795328809.367:29639): proctitle=63686D6F6400343430002F6574632F7375646F657273

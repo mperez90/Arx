@@ -27,10 +27,13 @@ import subprocess
 import threading
 import time
 
+from arx.modules import procring
+
 NETLINK_CONNECTOR = 11
 CN_IDX_PROC = CN_VAL_PROC = 1
 PROC_CN_MCAST_LISTEN = 1
 PROC_EVENT_EXEC = 0x00000002
+PROC_EVENT_EXIT = 0x80000000
 NLMSG_DONE = 3
 MAX_EVENTS = 4000
 # `sshd -T` y la lectura de la configuración de sshd y de PAM cada 15 min por edad (B78-b, P7: cada minuto era ~0,02 % de CPU
@@ -113,6 +116,36 @@ def parse_events(data: bytes) -> list[tuple[int, int]]:
                 out.append((struct.unpack_from("=I", body, 40)[0], ts))  # process_tgid
         off += (length + 3) & ~3
     return out
+
+
+def parse_all(data: bytes) -> list[tuple[int, int, int]]:
+    """(qué, tgid, instante del kernel) de cada `exec` y de cada SALIDA DE PROCESO (el hilo que lidera el grupo; la de
+    un hilo suelto no es la del proceso) del datagrama. Lo ve el anillo de scripts de mantenimiento (`procring`)."""
+    out, off = [], 0
+    while off + 16 <= len(data):
+        length = struct.unpack_from("=I", data, off)[0]
+        if length < 16 or off + length > len(data):
+            break
+        body = data[off + 16:off + length]
+        if len(body) >= 44 and struct.unpack_from("=I", body, 0)[0] == CN_IDX_PROC:
+            what, _, ts = struct.unpack_from("=IIQ", body, 20)
+            tid, tgid = struct.unpack_from("=II", body, 36)
+            if what == PROC_EVENT_EXEC or (what == PROC_EVENT_EXIT and tid == tgid):
+                out.append((what, tgid, ts))
+        off += (length + 3) & ~3
+    return out
+
+
+def _observe(what: int, pid: int) -> None:
+    """Lo que el anillo de scripts de mantenimiento necesita de cada evento, antes del trabajo lento: lo que se lanza vive
+    milisegundos. Un fallo aquí no para el bucle."""
+    try:
+        if what == PROC_EVENT_EXEC:
+            procring.observe_exec(pid)
+        elif what == PROC_EVENT_EXIT:
+            procring.observe_exit(pid)
+    except Exception:
+        pass
 
 
 def _subscribe() -> socket.socket:
@@ -757,8 +790,12 @@ def _listen(sock: socket.socket, root: str, enforce) -> None:
             data = sock.recv(1 << 16)
         except OSError:  # ENOBUFS: el kernel tiró eventos; se cuenta y se sigue
             _state["lost"] += 1
+            procring.lost()  # y lo que se daba por vivo ya no se prueba: la salida pudo ser de lo tirado
             continue
-        for pid, ts in parse_events(data):
+        for what, pid, ts in parse_all(data):
+            _observe(what, pid)
+            if what != PROC_EVENT_EXEC:
+                continue
             try:
                 handle_pid(pid, root, enforce, ts)
             except Exception:

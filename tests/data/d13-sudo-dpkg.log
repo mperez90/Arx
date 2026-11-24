@@ -1,0 +1,318 @@
+2026-11-22 06:26:32 startup archives unpack
+2026-11-22 06:26:32 upgrade libc6:amd64 2.41-12+deb13u4 2.41-12+deb13u5
+2026-11-22 06:26:32 status triggers-pending libc-bin:amd64 2.41-12+deb13u4
+2026-11-22 06:26:32 status half-configured libc6:amd64 2.41-12+deb13u4
+2026-11-22 06:26:32 status unpacked libc6:amd64 2.41-12+deb13u4
+2026-11-22 06:26:32 status half-installed libc6:amd64 2.41-12+deb13u4
+2026-11-22 06:26:33 status unpacked libc6:amd64 2.41-12+deb13u5
+2026-11-22 06:26:33 startup packages configure
+2026-11-22 06:26:33 configure libc6:amd64 2.41-12+deb13u5 <none>
+2026-11-22 06:26:33 status unpacked libc6:amd64 2.41-12+deb13u5
+2026-11-22 06:26:33 status half-configured libc6:amd64 2.41-12+deb13u5
+2026-11-22 06:26:33 status installed libc6:amd64 2.41-12+deb13u5
+2026-11-22 06:26:33 status triggers-pending systemd:amd64 257.13-1~deb13u1
+2026-11-22 06:26:33 startup archives unpack
+2026-11-22 06:26:33 upgrade libc-bin:amd64 2.41-12+deb13u4 2.41-12+deb13u5
+2026-11-22 06:26:33 status half-configured libc-bin:amd64 2.41-12+deb13u4
+2026-11-22 06:26:33 status unpacked libc-bin:amd64 2.41-12+deb13u4
+2026-11-22 06:26:33 status half-installed libc-bin:amd64 2.41-12+deb13u4
+2026-11-22 06:26:33 status triggers-pending man-db:amd64 2.13.1-1
+2026-11-22 06:26:33 status unpacked libc-bin:amd64 2.41-12+deb13u5
+2026-11-22 06:26:33 startup packages configure
+2026-11-22 06:26:33 configure libc-bin:amd64 2.41-12+deb13u5 <none>
+2026-11-22 06:26:33 status unpacked libc-bin:amd64 2.41-12+deb13u5
+2026-11-22 06:26:33 status half-configured libc-bin:amd64 2.41-12+deb13u5
+2026-11-22 06:26:33 status installed libc-bin:amd64 2.41-12+deb13u5
+2026-11-22 06:26:33 startup archives unpack
+2026-11-22 06:26:33 upgrade libc-l10n:all 2.41-12+deb13u4 2.41-12+deb13u5
+2026-11-22 06:26:33 status half-configured libc-l10n:all 2.41-12+deb13u4
+2026-11-22 06:26:33 status unpacked libc-l10n:all 2.41-12+deb13u4
+2026-11-22 06:26:33 status half-installed libc-l10n:all 2.41-12+deb13u4
+2026-11-22 06:26:33 status unpacked libc-l10n:all 2.41-12+deb13u5
+2026-11-22 06:26:33 upgrade locales:all 2.41-12+deb13u4 2.41-12+deb13u5
+2026-11-22 06:26:33 status half-configured locales:all 2.41-12+deb13u4
+2026-11-22 06:26:33 status unpacked locales:all 2.41-12+deb13u4
+2026-11-22 06:26:33 status half-installed locales:all 2.41-12+deb13u4
+2026-11-22 06:26:33 status unpacked locales:all 2.41-12+deb13u5
+2026-11-22 06:26:33 upgrade locales-all:amd64 2.41-12+deb13u4 2.41-12+deb13u5
+2026-11-22 06:26:33 status half-configured locales-all:amd64 2.41-12+deb13u4
+2026-11-22 06:26:33 status unpacked locales-all:amd64 2.41-12+deb13u4
+2026-11-22 06:26:33 status half-installed locales-all:amd64 2.41-12+deb13u4
+2026-11-22 06:26:35 status unpacked locales-all:amd64 2.41-12+deb13u5
+2026-11-22 06:26:35 startup packages configure
+2026-11-22 06:26:35 configure libc-l10n:all 2.41-12+deb13u5 <none>
+2026-11-22 06:26:35 status unpacked libc-l10n:all 2.41-12+deb13u5
+2026-11-22 06:26:35 status half-configured libc-l10n:all 2.41-12+deb13u5
+2026-11-22 06:26:35 status installed libc-l10n:all 2.41-12+deb13u5
+2026-11-22 06:26:35 configure locales:all 2.41-12+deb13u5 <none>
+2026-11-22 06:26:35 status unpacked locales:all 2.41-12+deb13u5
+2026-11-22 06:26:35 status half-configured locales:all 2.41-12+deb13u5
+2026-11-22 06:26:36 status installed locales:all 2.41-12+deb13u5
+2026-11-22 06:26:36 configure locales-all:amd64 2.41-12+deb13u5 <none>
+2026-11-22 06:26:36 status unpacked locales-all:amd64 2.41-12+deb13u5
+2026-11-22 06:26:36 status half-configured locales-all:amd64 2.41-12+deb13u5
+2026-11-22 06:26:36 status installed locales-all:amd64 2.41-12+deb13u5
+2026-11-22 06:26:36 trigproc man-db:amd64 2.13.1-1 <none>
+2026-11-22 06:26:36 status half-configured man-db:amd64 2.13.1-1
+2026-11-22 06:26:37 status installed man-db:amd64 2.13.1-1
+2026-11-22 06:26:37 trigproc systemd:amd64 257.13-1~deb13u1 <none>
+2026-11-22 06:26:37 status half-configured systemd:amd64 257.13-1~deb13u1
+2026-11-22 06:26:37 status installed systemd:amd64 257.13-1~deb13u1
+2026-11-22 06:26:39 startup archives unpack
+2026-11-22 06:26:39 upgrade dhcpcd-base:amd64 1:10.1.0-11+deb13u4 1:10.1.0-11+deb13u5
+2026-11-22 06:26:39 status half-configured dhcpcd-base:amd64 1:10.1.0-11+deb13u4
+2026-11-22 06:26:39 status unpacked dhcpcd-base:amd64 1:10.1.0-11+deb13u4
+2026-11-22 06:26:39 status half-installed dhcpcd-base:amd64 1:10.1.0-11+deb13u4
+2026-11-22 06:26:39 status triggers-pending man-db:amd64 2.13.1-1
+2026-11-22 06:26:39 status unpacked dhcpcd-base:amd64 1:10.1.0-11+deb13u5
+2026-11-22 06:26:39 startup packages configure
+2026-11-22 06:26:39 configure dhcpcd-base:amd64 1:10.1.0-11+deb13u5 <none>
+2026-11-22 06:26:39 status unpacked dhcpcd-base:amd64 1:10.1.0-11+deb13u5
+2026-11-22 06:26:39 status half-configured dhcpcd-base:amd64 1:10.1.0-11+deb13u5
+2026-11-22 06:26:39 status installed dhcpcd-base:amd64 1:10.1.0-11+deb13u5
+2026-11-22 06:26:39 trigproc man-db:amd64 2.13.1-1 <none>
+2026-11-22 06:26:39 status half-configured man-db:amd64 2.13.1-1
+2026-11-22 06:26:39 status installed man-db:amd64 2.13.1-1
+2026-11-22 06:26:41 startup archives unpack
+2026-11-22 06:26:41 upgrade grub-efi-amd64-unsigned:amd64 2.12-9+deb13u2 2.12-9+deb13u4
+2026-11-22 06:26:41 status half-configured grub-efi-amd64-unsigned:amd64 2.12-9+deb13u2
+2026-11-22 06:26:41 status unpacked grub-efi-amd64-unsigned:amd64 2.12-9+deb13u2
+2026-11-22 06:26:41 status half-installed grub-efi-amd64-unsigned:amd64 2.12-9+deb13u2
+2026-11-22 06:26:41 status unpacked grub-efi-amd64-unsigned:amd64 2.12-9+deb13u4
+2026-11-22 06:26:41 upgrade grub2-common:amd64 2.12-9+deb13u2 2.12-9+deb13u4
+2026-11-22 06:26:41 status half-configured grub2-common:amd64 2.12-9+deb13u2
+2026-11-22 06:26:41 status unpacked grub2-common:amd64 2.12-9+deb13u2
+2026-11-22 06:26:41 status half-installed grub2-common:amd64 2.12-9+deb13u2
+2026-11-22 06:26:41 status triggers-pending man-db:amd64 2.13.1-1
+2026-11-22 06:26:41 status unpacked grub2-common:amd64 2.12-9+deb13u4
+2026-11-22 06:26:41 upgrade grub-efi-amd64:amd64 2.12-9+deb13u2 2.12-9+deb13u4
+2026-11-22 06:26:41 status half-configured grub-efi-amd64:amd64 2.12-9+deb13u2
+2026-11-22 06:26:41 status unpacked grub-efi-amd64:amd64 2.12-9+deb13u2
+2026-11-22 06:26:41 status half-installed grub-efi-amd64:amd64 2.12-9+deb13u2
+2026-11-22 06:26:41 status unpacked grub-efi-amd64:amd64 2.12-9+deb13u4
+2026-11-22 06:26:41 upgrade grub-efi-amd64-bin:amd64 2.12-9+deb13u2 2.12-9+deb13u4
+2026-11-22 06:26:41 status half-configured grub-efi-amd64-bin:amd64 2.12-9+deb13u2
+2026-11-22 06:26:41 status unpacked grub-efi-amd64-bin:amd64 2.12-9+deb13u2
+2026-11-22 06:26:41 status half-installed grub-efi-amd64-bin:amd64 2.12-9+deb13u2
+2026-11-22 06:26:41 status unpacked grub-efi-amd64-bin:amd64 2.12-9+deb13u4
+2026-11-22 06:26:41 upgrade grub-pc-bin:amd64 2.12-9+deb13u2 2.12-9+deb13u4
+2026-11-22 06:26:41 status half-configured grub-pc-bin:amd64 2.12-9+deb13u2
+2026-11-22 06:26:41 status unpacked grub-pc-bin:amd64 2.12-9+deb13u2
+2026-11-22 06:26:41 status half-installed grub-pc-bin:amd64 2.12-9+deb13u2
+2026-11-22 06:26:41 status unpacked grub-pc-bin:amd64 2.12-9+deb13u4
+2026-11-22 06:26:41 upgrade grub-common:amd64 2.12-9+deb13u2 2.12-9+deb13u4
+2026-11-22 06:26:41 status half-configured grub-common:amd64 2.12-9+deb13u2
+2026-11-22 06:26:41 status unpacked grub-common:amd64 2.12-9+deb13u2
+2026-11-22 06:26:41 status half-installed grub-common:amd64 2.12-9+deb13u2
+2026-11-22 06:26:41 status unpacked grub-common:amd64 2.12-9+deb13u4
+2026-11-22 06:26:41 startup packages configure
+2026-11-22 06:26:41 configure grub-common:amd64 2.12-9+deb13u4 <none>
+2026-11-22 06:26:41 status unpacked grub-common:amd64 2.12-9+deb13u4
+2026-11-22 06:26:41 status half-configured grub-common:amd64 2.12-9+deb13u4
+2026-11-22 06:26:42 status installed grub-common:amd64 2.12-9+deb13u4
+2026-11-22 06:26:42 configure grub-efi-amd64-unsigned:amd64 2.12-9+deb13u4 <none>
+2026-11-22 06:26:42 status unpacked grub-efi-amd64-unsigned:amd64 2.12-9+deb13u4
+2026-11-22 06:26:42 status half-configured grub-efi-amd64-unsigned:amd64 2.12-9+deb13u4
+2026-11-22 06:26:42 status installed grub-efi-amd64-unsigned:amd64 2.12-9+deb13u4
+2026-11-22 06:26:42 configure grub2-common:amd64 2.12-9+deb13u4 <none>
+2026-11-22 06:26:42 status unpacked grub2-common:amd64 2.12-9+deb13u4
+2026-11-22 06:26:42 status half-configured grub2-common:amd64 2.12-9+deb13u4
+2026-11-22 06:26:42 status installed grub2-common:amd64 2.12-9+deb13u4
+2026-11-22 06:26:42 configure grub-pc-bin:amd64 2.12-9+deb13u4 <none>
+2026-11-22 06:26:42 status unpacked grub-pc-bin:amd64 2.12-9+deb13u4
+2026-11-22 06:26:42 status half-configured grub-pc-bin:amd64 2.12-9+deb13u4
+2026-11-22 06:26:42 status installed grub-pc-bin:amd64 2.12-9+deb13u4
+2026-11-22 06:26:42 configure grub-efi-amd64-bin:amd64 2.12-9+deb13u4 <none>
+2026-11-22 06:26:42 status unpacked grub-efi-amd64-bin:amd64 2.12-9+deb13u4
+2026-11-22 06:26:42 status half-configured grub-efi-amd64-bin:amd64 2.12-9+deb13u4
+2026-11-22 06:26:42 status installed grub-efi-amd64-bin:amd64 2.12-9+deb13u4
+2026-11-22 06:26:42 configure grub-efi-amd64:amd64 2.12-9+deb13u4 <none>
+2026-11-22 06:26:42 status unpacked grub-efi-amd64:amd64 2.12-9+deb13u4
+2026-11-22 06:26:42 status half-configured grub-efi-amd64:amd64 2.12-9+deb13u4
+2026-11-22 06:26:43 status installed grub-efi-amd64:amd64 2.12-9+deb13u4
+2026-11-22 06:26:43 status triggers-pending shim-signed:amd64 1.51~1+deb13u1+16.1-2~deb13u1
+2026-11-22 06:26:43 trigproc man-db:amd64 2.13.1-1 <none>
+2026-11-22 06:26:43 status half-configured man-db:amd64 2.13.1-1
+2026-11-22 06:26:43 status installed man-db:amd64 2.13.1-1
+2026-11-22 06:26:43 trigproc shim-signed:amd64 1.51~1+deb13u1+16.1-2~deb13u1 <none>
+2026-11-22 06:26:43 status half-configured shim-signed:amd64 1.51~1+deb13u1+16.1-2~deb13u1
+2026-11-22 06:26:43 status installed shim-signed:amd64 1.51~1+deb13u1+16.1-2~deb13u1
+2026-11-22 06:26:45 startup archives unpack
+2026-11-22 06:26:45 upgrade openssl-provider-legacy:amd64 3.5.7-1~deb13u3 3.5.9-1~deb13u1
+2026-11-22 06:26:45 status half-configured openssl-provider-legacy:amd64 3.5.7-1~deb13u3
+2026-11-22 06:26:45 status unpacked openssl-provider-legacy:amd64 3.5.7-1~deb13u3
+2026-11-22 06:26:45 status half-installed openssl-provider-legacy:amd64 3.5.7-1~deb13u3
+2026-11-22 06:26:45 status unpacked openssl-provider-legacy:amd64 3.5.9-1~deb13u1
+2026-11-22 06:26:45 startup packages configure
+2026-11-22 06:26:45 configure openssl-provider-legacy:amd64 3.5.9-1~deb13u1 <none>
+2026-11-22 06:26:45 status unpacked openssl-provider-legacy:amd64 3.5.9-1~deb13u1
+2026-11-22 06:26:45 status half-configured openssl-provider-legacy:amd64 3.5.9-1~deb13u1
+2026-11-22 06:26:45 status installed openssl-provider-legacy:amd64 3.5.9-1~deb13u1
+2026-11-22 06:26:45 startup archives unpack
+2026-11-22 06:26:45 upgrade libssl3t64:amd64 3.5.7-1~deb13u3 3.5.9-1~deb13u1
+2026-11-22 06:26:45 status triggers-pending libc-bin:amd64 2.41-12+deb13u5
+2026-11-22 06:26:45 status half-configured libssl3t64:amd64 3.5.7-1~deb13u3
+2026-11-22 06:26:45 status unpacked libssl3t64:amd64 3.5.7-1~deb13u3
+2026-11-22 06:26:45 status half-installed libssl3t64:amd64 3.5.7-1~deb13u3
+2026-11-22 06:26:45 status unpacked libssl3t64:amd64 3.5.9-1~deb13u1
+2026-11-22 06:26:45 startup packages configure
+2026-11-22 06:26:45 configure libssl3t64:amd64 3.5.9-1~deb13u1 <none>
+2026-11-22 06:26:45 status unpacked libssl3t64:amd64 3.5.9-1~deb13u1
+2026-11-22 06:26:45 status half-configured libssl3t64:amd64 3.5.9-1~deb13u1
+2026-11-22 06:26:45 status installed libssl3t64:amd64 3.5.9-1~deb13u1
+2026-11-22 06:26:45 startup archives unpack
+2026-11-22 06:26:45 upgrade openssl:amd64 3.5.7-1~deb13u3 3.5.9-1~deb13u1
+2026-11-22 06:26:45 status half-configured openssl:amd64 3.5.7-1~deb13u3
+2026-11-22 06:26:45 status unpacked openssl:amd64 3.5.7-1~deb13u3
+2026-11-22 06:26:45 status half-installed openssl:amd64 3.5.7-1~deb13u3
+2026-11-22 06:26:45 status triggers-pending man-db:amd64 2.13.1-1
+2026-11-22 06:26:45 status unpacked openssl:amd64 3.5.9-1~deb13u1
+2026-11-22 06:26:45 startup packages configure
+2026-11-22 06:26:45 configure openssl:amd64 3.5.9-1~deb13u1 <none>
+2026-11-22 06:26:45 status unpacked openssl:amd64 3.5.9-1~deb13u1
+2026-11-22 06:26:45 status half-configured openssl:amd64 3.5.9-1~deb13u1
+2026-11-22 06:26:45 status installed openssl:amd64 3.5.9-1~deb13u1
+2026-11-22 06:26:45 trigproc man-db:amd64 2.13.1-1 <none>
+2026-11-22 06:26:45 status half-configured man-db:amd64 2.13.1-1
+2026-11-22 06:26:46 status installed man-db:amd64 2.13.1-1
+2026-11-22 06:26:46 trigproc libc-bin:amd64 2.41-12+deb13u5 <none>
+2026-11-22 06:26:46 status half-configured libc-bin:amd64 2.41-12+deb13u5
+2026-11-22 06:26:46 status installed libc-bin:amd64 2.41-12+deb13u5
+2026-11-22 06:26:47 startup archives unpack
+2026-11-22 06:26:47 upgrade base-files:amd64 13.8+deb13u7 13.8+deb13u8
+2026-11-22 06:26:47 status half-configured base-files:amd64 13.8+deb13u7
+2026-11-22 06:26:47 status unpacked base-files:amd64 13.8+deb13u7
+2026-11-22 06:26:47 status half-installed base-files:amd64 13.8+deb13u7
+2026-11-22 06:26:47 status triggers-pending man-db:amd64 2.13.1-1
+2026-11-22 06:26:47 status unpacked base-files:amd64 13.8+deb13u8
+2026-11-22 06:26:47 startup packages configure
+2026-11-22 06:26:47 configure base-files:amd64 13.8+deb13u8 <none>
+2026-11-22 06:26:47 status unpacked base-files:amd64 13.8+deb13u8
+2026-11-22 06:26:47 status half-configured base-files:amd64 13.8+deb13u8
+2026-11-22 06:26:47 status installed base-files:amd64 13.8+deb13u8
+2026-11-22 06:26:47 startup packages configure
+2026-11-22 06:26:47 trigproc man-db:amd64 2.13.1-1 <none>
+2026-11-22 06:26:47 status half-configured man-db:amd64 2.13.1-1
+2026-11-22 06:26:47 status installed man-db:amd64 2.13.1-1
+2026-11-22 06:26:49 startup archives unpack
+2026-11-22 06:26:49 upgrade sudo:amd64 1.9.16p2-3+deb13u2 1.9.16p2-3+deb13u5
+2026-11-22 06:26:49 status triggers-pending libc-bin:amd64 2.41-12+deb13u5
+2026-11-22 06:26:49 status half-configured sudo:amd64 1.9.16p2-3+deb13u2
+2026-11-22 06:26:49 status unpacked sudo:amd64 1.9.16p2-3+deb13u2
+2026-11-22 06:26:49 status half-installed sudo:amd64 1.9.16p2-3+deb13u2
+2026-11-22 06:26:49 status triggers-pending man-db:amd64 2.13.1-1
+2026-11-22 06:26:49 status unpacked sudo:amd64 1.9.16p2-3+deb13u5
+2026-11-22 06:26:49 startup packages configure
+2026-11-22 06:26:49 configure sudo:amd64 1.9.16p2-3+deb13u5 <none>
+2026-11-22 06:26:49 status unpacked sudo:amd64 1.9.16p2-3+deb13u5
+2026-11-22 06:26:49 status half-configured sudo:amd64 1.9.16p2-3+deb13u5
+2026-11-22 06:26:49 status installed sudo:amd64 1.9.16p2-3+deb13u5
+2026-11-22 06:26:49 trigproc man-db:amd64 2.13.1-1 <none>
+2026-11-22 06:26:49 status half-configured man-db:amd64 2.13.1-1
+2026-11-22 06:26:50 status installed man-db:amd64 2.13.1-1
+2026-11-22 06:26:50 trigproc libc-bin:amd64 2.41-12+deb13u5 <none>
+2026-11-22 06:26:50 status half-configured libc-bin:amd64 2.41-12+deb13u5
+2026-11-22 06:26:50 status installed libc-bin:amd64 2.41-12+deb13u5
+2026-11-22 06:26:51 startup archives unpack
+2026-11-22 06:26:51 upgrade rsync:amd64 3.5.0+ds1-0+deb13u1 3.5.0+ds1-0+deb13u2
+2026-11-22 06:26:51 status half-configured rsync:amd64 3.5.0+ds1-0+deb13u1
+2026-11-22 06:26:51 status unpacked rsync:amd64 3.5.0+ds1-0+deb13u1
+2026-11-22 06:26:51 status half-installed rsync:amd64 3.5.0+ds1-0+deb13u1
+2026-11-22 06:26:51 status triggers-pending man-db:amd64 2.13.1-1
+2026-11-22 06:26:51 status unpacked rsync:amd64 3.5.0+ds1-0+deb13u2
+2026-11-22 06:26:51 startup packages configure
+2026-11-22 06:26:51 configure rsync:amd64 3.5.0+ds1-0+deb13u2 <none>
+2026-11-22 06:26:51 status unpacked rsync:amd64 3.5.0+ds1-0+deb13u2
+2026-11-22 06:26:51 status half-configured rsync:amd64 3.5.0+ds1-0+deb13u2
+2026-11-22 06:26:52 status installed rsync:amd64 3.5.0+ds1-0+deb13u2
+2026-11-22 06:26:52 trigproc man-db:amd64 2.13.1-1 <none>
+2026-11-22 06:26:52 status half-configured man-db:amd64 2.13.1-1
+2026-11-22 06:26:52 status installed man-db:amd64 2.13.1-1
+2026-11-22 06:26:54 startup archives unpack
+2026-11-22 06:26:54 upgrade libfreetype6:amd64 2.13.3+dfsg-1+deb13u1 2.13.3+dfsg-1+deb13u2
+2026-11-22 06:26:54 status triggers-pending libc-bin:amd64 2.41-12+deb13u5
+2026-11-22 06:26:54 status half-configured libfreetype6:amd64 2.13.3+dfsg-1+deb13u1
+2026-11-22 06:26:54 status unpacked libfreetype6:amd64 2.13.3+dfsg-1+deb13u1
+2026-11-22 06:26:54 status half-installed libfreetype6:amd64 2.13.3+dfsg-1+deb13u1
+2026-11-22 06:26:54 status unpacked libfreetype6:amd64 2.13.3+dfsg-1+deb13u2
+2026-11-22 06:26:54 startup packages configure
+2026-11-22 06:26:54 configure libfreetype6:amd64 2.13.3+dfsg-1+deb13u2 <none>
+2026-11-22 06:26:54 status unpacked libfreetype6:amd64 2.13.3+dfsg-1+deb13u2
+2026-11-22 06:26:54 status half-configured libfreetype6:amd64 2.13.3+dfsg-1+deb13u2
+2026-11-22 06:26:54 status installed libfreetype6:amd64 2.13.3+dfsg-1+deb13u2
+2026-11-22 06:26:54 trigproc libc-bin:amd64 2.41-12+deb13u5 <none>
+2026-11-22 06:26:54 status half-configured libc-bin:amd64 2.41-12+deb13u5
+2026-11-22 06:26:54 status installed libc-bin:amd64 2.41-12+deb13u5
+2026-11-22 06:26:55 startup archives unpack
+2026-11-22 06:26:55 upgrade libefivar1t64:amd64 38-3.1+b1 38-3.1+deb13u1
+2026-11-22 06:26:55 status triggers-pending libc-bin:amd64 2.41-12+deb13u5
+2026-11-22 06:26:55 status half-configured libefivar1t64:amd64 38-3.1+b1
+2026-11-22 06:26:55 status unpacked libefivar1t64:amd64 38-3.1+b1
+2026-11-22 06:26:55 status half-installed libefivar1t64:amd64 38-3.1+b1
+2026-11-22 06:26:55 status unpacked libefivar1t64:amd64 38-3.1+deb13u1
+2026-11-22 06:26:55 upgrade libefiboot1t64:amd64 38-3.1+b1 38-3.1+deb13u1
+2026-11-22 06:26:56 status half-configured libefiboot1t64:amd64 38-3.1+b1
+2026-11-22 06:26:56 status unpacked libefiboot1t64:amd64 38-3.1+b1
+2026-11-22 06:26:56 status half-installed libefiboot1t64:amd64 38-3.1+b1
+2026-11-22 06:26:56 status unpacked libefiboot1t64:amd64 38-3.1+deb13u1
+2026-11-22 06:26:56 startup packages configure
+2026-11-22 06:26:56 configure libefivar1t64:amd64 38-3.1+deb13u1 <none>
+2026-11-22 06:26:56 status unpacked libefivar1t64:amd64 38-3.1+deb13u1
+2026-11-22 06:26:56 status half-configured libefivar1t64:amd64 38-3.1+deb13u1
+2026-11-22 06:26:56 status installed libefivar1t64:amd64 38-3.1+deb13u1
+2026-11-22 06:26:56 configure libefiboot1t64:amd64 38-3.1+deb13u1 <none>
+2026-11-22 06:26:56 status unpacked libefiboot1t64:amd64 38-3.1+deb13u1
+2026-11-22 06:26:56 status half-configured libefiboot1t64:amd64 38-3.1+deb13u1
+2026-11-22 06:26:56 status installed libefiboot1t64:amd64 38-3.1+deb13u1
+2026-11-22 06:26:56 trigproc libc-bin:amd64 2.41-12+deb13u5 <none>
+2026-11-22 06:26:56 status half-configured libc-bin:amd64 2.41-12+deb13u5
+2026-11-22 06:26:56 status installed libc-bin:amd64 2.41-12+deb13u5
+2026-11-22 06:26:57 startup archives unpack
+2026-11-22 06:26:57 upgrade mdadm:amd64 4.4-11 4.4-11+deb13u1
+2026-11-22 06:26:57 status triggers-pending initramfs-tools:all 0.148.4
+2026-11-22 06:26:57 status half-configured mdadm:amd64 4.4-11
+2026-11-22 06:26:57 status unpacked mdadm:amd64 4.4-11
+2026-11-22 06:26:57 status half-installed mdadm:amd64 4.4-11
+2026-11-22 06:26:57 status triggers-pending man-db:amd64 2.13.1-1
+2026-11-22 06:26:58 status unpacked mdadm:amd64 4.4-11+deb13u1
+2026-11-22 06:26:58 startup packages configure
+2026-11-22 06:26:58 configure mdadm:amd64 4.4-11+deb13u1 <none>
+2026-11-22 06:26:58 status unpacked mdadm:amd64 4.4-11+deb13u1
+2026-11-22 06:26:58 status half-configured mdadm:amd64 4.4-11+deb13u1
+2026-11-22 06:27:00 status installed mdadm:amd64 4.4-11+deb13u1
+2026-11-22 06:27:00 trigproc man-db:amd64 2.13.1-1 <none>
+2026-11-22 06:27:00 status half-configured man-db:amd64 2.13.1-1
+2026-11-22 06:27:01 status installed man-db:amd64 2.13.1-1
+2026-11-22 06:27:01 trigproc initramfs-tools:all 0.148.4 <none>
+2026-11-22 06:27:01 status half-configured initramfs-tools:all 0.148.4
+2026-11-22 06:27:13 status installed initramfs-tools:all 0.148.4
+2026-11-22 06:27:14 startup archives unpack
+2026-11-22 06:27:14 upgrade libnghttp2-14:amd64 1.64.0-1.1+deb13u1 1.64.0-1.1+deb13u2
+2026-11-22 06:27:14 status triggers-pending libc-bin:amd64 2.41-12+deb13u5
+2026-11-22 06:27:14 status half-configured libnghttp2-14:amd64 1.64.0-1.1+deb13u1
+2026-11-22 06:27:14 status unpacked libnghttp2-14:amd64 1.64.0-1.1+deb13u1
+2026-11-22 06:27:14 status half-installed libnghttp2-14:amd64 1.64.0-1.1+deb13u1
+2026-11-22 06:27:14 status unpacked libnghttp2-14:amd64 1.64.0-1.1+deb13u2
+2026-11-22 06:27:14 startup packages configure
+2026-11-22 06:27:14 configure libnghttp2-14:amd64 1.64.0-1.1+deb13u2 <none>
+2026-11-22 06:27:14 status unpacked libnghttp2-14:amd64 1.64.0-1.1+deb13u2
+2026-11-22 06:27:14 status half-configured libnghttp2-14:amd64 1.64.0-1.1+deb13u2
+2026-11-22 06:27:14 status installed libnghttp2-14:amd64 1.64.0-1.1+deb13u2
+2026-11-22 06:27:14 trigproc libc-bin:amd64 2.41-12+deb13u5 <none>
+2026-11-22 06:27:14 status half-configured libc-bin:amd64 2.41-12+deb13u5
+2026-11-22 06:27:14 status installed libc-bin:amd64 2.41-12+deb13u5
+2026-11-22 06:27:16 startup archives unpack
+2026-11-22 06:27:16 upgrade patch:amd64 2.8-2 2.8-2+deb13u1
+2026-11-22 06:27:16 status half-configured patch:amd64 2.8-2
+2026-11-22 06:27:16 status unpacked patch:amd64 2.8-2
+2026-11-22 06:27:16 status half-installed patch:amd64 2.8-2
+2026-11-22 06:27:16 status triggers-pending man-db:amd64 2.13.1-1
+2026-11-22 06:27:16 status unpacked patch:amd64 2.8-2+deb13u1
+2026-11-22 06:27:16 startup packages configure
+2026-11-22 06:27:16 configure patch:amd64 2.8-2+deb13u1 <none>
+2026-11-22 06:27:16 status unpacked patch:amd64 2.8-2+deb13u1
+2026-11-22 06:27:16 status half-configured patch:amd64 2.8-2+deb13u1
+2026-11-22 06:27:16 status installed patch:amd64 2.8-2+deb13u1
+2026-11-22 06:27:16 trigproc man-db:amd64 2.13.1-1 <none>
+2026-11-22 06:27:16 status half-configured man-db:amd64 2.13.1-1
+2026-11-22 06:27:16 status installed man-db:amd64 2.13.1-1

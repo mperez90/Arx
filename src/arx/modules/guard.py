@@ -30,7 +30,7 @@ from datetime import datetime, timezone
 from arx import config, consensus, engine, notify, redact, telemetry
 from arx import license as lic
 from arx.i18n import lang, tr
-from arx.modules import (baseline, canaries, dnswatch, execwatch, filewatch, fleet, integrity, metrics, pkgdb, profile, provenance, recon,
+from arx.modules import (baseline, canaries, dnswatch, execwatch, filewatch, fleet, integrity, metrics, pkgdb, pkgtx, profile, provenance, recon,
                          response, sandbox, sensors, service, sweepcache, telegram, vaccines)
 
 SYSTEM_PROMPT = (
@@ -140,13 +140,10 @@ def _package_wrote(path: str) -> bool:
     """¿El fichero es de un paquete de un repositorio firmado, y el dpkg que lo escribió es el auténtico?
     Solo entonces un cambio que solo hizo dpkg es una actualización y no un hallazgo. Ante cualquier duda, no."""
     try:
-        pkg = pkgdb.owner(path)
-        if not pkg or provenance.intact(integrity.DPKG, "dpkg") is not True:
-            return False
-        # la versión INSTALADA de ambos tiene que venir de un repositorio firmado: un .deb local con el nombre de
-        # un paquete de repositorio no basta (HZ#7)
-        return bool(provenance.signed_origin("dpkg", installed_only=True)[0]
-                    and provenance.signed_origin(pkg, installed_only=True)[0])
+        # el mismo criterio con el que el sensor de auditd rebaja lo que escribe un paquete (`pkgtx`): la versión
+        # INSTALADA de ambos tiene que venir de un repositorio firmado; un .deb local con el nombre de un paquete de
+        # repositorio no basta (HZ#7)
+        return pkgtx.verified_owner(path) is not None
     except Exception:  # noqa: BLE001 - sin respuesta de dpkg no se rebaja nada
         return False
 
