@@ -202,7 +202,9 @@ v bash -c 'echo "* * * * * root /bin/true" > /etc/cron.d/persistencia'
 PEND=""
 find_cron() { PEND=$(docker exec "$VIC" arx authorize 2>/dev/null | grep -E '^\s+[0-9a-f]{6}\s' | grep "cron" | awk '{print $1}' | head -1); [ -n "$PEND" ]; }
 if wait_for 70 find_cron; then pass "la persistencia queda pendiente ($PEND)"; else fail "la persistencia queda pendiente"; fi
-if wait_for 15 said "cron changed"; then pass "la alerta llega al chat"; else fail "la alerta llega al chat"; fi
+# B77: la alerta nombra el fichero y lo que significa el cambio («/etc/cron.d/persistencia: new scheduled command…»),
+# no el grupo («cron changed»); se busca por el fichero, que no depende de la redacción ni del idioma
+if wait_for 15 said "cron.d/persistencia"; then pass "la alerta llega al chat"; else fail "la alerta llega al chat"; fi
 inject 4242 "/authorize $PEND 000000"
 if wait_for 15 said "Wrong or already used"; then pass "con un código falso no se hace nada"; else fail "con un código falso no se hace nada"; fi
 if v test -f /etc/cron.d/persistencia; then pass "el fichero sigue ahí tras el código falso"; else fail "el fichero sigue ahí tras el código falso"; fi
@@ -216,7 +218,7 @@ else
   pass "control: con ProtectHome no se podría escribir en /root"
 fi
 v bash -c 'echo "ssh-ed25519 AAAAC3Nza intruso" >> /root/.ssh/authorized_keys'
-find_key() { PEND=$(docker exec "$VIC" arx authorize 2>/dev/null | grep -E '^\s+[0-9a-f]{6}\s' | grep "authorized_keys_root" | awk '{print $1}' | head -1); [ -n "$PEND" ]; }
+find_key() { PEND=$(docker exec "$VIC" arx authorize 2>/dev/null | grep -E '^\s+[0-9a-f]{6}\s' | grep "/root/.ssh/authorized_keys" | awk '{print $1}' | head -1); [ -n "$PEND" ]; }
 if wait_for 70 find_key; then pass "la llave plantada queda pendiente ($PEND)"; else fail "la llave plantada queda pendiente"; fi
 sleep 31  # un código por paso de reloj: el anterior ya está usado
 inject 4242 "/authorize $PEND $(code)"
